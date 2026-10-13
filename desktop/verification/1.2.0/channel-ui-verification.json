@@ -1,0 +1,15 @@
+{
+  "ok": true,
+  "count": 618,
+  "nonforum_selection_checked": true,
+  "topic_count": 13,
+  "topic_selection_checked": true,
+  "refreshes": 2,
+  "heartbeat": 51,
+  "thread_violations": 0,
+  "original_metadata_hashes_unchanged": true,
+  "elapsed": 13.438,
+  "core_sha256": "04eb3bb5f81a79d58984aebfc58f8cefa6c9f4130338e6ef47df98dcad32ca5e",
+  "version": "1.2.0",
+  "sha256": "3ef03c924cf6fa01570318edaf328a115cba558341271035590b6fe715b7b351"
+}

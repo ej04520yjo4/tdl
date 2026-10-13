@@ -65,6 +65,7 @@ type iter struct {
 
 	// TODO(Hexa): counter is de facto not be used in the codebase, but I perfer to reserve it. The key point is whether it still needs to be atomic or not.
 	counter        *atomic.Int64
+	candidates     *atomic.Int64 // media items after filters, before skip-same
 	skippedDeleted *atomic.Int64 // count of skipped deleted messages
 	deletedIDs     []string      // IDs of deleted messages (format: "dialogID/messageID")
 	elem           chan downloader.Elem
@@ -113,6 +114,7 @@ func newIter(pool dcpool.Pool, manager *peers.Manager, dialog [][]*tmessage.Dial
 		dialogIndex:    0,
 		messageIndex:   0,
 		counter:        atomic.NewInt64(-1),
+		candidates:     atomic.NewInt64(0),
 		skippedDeleted: atomic.NewInt64(0),
 		deletedIDs:     make([]string, 0),
 		elem:           make(chan downloader.Elem, 10), // grouped message buffer
@@ -240,6 +242,7 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 		i.err = errors.Wrap(err, "execute template")
 		return false, false
 	}
+	i.candidates.Inc()
 
 	if i.opts.SkipSame {
 		if stat, err := os.Stat(filepath.Join(i.opts.Dir, toName.String())); err == nil {
@@ -361,6 +364,26 @@ func (i *iter) Total() int {
 	return total
 }
 
+// PreparedCount is the number of media elements which made it into the
+// downloader queue.  A source can contain only text, deleted messages, or
+// filtered files while still allowing the command to finish without an
+// iterator error.
+func (i *iter) PreparedCount() int64 {
+	count := i.counter.Load() + 1
+	if count < 0 {
+		return 0
+	}
+	return count
+}
+
+// CandidateCount is the number of media items which passed include/exclude
+// filters.  It includes files skipped by --skip-same, so an intentional
+// no-op remains a successful run while a source containing no media is
+// reported as an error by the desktop protocol.
+func (i *iter) CandidateCount() int64 {
+	return i.candidates.Load()
+}
+
 func (i *iter) SkippedDeleted() int64 {
 	return i.skippedDeleted.Load()
 }
@@ -390,8 +413,13 @@ func flatDialogs(dialogs [][]*tmessage.Dialog) []*tmessage.Dialog {
 
 func sortDialogs(dialogs []*tmessage.Dialog, desc bool) {
 	sort.Slice(dialogs, func(i, j int) bool {
-		return tutil.GetInputPeerID(dialogs[i].Peer) <
-			tutil.GetInputPeerID(dialogs[j].Peer) // increasing order
+		leftID, rightID := tutil.GetInputPeerID(dialogs[i].Peer), tutil.GetInputPeerID(dialogs[j].Peer)
+		if leftID != rightID {
+			return leftID < rightID // increasing order
+		}
+		// Basic groups and channels may share a numeric ID. Tie-break by peer
+		// kind so the fingerprint and resume order remain deterministic.
+		return inputPeerType(dialogs[i].Peer) < inputPeerType(dialogs[j].Peer)
 	})
 
 	for _, m := range dialogs {
@@ -417,8 +445,20 @@ func sortDialogs(dialogs []*tmessage.Dialog, desc bool) {
 func fingerprint(dialogs []*tmessage.Dialog) string {
 	endian := binary.BigEndian
 	buf, b := &bytes.Buffer{}, make([]byte, 8)
+	// Version the encoding so old numeric-only resume keys can never be
+	// mistaken for the typed manifest format.
+	endian.PutUint64(b, 2)
+	buf.Write(b)
+	endian.PutUint64(b, uint64(len(dialogs)))
+	buf.Write(b)
 	for _, m := range dialogs {
+		peerKind := inputPeerType(m.Peer)
+		endian.PutUint64(b, uint64(len(peerKind)))
+		buf.Write(b)
+		buf.WriteString(peerKind)
 		endian.PutUint64(b, uint64(tutil.GetInputPeerID(m.Peer)))
+		buf.Write(b)
+		endian.PutUint64(b, uint64(len(m.Messages)))
 		buf.Write(b)
 		for _, msg := range m.Messages {
 			endian.PutUint64(b, uint64(msg))
@@ -427,4 +467,19 @@ func fingerprint(dialogs []*tmessage.Dialog) string {
 	}
 
 	return fmt.Sprintf("%x", sha256.Sum256(buf.Bytes()))
+}
+
+func inputPeerType(peer tg.InputPeerClass) string {
+	switch peer.(type) {
+	case *tg.InputPeerUser:
+		return "user"
+	case *tg.InputPeerChat:
+		return "chat"
+	case *tg.InputPeerChannel:
+		return "channel"
+	case *tg.InputPeerSelf:
+		return "self"
+	default:
+		return fmt.Sprintf("%T", peer)
+	}
 }

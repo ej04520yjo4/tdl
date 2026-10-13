@@ -18,6 +18,11 @@ const MaxPartSize = 1024 * 1024
 
 type Downloader struct {
 	opts Options
+
+	// downloadFn is intentionally only used by package tests. Keeping the
+	// scheduling and completion path injectable lets tests exercise Download's
+	// real error propagation without requiring a live Telegram DC.
+	downloadFn func(context.Context, Elem) error
 }
 
 type Options struct {
@@ -42,9 +47,16 @@ func (d *Downloader) Download(ctx context.Context, limit int) error {
 
 		wg.Go(func() (rerr error) {
 			d.opts.Progress.OnAdd(elem)
-			defer func() { d.opts.Progress.OnDone(elem, rerr) }()
+			var progressErr error
+			defer func() { d.opts.Progress.OnDone(elem, progressErr) }()
 
-			if err := d.download(wgctx, elem); err != nil {
+			if err := d.downloadElem(wgctx, elem); err != nil {
+				// Always pass the actual file error to the progress callback. A
+				// nil error here would make the progress layer checkpoint and
+				// report a file as complete even when its temporary file is
+				// incomplete.
+				progressErr = err
+
 				// canceled by user, so we directly return error to stop all
 				if errors.Is(err, context.Canceled) {
 					return errors.Wrap(err, "download")
@@ -63,11 +75,24 @@ func (d *Downloader) Download(ctx context.Context, limit int) error {
 		})
 	}
 
-	if err := d.opts.Iter.Err(); err != nil {
-		return errors.Wrap(err, "iter")
+	iterErr := d.opts.Iter.Err()
+	waitErr := wg.Wait()
+	if iterErr != nil {
+		// Iterators can report context.Canceled after the caller stops the
+		// iteration. Wait for all already-started workers first so their
+		// OnDone callbacks close temporary files and update checkpoints before
+		// Download returns to the caller.
+		return errors.Wrap(iterErr, "iter")
 	}
 
-	return wg.Wait()
+	return waitErr
+}
+
+func (d *Downloader) downloadElem(ctx context.Context, elem Elem) error {
+	if d.downloadFn != nil {
+		return d.downloadFn(ctx, elem)
+	}
+	return d.download(ctx, elem)
 }
 
 func (d *Downloader) download(ctx context.Context, elem Elem) error {

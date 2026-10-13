@@ -6,8 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gotd/td/tg"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/iyear/tdl/pkg/tmessage"
 )
 
 // TestIterDeletedMessageHandling verifies that deleted messages are handled correctly
@@ -228,4 +231,43 @@ func TestIterContextCancellation(t *testing.T) {
 			t.Fatal("Context should be cancelled")
 		}
 	})
+}
+
+func TestFingerprintIncludesPeerKindAndDialogBoundaries(t *testing.T) {
+	channel := func(id int64, messages ...int) *tmessage.Dialog {
+		return &tmessage.Dialog{
+			Peer:     &tg.InputPeerChannel{ChannelID: id},
+			Messages: messages,
+		}
+	}
+	chat := func(id int64, messages ...int) *tmessage.Dialog {
+		return &tmessage.Dialog{
+			Peer:     &tg.InputPeerChat{ChatID: id},
+			Messages: messages,
+		}
+	}
+
+	// A basic group and a channel can legally share the same numeric ID.
+	require.NotEqual(t,
+		fingerprint([]*tmessage.Dialog{channel(123, 9)}),
+		fingerprint([]*tmessage.Dialog{chat(123, 9)}),
+	)
+
+	// The old numeric-only stream could encode these two manifests identically:
+	// [peer 1, messages 2,3] and [peer 1, message 2, peer 3].
+	require.NotEqual(t,
+		fingerprint([]*tmessage.Dialog{channel(1, 2, 3)}),
+		fingerprint([]*tmessage.Dialog{channel(1, 2), channel(3)}),
+	)
+}
+
+func TestSortDialogsBreaksPeerIDTiesByKind(t *testing.T) {
+	dialogs := []*tmessage.Dialog{
+		{Peer: &tg.InputPeerChat{ChatID: 7}},
+		{Peer: &tg.InputPeerChannel{ChannelID: 7}},
+	}
+
+	sortDialogs(dialogs, false)
+	require.IsType(t, &tg.InputPeerChannel{}, dialogs[0].Peer)
+	require.IsType(t, &tg.InputPeerChat{}, dialogs[1].Peer)
 }

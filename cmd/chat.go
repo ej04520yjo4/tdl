@@ -26,8 +26,26 @@ func NewChat() *cobra.Command {
 		GroupID: groupTools.ID,
 	}
 
-	cmd.AddCommand(NewChatList(), NewChatExport(), NewChatUsers())
+	cmd.AddCommand(NewChatList(), NewChatTopics(), NewChatExport(), NewChatUsers())
 
+	return cmd
+}
+
+func NewChatTopics() *cobra.Command {
+	var opts chat.TopicsOptions
+
+	cmd := &cobra.Command{
+		Use:   "topics",
+		Short: "List topics for one forum",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return tRun(cmd.Context(), func(ctx context.Context, c *telegram.Client, kvd storage.Storage) error {
+				return chat.Topics(logctx.Named(ctx, "topics"), c, kvd, opts)
+			}, limiter)
+		},
+	}
+
+	cmd.Flags().StringVarP(&opts.Chat, "chat", "c", "", "typed chat reference, for example channel:123")
+	cmd.Flags().VarP(&opts.Output, "output", "o", fmt.Sprintf("output format: [%s]", strings.Join(chat.ListOutputNames(), ", ")))
 	return cmd
 }
 
@@ -46,6 +64,7 @@ func NewChatList() *cobra.Command {
 
 	cmd.Flags().VarP(&opts.Output, "output", "o", fmt.Sprintf("output format: [%s]", strings.Join(chat.ListOutputNames(), ", ")))
 	cmd.Flags().StringVarP(&opts.Filter, "filter", "f", "true", "filter chats by expression")
+	cmd.Flags().BoolVar(&opts.IncludeTopics, "topics", false, "include forum topics (GUI: fetch topics before showing the picker)")
 
 	return cmd
 }
@@ -57,30 +76,8 @@ func NewChatExport() *cobra.Command {
 		Use:   "export",
 		Short: "export messages from (protected) chat for download",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			switch opts.Type {
-			case chat.ExportTypeTime, chat.ExportTypeId:
-				// set default value
-				switch len(opts.Input) {
-				case 0:
-					opts.Input = []int{0, math.MaxInt}
-				case 1:
-					opts.Input = append(opts.Input, math.MaxInt)
-				}
-
-				if len(opts.Input) != 2 {
-					return fmt.Errorf("input data should be 2 integers when export type is %s", opts.Type)
-				}
-
-				// sort helper
-				if opts.Input[0] > opts.Input[1] {
-					opts.Input[0], opts.Input[1] = opts.Input[1], opts.Input[0]
-				}
-			case chat.ExportTypeLast:
-				if len(opts.Input) != 1 {
-					return fmt.Errorf("input data should be 1 integer when export type is %s", opts.Type)
-				}
-			default:
-				return fmt.Errorf("unknown export type: %s", opts.Type)
+			if err := normalizeExportInput(&opts); err != nil {
+				return err
 			}
 
 			return tRun(cmd.Context(), func(ctx context.Context, c *telegram.Client, kvd storage.Storage) error {
@@ -98,13 +95,13 @@ func NewChatExport() *cobra.Command {
 	cmd.Flags().VarP(&opts.Type, _type, "T", fmt.Sprintf("export type: [%s]", strings.Join(chat.ExportTypeNames(), ", ")))
 	cmd.Flags().StringVarP(&opts.Chat, _chat, "c", "", "chat id or domain. If not specified, 'Saved Messages' will be used")
 
-	// topic id and message id is the same field in tg.MessagesGetRepliesRequest
-	cmd.Flags().IntVar(&opts.Thread, "topic", 0, "specify topic id")
-	cmd.Flags().IntVar(&opts.Thread, "reply", 0, "specify channel post id")
+	cmd.Flags().IntVar(&opts.Topic, "topic", 0, "specify forum topic id (1 is General)")
+	cmd.Flags().IntVar(&opts.Reply, "reply", 0, "specify channel post id for its discussion thread")
 
 	cmd.Flags().IntSliceVarP(&opts.Input, input, "i", []int{}, "input data, depends on export type")
 	cmd.Flags().StringVarP(&opts.Filter, "filter", "f", "true", "filter messages by expression, defaults to match all messages. Specify '-' to see available fields")
 	cmd.Flags().StringVarP(&opts.Output, "output", "o", "tdl-export.json", "output JSON file path")
+	cmd.Flags().StringVar(&opts.MediaTypes, "media-types", "", "comma-separated media types: video, photo, audio, document")
 	cmd.Flags().BoolVar(&opts.WithContent, "with-content", false, "export with message content")
 	cmd.Flags().BoolVar(&opts.Raw, "raw", false, "export raw message struct of Telegram MTProto API, useful for debugging")
 	cmd.Flags().BoolVar(&opts.All, "all", false, "export all messages including non-media messages, but still affected by filter and type flag")
@@ -129,6 +126,34 @@ func NewChatExport() *cobra.Command {
 	})
 
 	return cmd
+}
+
+func normalizeExportInput(opts *chat.ExportOptions) error {
+	switch opts.Type {
+	case chat.ExportTypeTime, chat.ExportTypeId:
+		// Set defaults while keeping the existing inclusive range contract.
+		switch len(opts.Input) {
+		case 0:
+			opts.Input = []int{0, math.MaxInt}
+		case 1:
+			opts.Input = append(opts.Input, math.MaxInt)
+		}
+
+		if len(opts.Input) != 2 {
+			return fmt.Errorf("input data should be 2 integers when export type is %s", opts.Type)
+		}
+
+		if opts.Input[0] > opts.Input[1] {
+			opts.Input[0], opts.Input[1] = opts.Input[1], opts.Input[0]
+		}
+	case chat.ExportTypeLast:
+		if len(opts.Input) != 1 {
+			return fmt.Errorf("input data should be 1 integer when export type is %s", opts.Type)
+		}
+	default:
+		return fmt.Errorf("unknown export type: %s", opts.Type)
+	}
+	return nil
 }
 
 func NewChatUsers() *cobra.Command {

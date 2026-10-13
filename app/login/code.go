@@ -2,6 +2,7 @@ package login
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/AlecAivazis/survey/v2"
@@ -12,6 +13,7 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/iyear/tdl/pkg/consts"
+	"github.com/iyear/tdl/pkg/desktopio"
 	"github.com/iyear/tdl/pkg/key"
 	"github.com/iyear/tdl/pkg/kv"
 	"github.com/iyear/tdl/pkg/tclient"
@@ -53,7 +55,16 @@ func Code(ctx context.Context) error {
 			return err
 		}
 
-		color.Green("Login successfully! ID: %d, Username: %s", user.ID, user.Username)
+		if desktopio.From(ctx) != nil {
+			_ = desktopio.Emit(ctx, desktopio.Event{
+				Event:    "authenticated",
+				ID:       fmt.Sprintf("%d", user.ID),
+				Username: user.Username,
+				Name:     userDisplayName(user),
+			})
+		} else {
+			color.Green("Login successfully! ID: %d, Username: %s", user.ID, user.Username)
+		}
 
 		return nil
 	})
@@ -75,7 +86,18 @@ type termAuth struct {
 	noSignUp
 }
 
-func (a termAuth) Phone(_ context.Context) (string, error) {
+func userDisplayName(user *tg.User) string {
+	if user == nil {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimSpace(user.FirstName + " " + user.LastName))
+}
+
+func (a termAuth) Phone(ctx context.Context) (string, error) {
+	if desktopio.From(ctx) != nil {
+		return desktopio.Prompt(ctx, "phone", "請輸入 Telegram 手機號碼（含國碼，例如 +886912345678）：")
+	}
+
 	phone := ""
 	prompt := &survey.Input{
 		Message: "Enter your phone number:",
@@ -90,7 +112,11 @@ func (a termAuth) Phone(_ context.Context) (string, error) {
 	return strings.TrimSpace(phone), nil
 }
 
-func (a termAuth) Password(_ context.Context) (string, error) {
+func (a termAuth) Password(ctx context.Context) (string, error) {
+	if desktopio.From(ctx) != nil {
+		return desktopio.Prompt(ctx, "password", "請輸入 Telegram 兩步驟驗證密碼：")
+	}
+
 	pwd := ""
 	prompt := &survey.Password{
 		Message: "Enter 2FA Password:",
@@ -103,7 +129,11 @@ func (a termAuth) Password(_ context.Context) (string, error) {
 	return strings.TrimSpace(pwd), nil
 }
 
-func (a termAuth) Code(_ context.Context, _ *tg.AuthSentCode) (string, error) {
+func (a termAuth) Code(ctx context.Context, _ *tg.AuthSentCode) (string, error) {
+	if desktopio.From(ctx) != nil {
+		return desktopio.Prompt(ctx, "code", "請輸入 Telegram 登入驗證碼：")
+	}
+
 	code := ""
 	prompt := &survey.Input{
 		Message: "Enter Code:",

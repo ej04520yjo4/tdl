@@ -1,0 +1,9 @@
+{
+  "ok": true,
+  "elapsed": 4.859,
+  "error": "",
+  "version": "1.2.0",
+  "sha256": "3ef03c924cf6fa01570318edaf328a115cba558341271035590b6fe715b7b351",
+  "actual_executable_clicked_login_and_rendered_qr": true,
+  "cancelled_before_account_authentication": true
+}

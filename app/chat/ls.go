@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/expr-lang/expr"
-	"github.com/fatih/color"
 	"github.com/go-faster/errors"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/message/peer"
@@ -21,6 +20,7 @@ import (
 	"github.com/iyear/tdl/core/logctx"
 	"github.com/iyear/tdl/core/storage"
 	"github.com/iyear/tdl/core/util/tutil"
+	"github.com/iyear/tdl/pkg/desktopio"
 	"github.com/iyear/tdl/pkg/texpr"
 )
 
@@ -32,6 +32,10 @@ type Dialog struct {
 	VisibleName string  `json:"visible_name,omitempty" comment:"Title of channel and group, first and last name of user. If empty, output '-'"`
 	Username    string  `json:"username,omitempty" comment:"Username of dialog. If empty, output '-'"`
 	Topics      []Topic `json:"topics,omitempty" comment:"Topics of dialog. If not set, output '-'"`
+	forum       bool
+	// ref is the typed peer reference used by the desktop protocol. Keep it
+	// private so the historical CLI JSON/filter field set stays unchanged.
+	ref string
 }
 
 type Topic struct {
@@ -52,12 +56,14 @@ const (
 )
 
 type ListOptions struct {
-	Output ListOutput
-	Filter string
+	Output        ListOutput
+	Filter        string
+	IncludeTopics bool
 }
 
 func List(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts ListOptions) error {
 	log := logctx.From(ctx)
+	gui := desktopio.From(ctx) != nil
 
 	// align output
 	runewidth.EastAsianWidth = false
@@ -80,14 +86,35 @@ func List(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Lis
 		return fmt.Errorf("failed to compile filter: %w", err)
 	}
 
-	// Manually iterate through dialogs to handle errors gracefully
-	// This allows us to skip problematic dialogs (deleted/inaccessible channels)
-	// rather than failing completely when ExtractPeer fails
-	dialogs, skipped := fetchDialogsWithErrorHandling(ctx, c.API())
+	if gui {
+		_ = desktopio.Emit(ctx, desktopio.Event{
+			Event:   "status",
+			Kind:    "chat_scan",
+			Stage:   "scanning",
+			Message: "正在掃描頻道與群組…",
+		})
+	}
+
+	// Manually iterate through dialogs to handle errors gracefully.  A failed
+	// page is returned as an error instead of looking like the end of the list.
+	dialogs, skipped, fetchErr := fetchDialogsWithErrorHandling(ctx, c.API(), func(current int) {
+		if gui {
+			_ = desktopio.Emit(ctx, desktopio.Event{
+				Event:   "status",
+				Kind:    "chat_scan",
+				Stage:   "scanning",
+				Current: int64(current),
+				Message: fmt.Sprintf("已掃描 %d 個對話", current),
+			})
+		}
+	})
 	if skipped > 0 {
 		log.Warn("skipped problematic dialogs during iteration",
 			zap.Int("skipped", skipped),
 			zap.Int("fetched", len(dialogs)))
+	}
+	if fetchErr != nil {
+		log.Warn("dialog list is partial", zap.Error(fetchErr), zap.Int("fetched", len(dialogs)))
 	}
 
 	blocked, err := tutil.GetBlockedDialogs(ctx, c.API())
@@ -97,6 +124,10 @@ func List(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Lis
 
 	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(c.API())
 	result := make([]*Dialog, 0, len(dialogs))
+	var partialMessages []string
+	if fetchErr != nil {
+		partialMessages = append(partialMessages, desktopio.SafeError(fetchErr))
+	}
 	for _, d := range dialogs {
 		id := tutil.GetInputPeerID(d.Peer)
 
@@ -105,19 +136,37 @@ func List(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Lis
 			log.Warn("failed to apply peer updates", zap.Int64("id", id), zap.Error(err))
 		}
 
-		// filter blocked peers
-		if _, ok := blocked[id]; ok {
+		// Telegram's blocked-dialog query is keyed by numeric IDs. Apply it
+		// only to users so a blocked user cannot hide a channel/basic group
+		// which happens to share that numeric ID.
+		_, blockedUser := d.Peer.(*tg.InputPeerUser)
+		if blockedUser {
+			if _, ok := blocked[id]; !ok {
+				blockedUser = false
+			}
+		}
+		if blockedUser {
 			continue
 		}
 
-		var r *Dialog
+		var (
+			r       *Dialog
+			procErr error
+		)
 		switch t := d.Peer.(type) {
 		case *tg.InputPeerUser:
 			r = processUser(t.UserID, d.Entities)
 		case *tg.InputPeerChannel:
-			r = processChannel(ctx, c.API(), t.ChannelID, d.Entities)
+			// Topic enumeration is opt-in for GUI calls: a large account can have
+			// hundreds of forums and Telegram may rate-limit one request per forum.
+			// The forum marker is emitted even when topics are not requested so the
+			// desktop can fetch/require them before allowing a topic-scoped export.
+			r, procErr = processChannel(ctx, c.API(), t.ChannelID, d.Entities, !gui || opts.IncludeTopics)
 		case *tg.InputPeerChat:
 			r = processChat(t.ChatID, d.Entities)
+		}
+		if procErr != nil {
+			partialMessages = append(partialMessages, desktopio.SafeError(procErr))
 		}
 
 		// skip unsupported types
@@ -135,20 +184,69 @@ func List(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Lis
 		}
 
 		result = append(result, r)
+		if gui {
+			_ = desktopio.Emit(ctx, desktopio.Event{
+				Event:   "status",
+				Kind:    "chat_scan",
+				Stage:   "reading",
+				Current: int64(len(result)),
+				Total:   int64(len(dialogs)),
+				Message: fmt.Sprintf("正在整理頻道與群組 %d/%d", len(result), len(dialogs)),
+			})
+		}
 	}
 
-	switch opts.Output {
-	case ListOutputTable:
-		printTable(result)
-	case ListOutputJson:
-		bytes, err := json.MarshalIndent(result, "", "\t")
-		if err != nil {
-			return fmt.Errorf("marshal json: %w", err)
+	partial := len(partialMessages) > 0
+	if gui {
+		items := make([]desktopio.Chat, 0, len(result))
+		for _, r := range result {
+			topics := make([]desktopio.Topic, 0, len(r.Topics))
+			for _, topic := range r.Topics {
+				topics = append(topics, desktopio.Topic{ID: topic.ID, Title: topic.Title})
+			}
+			username := r.Username
+			if username == "-" {
+				username = ""
+			}
+			items = append(items, desktopio.Chat{
+				ID:       strconv.FormatInt(r.ID, 10),
+				Ref:      r.ref,
+				Type:     r.Type,
+				Title:    r.VisibleName,
+				Username: username,
+				Forum:    r.forum,
+				Topics:   topics,
+			})
 		}
+		skippedCopy := skipped
+		event := desktopio.Event{
+			Event:   "chats",
+			Chats:   &items,
+			Skipped: &skippedCopy,
+			Partial: partial,
+		}
+		if partial {
+			event.Message = strings.Join(partialMessages, "; ")
+		}
+		_ = desktopio.Emit(ctx, event)
+	} else {
+		switch opts.Output {
+		case ListOutputTable:
+			printTable(result)
+		case ListOutputJson:
+			bytes, err := json.MarshalIndent(result, "", "\t")
+			if err != nil {
+				return fmt.Errorf("marshal json: %w", err)
+			}
 
-		fmt.Println(string(bytes))
-	default:
-		return fmt.Errorf("unknown output: %s", opts.Output)
+			fmt.Println(string(bytes))
+		default:
+			return fmt.Errorf("unknown output: %s", opts.Output)
+		}
+	}
+
+	if partial && !gui {
+		return fmt.Errorf("partial chat list: %s", strings.Join(partialMessages, "; "))
 	}
 
 	return nil
@@ -206,19 +304,21 @@ func processUser(id int64, entities peer.Entities) *Dialog {
 		Username:    u.Username,
 		Type:        DialogPrivate,
 		Topics:      nil,
+		ref:         fmt.Sprintf("user:%d", u.ID),
 	}
 }
 
-func processChannel(ctx context.Context, api *tg.Client, id int64, entities peer.Entities) *Dialog {
+func processChannel(ctx context.Context, api *tg.Client, id int64, entities peer.Entities, includeTopics bool) (*Dialog, error) {
 	c, ok := entities.Channel(id)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 
 	d := &Dialog{
 		ID:          c.ID,
 		VisibleName: c.Title,
 		Username:    c.Username,
+		forum:       c.Forum,
 	}
 
 	// channel type
@@ -230,21 +330,37 @@ func processChannel(ctx context.Context, api *tg.Client, id int64, entities peer
 	default:
 		d.Type = DialogUnknown
 	}
+	d.ref = fmt.Sprintf("channel:%d", c.ID)
 
-	if c.Forum {
+	if c.Forum && includeTopics {
 		topics, err := fetchTopics(ctx, api, c.AsInputPeer())
 		if err != nil {
 			logctx.From(ctx).Error("failed to fetch topics",
 				zap.Int64("channel_id", c.ID),
 				zap.String("channel_username", c.Username),
 				zap.Error(err))
-			return nil
+			// Keep the channel visible even when its topic endpoint fails. The
+			// caller marks the overall list partial instead of swallowing it.
+			return d, errors.Wrap(err, "fetch topics")
 		}
 
-		d.Topics = topics
+		d.Topics = ensureGeneralTopic(topics)
 	}
 
-	return d
+	return d, nil
+}
+
+// ensureGeneralTopic keeps Telegram's non-deletable General forum topic
+// selectable even when getForumTopics omits it from the returned page.
+func ensureGeneralTopic(topics []Topic) []Topic {
+	for _, topic := range topics {
+		if topic.ID == 1 {
+			return topics
+		}
+	}
+	result := make([]Topic, 0, len(topics)+1)
+	result = append(result, Topic{ID: 1, Title: "General"})
+	return append(result, topics...)
 }
 
 // fetchTopics https://github.com/telegramdesktop/tdesktop/blob/4047f1733decd5edf96d125589f128758b68d922/Telegram/SourceFiles/data/data_forum.cpp#L135
@@ -263,12 +379,12 @@ func fetchTopics(ctx context.Context, api *tg.Client, peer tg.InputPeerClass) ([
 		if offsetTopic == lastOffsetTopic && lastOffsetTopic != -1 {
 			log.Warn("pagination stuck (same offset), breaking loop",
 				zap.Int("offset_topic", offsetTopic))
-			break
+			return res, errors.Errorf("forum topic pagination stuck at offset %d", offsetTopic)
 		}
 		if seenOffsets[offsetTopic] {
 			log.Warn("pagination cycle detected, breaking loop",
 				zap.Int("offset_topic", offsetTopic))
-			break
+			return res, errors.Errorf("forum topic pagination cycle at offset %d", offsetTopic)
 		}
 		seenOffsets[offsetTopic] = true
 		lastOffsetTopic = offsetTopic
@@ -344,7 +460,48 @@ func processChat(id int64, entities peer.Entities) *Dialog {
 		Username:    "-",
 		Type:        DialogGroup,
 		Topics:      nil,
+		ref:         fmt.Sprintf("chat:%d", c.ID),
 	}
+}
+
+func typedPeerRef(p tg.PeerClass) string {
+	switch p := p.(type) {
+	case *tg.PeerUser:
+		return fmt.Sprintf("user:%d", p.UserID)
+	case *tg.PeerChat:
+		return fmt.Sprintf("chat:%d", p.ChatID)
+	case *tg.PeerChannel:
+		return fmt.Sprintf("channel:%d", p.ChannelID)
+	default:
+		return ""
+	}
+}
+
+type dialogMessageKey struct {
+	Peer string
+	ID   int
+}
+
+func indexDialogMessages(messages []tg.MessageClass) map[dialogMessageKey]tg.NotEmptyMessage {
+	indexed := make(map[dialogMessageKey]tg.NotEmptyMessage, len(messages))
+	for _, msg := range messages {
+		var notEmpty tg.NotEmptyMessage
+		switch m := msg.(type) {
+		case *tg.Message:
+			notEmpty = m
+		case *tg.MessageService:
+			notEmpty = m
+		default:
+			continue
+		}
+
+		peer := typedPeerRef(notEmpty.GetPeerID())
+		if peer == "" {
+			continue
+		}
+		indexed[dialogMessageKey{Peer: peer, ID: notEmpty.GetID()}] = notEmpty
+	}
+	return indexed
 }
 
 func visibleName(first, last string) string {
@@ -384,7 +541,7 @@ func applyPeers(ctx context.Context, manager *peers.Manager, entities peer.Entit
 // to gracefully handle errors from problematic dialogs (deleted/inaccessible channels).
 // Instead of failing completely when ExtractPeer fails in gotd's iterator, it logs errors
 // and continues, skipping bad dialogs.
-func fetchDialogsWithErrorHandling(ctx context.Context, api *tg.Client) ([]dialogs.Elem, int) {
+func fetchDialogsWithErrorHandling(ctx context.Context, api *tg.Client, progress func(current int)) ([]dialogs.Elem, int, error) {
 	log := logctx.From(ctx)
 	const batchSize = 100
 	var (
@@ -393,7 +550,8 @@ func fetchDialogsWithErrorHandling(ctx context.Context, api *tg.Client) ([]dialo
 		offsetID   int
 		offsetDate int
 		offsetPeer tg.InputPeerClass = &tg.InputPeerEmpty{}
-		seen                         = make(map[int64]bool) // Track seen dialog IDs to prevent duplicates
+		seen                         = make(map[string]bool) // Track typed peers; channel/chat IDs can collide.
+		seenPages                    = make(map[string]bool)
 	)
 
 	for {
@@ -406,7 +564,7 @@ func fetchDialogsWithErrorHandling(ctx context.Context, api *tg.Client) ([]dialo
 		})
 		if err != nil {
 			log.Error("failed to fetch dialog batch", zap.Error(err))
-			break
+			return allElems, skipped, errors.Wrap(err, "get dialogs")
 		}
 
 		var (
@@ -429,14 +587,14 @@ func fetchDialogsWithErrorHandling(ctx context.Context, api *tg.Client) ([]dialo
 			chats = d.Chats
 		case *tg.MessagesDialogsNotModified:
 			// No more dialogs
-			return allElems, skipped
+			return allElems, skipped, nil
 		default:
 			log.Error("unexpected dialog type", zap.String("type", fmt.Sprintf("%T", result)))
-			return allElems, skipped
+			return allElems, skipped, fmt.Errorf("unexpected dialogs response %T", result)
 		}
 
 		if len(dialogsSlice) == 0 {
-			break
+			return allElems, skipped, nil
 		}
 
 		// Build entities map for this batch
@@ -461,16 +619,10 @@ func fetchDialogsWithErrorHandling(ctx context.Context, api *tg.Client) ([]dialo
 
 		entities := peer.NewEntities(userMap, chatMap, channelMap)
 
-		// Build message map for quick lookup by ID
-		messageMap := make(map[int]tg.NotEmptyMessage)
-		for _, msg := range messages {
-			switch m := msg.(type) {
-			case *tg.Message:
-				messageMap[m.ID] = m
-			case *tg.MessageService:
-				messageMap[m.ID] = m
-			}
-		}
+		// Message IDs are only unique within a peer. Index by typed peer and
+		// message ID so two dialogs with the same numeric message ID cannot
+		// exchange their last-message date or pagination offset.
+		messageMap := indexDialogMessages(messages)
 
 		// Process each dialog in this batch
 		for _, d := range dialogsSlice {
@@ -494,11 +646,18 @@ func fetchDialogsWithErrorHandling(ctx context.Context, api *tg.Client) ([]dialo
 				continue
 			}
 
-			// Skip if we've already seen this dialog (deduplication)
-			if seen[peerID] {
+			// Skip if we've already seen this typed dialog (deduplication).
+			// Numeric channel and basic-group IDs can collide.
+			peerKey := typedPeerRef(dialog.Peer)
+			if peerKey == "" {
+				log.Error("unknown peer type", zap.String("type", fmt.Sprintf("%T", dialog.Peer)))
+				skipped++
 				continue
 			}
-			seen[peerID] = true
+			if seen[peerKey] {
+				continue
+			}
+			seen[peerKey] = true
 
 			// Try to extract the peer - THIS IS WHERE THE ORIGINAL ERROR OCCURS
 			// In gotd's query/dialogs iterator, it calls ExtractPeer without error handling,
@@ -518,8 +677,8 @@ func fetchDialogsWithErrorHandling(ctx context.Context, api *tg.Client) ([]dialo
 				continue
 			}
 
-			// Get the last message for this dialog from message map
-			lastMsg := messageMap[dialog.TopMessage]
+			// Get the last message for this dialog from the typed message map.
+			lastMsg := messageMap[dialogMessageKey{Peer: peerKey, ID: dialog.TopMessage}]
 
 			// Successfully processed this dialog
 			allElems = append(allElems, dialogs.Elem{
@@ -529,52 +688,71 @@ func fetchDialogsWithErrorHandling(ctx context.Context, api *tg.Client) ([]dialo
 				Last:     lastMsg,
 			})
 		}
+		if progress != nil {
+			progress(len(allElems))
+		}
 
 		// Update offset for next batch using the last dialog in dialogsSlice
 		// (regardless of whether it was successfully processed or skipped)
 		if len(dialogsSlice) > 0 {
 			lastDialog, ok := dialogsSlice[len(dialogsSlice)-1].(*tg.Dialog)
-			if ok {
-				// Get the message date from message map
-				var msgDate int
-				if lastMsg, found := messageMap[lastDialog.TopMessage]; found {
-					msgDate = lastMsg.GetDate()
+			if !ok {
+				return allElems, skipped, fmt.Errorf("unexpected dialog element %T", dialogsSlice[len(dialogsSlice)-1])
+			}
+			// Get the message date from the typed message map. A non-empty top
+			// message without a matching peer is not safe to treat as date zero:
+			// doing so can restart pagination and silently omit later dialogs.
+			var msgDate int
+			lastPeerKey := typedPeerRef(lastDialog.Peer)
+			if lastPeerKey == "" {
+				return allElems, skipped, fmt.Errorf("unsupported dialog peer %T for pagination", lastDialog.Peer)
+			}
+			lastMsg, found := messageMap[dialogMessageKey{Peer: lastPeerKey, ID: lastDialog.TopMessage}]
+			if found {
+				msgDate = lastMsg.GetDate()
+			} else if lastDialog.TopMessage != 0 {
+				return allElems, skipped, fmt.Errorf(
+					"missing last message %s/%d for dialog pagination",
+					lastPeerKey, lastDialog.TopMessage,
+				)
+			}
+			pageKey := fmt.Sprintf("%d:%d:%s", msgDate, lastDialog.TopMessage, typedPeerRef(lastDialog.Peer))
+			if seenPages[pageKey] {
+				return allElems, skipped, fmt.Errorf("dialog pagination made no progress at %s", pageKey)
+			}
+			seenPages[pageKey] = true
+
+			offsetDate = msgDate
+			offsetID = lastDialog.TopMessage
+
+			// Set offset peer based on dialog peer type.
+			// Try to get access hash from entities if available.
+			switch peerType := lastDialog.Peer.(type) {
+			case *tg.PeerUser:
+				if user, ok := entities.User(peerType.UserID); ok {
+					offsetPeer = &tg.InputPeerUser{
+						UserID:     peerType.UserID,
+						AccessHash: user.AccessHash,
+					}
+				} else {
+					// Can't continue pagination without access hash
+					log.Error("failed to get user for offset, stopping pagination",
+						zap.Int64("user_id", peerType.UserID))
+					return allElems, skipped, fmt.Errorf("failed to get user for offset: %d", peerType.UserID)
 				}
-
-				offsetDate = msgDate
-				offsetID = lastDialog.TopMessage
-
-				// Set offset peer based on dialog peer type
-				// Try to get access hash from entities if available
-				switch peerType := lastDialog.Peer.(type) {
-				case *tg.PeerUser:
-					if user, ok := entities.User(peerType.UserID); ok {
-						offsetPeer = &tg.InputPeerUser{
-							UserID:     peerType.UserID,
-							AccessHash: user.AccessHash,
-						}
-					} else {
-						// Can't continue pagination without access hash
-						log.Error("failed to get user for offset, stopping pagination",
-							zap.Int64("user_id", peerType.UserID))
-						color.Red("Error: failed to get user for offset, stopping pagination. User ID: %d", peerType.UserID)
-						return allElems, skipped
+			case *tg.PeerChat:
+				offsetPeer = &tg.InputPeerChat{ChatID: peerType.ChatID}
+			case *tg.PeerChannel:
+				if channel, ok := entities.Channel(peerType.ChannelID); ok {
+					offsetPeer = &tg.InputPeerChannel{
+						ChannelID:  peerType.ChannelID,
+						AccessHash: channel.AccessHash,
 					}
-				case *tg.PeerChat:
-					offsetPeer = &tg.InputPeerChat{ChatID: peerType.ChatID}
-				case *tg.PeerChannel:
-					if channel, ok := entities.Channel(peerType.ChannelID); ok {
-						offsetPeer = &tg.InputPeerChannel{
-							ChannelID:  peerType.ChannelID,
-							AccessHash: channel.AccessHash,
-						}
-					} else {
-						// Can't continue pagination without access hash
-						log.Error("failed to get channel for offset, stopping pagination",
-							zap.Int64("channel_id", peerType.ChannelID))
-						color.Red("Error: failed to get channel for offset, stopping pagination. Channel ID: %d", peerType.ChannelID)
-						return allElems, skipped
-					}
+				} else {
+					// Can't continue pagination without access hash
+					log.Error("failed to get channel for offset, stopping pagination",
+						zap.Int64("channel_id", peerType.ChannelID))
+					return allElems, skipped, fmt.Errorf("failed to get channel for offset: %d", peerType.ChannelID)
 				}
 			}
 		}
@@ -583,9 +761,7 @@ func fetchDialogsWithErrorHandling(ctx context.Context, api *tg.Client) ([]dialo
 		// Continue fetching if we got a full batch (there might be more)
 		if len(dialogsSlice) < batchSize {
 			// Got less than requested, we've reached the end
-			break
+			return allElems, skipped, nil
 		}
 	}
-
-	return allElems, skipped
 }
