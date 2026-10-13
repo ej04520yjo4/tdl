@@ -102,6 +102,34 @@ def main() -> None:
                 report["qr_display_test"] = "PASS_CANCELLED_BEFORE_AUTHENTICATION"
                 report["qr_verification_receipt"] = qr_receipt.name
         (release / "build-info.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    # GitHub sanitizes non-ASCII asset names (different Chinese ZIP names
+    # can both become TDL.zip). Keep friendly local names and publish these
+    # unambiguous ASCII aliases, with Chinese descriptions in the release.
+    aliases = {
+        "TDL下載助手.exe": "TDL-Desktop-1.2.0.exe",
+        "TDL桌面版原始碼.zip": "TDL-Desktop-Source-1.2.0.zip",
+        "TDL桌面版交接清冊-1.2.0.md": "Handover-1.2.0.zh-TW.md",
+        "使用說明.md": "README.zh-TW.md",
+        "驗證結果.md": "VALIDATION.zh-TW.md",
+    }
+    for source, target in aliases.items():
+        if (release / source).is_file():
+            copy_release_file(release / source, release / target)
+    with zipfile.ZipFile(release / "THIRD-PARTY-LICENSES.zip", "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(licenses.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(release).as_posix())
+    assets = [*aliases.values(), "THIRD-PARTY-LICENSES.zip", "build-info.json"]
+    for name in ("verification.json", "restart-verification.json", "channel-ui-verification.json", "channel-live-verification.json", "qr-login-verification.json"):
+        path = release / name
+        if path.exists() and executable.exists():
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+            if receipt.get("sha256") == report["sha256"] and (receipt.get("ok") or receipt.get("result") == "PASS"):
+                assets.append(name)
+    (release / "SHA256SUMS.txt").write_text(
+        "".join(hashlib.sha256((release / name).read_bytes()).hexdigest() + "  " + name + "\n" for name in assets if (release / name).is_file()),
+        encoding="utf-8",
+    )
     print("Release source and licenses collected.")
 
 
