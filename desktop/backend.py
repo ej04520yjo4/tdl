@@ -49,6 +49,16 @@ SESSION_FILE_NAME = "session.dpapi"
 _JSON_VERSION = 1
 _TAIPEI_TZ = timezone(timedelta(hours=8), name="Asia/Taipei")
 EXPORT_MEDIA_TYPES = frozenset({"video", "photo", "audio", "document"})
+CHAT_CACHE_FILE_NAME = "chats.dpapi"
+# The core reports progress several times per second and file.  Rewriting the
+# queue and history JSON for each event made the core block on its stdout pipe,
+# which slowed the transfer itself; state changes are still written at once.
+_PROGRESS_PERSIST_INTERVAL = 2.0
+# Scan manifests that were never turned into a download are only useful for
+# the current session; resumable jobs keep their own snapshot.
+_EXPORT_RETENTION_SECONDS = 7 * 24 * 60 * 60
+DEFAULT_TEMPLATE = "{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}"
+FORWARD_MODES = frozenset({"direct", "clone"})
 
 # Operations are tracked at module scope rather than on ``Runner`` instances.
 # The window normally owns one Runner, but keeping the registry shared also
@@ -359,6 +369,86 @@ class Account:
         )
 
 
+_EXTENSION_RE = re.compile(r"^[A-Za-z0-9_+-]{1,16}$")
+
+
+def normalize_extensions(value: Any) -> list[str]:
+    """Normalize ``mp4, .MKV`` style input for ``--include``/``--exclude``."""
+
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        raw_items: Iterable[Any] = re.split(r"[\s,，;；]+", value)
+    elif isinstance(value, Iterable) and not isinstance(value, (bytes, bytearray, Mapping)):
+        raw_items = value
+    else:
+        raise ValidationError("副檔名清單格式無效")
+    result: list[str] = []
+    for raw_item in raw_items:
+        item = str(raw_item).strip().lstrip(".").lower()
+        if not item:
+            continue
+        if not _EXTENSION_RE.fullmatch(item):
+            raise ValidationError(f"副檔名格式無效：{sanitize_text(item)[:20]}")
+        if item not in result:
+            result.append(item)
+    if len(result) > 50:
+        raise ValidationError("副檔名最多只能填 50 個")
+    return result
+
+
+def validate_template(value: Any) -> str:
+    """Validate a ``tdl dl --template`` value; empty keeps the core default."""
+
+    text = str(value or "").strip()
+    if not text or text == DEFAULT_TEMPLATE:
+        return ""
+    if len(text) > 300 or any(ord(char) < 0x20 for char in text):
+        raise ValidationError("檔名格式過長或包含換行")
+    if "{{" not in text or "}}" not in text:
+        raise ValidationError("檔名格式需要包含 {{ }} 變數，例如 {{ .MessageID }}")
+    # The template is one file name below the download folder.  Path
+    # separators outside the {{ }} actions would point the core elsewhere.
+    literal = re.sub(r"\{\{.*?\}\}", "", text)
+    if any(char in literal for char in '\\/:*?"<>|') or ".." in literal:
+        raise ValidationError("檔名格式不可包含路徑或 Windows 不允許的檔名字元")
+    return text
+
+
+def normalize_download_advanced(raw: Any) -> dict[str, Any]:
+    """Return the validated advanced ``tdl dl`` options stored with a job.
+
+    The result is a JSON-shaped mapping so a paused job resumes with exactly
+    the options it was created with, even after the preferences change.
+    """
+
+    data = dict(raw) if isinstance(raw, Mapping) else {}
+    include = normalize_extensions(data.get("include"))
+    exclude = normalize_extensions(data.get("exclude"))
+    if include and exclude:
+        raise ValidationError("「只下載」與「排除」副檔名只能擇一設定")
+
+    def bounded(name: str, default: int, low: int, high: int) -> int:
+        value = data.get(name, default)
+        if isinstance(value, bool):
+            return default
+        try:
+            return max(low, min(int(value), high))
+        except (TypeError, ValueError, OverflowError):
+            return default
+
+    return {
+        "template": validate_template(data.get("template")),
+        "include": include,
+        "exclude": exclude,
+        "desc": bool(data.get("desc", False)),
+        "takeout": bool(data.get("takeout", False)),
+        "rewrite_ext": bool(data.get("rewrite_ext", False)),
+        "threads": bounded("threads", 4, 1, 16),
+        "delay_ms": bounded("delay_ms", 0, 0, 60000),
+    }
+
+
 @dataclass
 class Preferences:
     download_dir: str = ""
@@ -368,6 +458,16 @@ class Preferences:
     group: bool = True
     proxy: str = ""
     language: str = "zh-TW"
+    # Advanced ``tdl dl`` options.  Extensions are kept as the comma-separated
+    # text the user typed so the settings page can show it back unchanged.
+    template: str = ""
+    include_ext: str = ""
+    exclude_ext: str = ""
+    desc: bool = False
+    takeout: bool = False
+    rewrite_ext: bool = False
+    threads: int = 4
+    delay_ms: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -378,6 +478,22 @@ class Preferences:
     def get(self, key: str, default: Any = None) -> Any:
         return self.to_dict().get(key, default)
 
+    def download_advanced(self) -> dict[str, Any]:
+        """Advanced options a new download job inherits from the settings."""
+
+        return normalize_download_advanced(
+            {
+                "template": self.template,
+                "include": self.include_ext,
+                "exclude": self.exclude_ext,
+                "desc": self.desc,
+                "takeout": self.takeout,
+                "rewrite_ext": self.rewrite_ext,
+                "threads": self.threads,
+                "delay_ms": self.delay_ms,
+            }
+        )
+
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any], default_download_dir: str) -> "Preferences":
         data = dict(raw)
@@ -386,6 +502,23 @@ class Preferences:
             concurrency = int(data.get("concurrency", 2))
         except (ValueError, TypeError):
             concurrency = 2
+        # A hand-edited or older preferences file must not make the whole
+        # settings page unreadable; fall back to the defaults instead.
+        try:
+            advanced = normalize_download_advanced(
+                {
+                    "template": data.get("template"),
+                    "include": data.get("include_ext"),
+                    "exclude": data.get("exclude_ext"),
+                    "desc": data.get("desc"),
+                    "takeout": data.get("takeout"),
+                    "rewrite_ext": data.get("rewrite_ext"),
+                    "threads": data.get("threads", 4),
+                    "delay_ms": data.get("delay_ms", 0),
+                }
+            )
+        except ValidationError:
+            advanced = normalize_download_advanced({})
         return cls(
             download_dir=directory,
             concurrency=max(1, min(concurrency, 64)),
@@ -394,6 +527,14 @@ class Preferences:
             group=bool(data.get("group", True)),
             proxy=str(data.get("proxy") or ""),
             language=str(data.get("language") or "zh-TW"),
+            template=advanced["template"],
+            include_ext=", ".join(advanced["include"]),
+            exclude_ext=", ".join(advanced["exclude"]),
+            desc=advanced["desc"],
+            takeout=advanced["takeout"],
+            rewrite_ext=advanced["rewrite_ext"],
+            threads=advanced["threads"],
+            delay_ms=advanced["delay_ms"],
         )
 
 
@@ -430,6 +571,17 @@ class DownloadJob:
     # Stable per-file progress survives a close/reopen and is intentionally a
     # top-level JSON mapping so the Qt queue can restore rows directly.
     file_progress: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Advanced ``tdl dl`` options captured when the job was created; see
+    # ``normalize_download_advanced``.
+    advanced: dict[str, Any] = field(default_factory=dict)
+    # Totals reported by a channel scan, so the queue can show overall
+    # progress before the core has discovered every file.  Zero is unknown.
+    expected_files: int = 0
+    expected_bytes: int = 0
+    # What a completed job actually transferred.  They replace the per-file
+    # rows, which are dropped once nothing can resume; see ``_complete_job``.
+    file_count: int = 0
+    total_bytes: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -474,7 +626,30 @@ class DownloadJob:
                 if isinstance(value, str)
             ],
             file_progress=_normalize_file_progress(raw.get("file_progress", {})),
+            advanced=_stored_download_advanced(raw.get("advanced")),
+            expected_files=_non_negative_int(raw.get("expected_files")),
+            expected_bytes=_non_negative_int(raw.get("expected_bytes")),
+            file_count=_non_negative_int(raw.get("file_count")),
+            total_bytes=_non_negative_int(raw.get("total_bytes")),
         )
+
+
+def _non_negative_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _stored_download_advanced(value: Any) -> dict[str, Any]:
+    """Read a persisted job's options; a damaged record uses the defaults."""
+
+    try:
+        return normalize_download_advanced(value)
+    except ValidationError:
+        return normalize_download_advanced({})
 
 
 class Store:
@@ -503,11 +678,13 @@ class Store:
         self._lock = threading.RLock()
         self._ensure_files()
         self.mark_interrupted_jobs()
+        self.prune_completed_queue()
         # A forced close can leave a plaintext core runtime behind.  Seal it
         # before the first new operation so the normal startup path does not
         # rely on a user opening each account once before credentials are
         # protected again.
         self.reseal_plaintext_runtimes()
+        self.purge_stale_exports()
 
     def _ensure_files(self) -> None:
         with self._lock:
@@ -679,6 +856,15 @@ class Store:
                 if key not in allowed:
                     raise ValidationError(f"不支援的偏好設定：{key}")
                 values[key] = value
+            # ``Preferences.from_dict`` forgives a damaged file by falling back
+            # to defaults; a value the user just typed must be rejected instead.
+            normalize_download_advanced(
+                {
+                    "template": values.get("template"),
+                    "include": values.get("include_ext"),
+                    "exclude": values.get("exclude_ext"),
+                }
+            )
             current = Preferences.from_dict(values, str(self._default_download_dir))
             # Keep metadata such as active_account_id that is stored beside
             # the user-facing preference fields.
@@ -882,6 +1068,9 @@ class Store:
         group: bool | None = None,
         concurrency: int | None = None,
         title: str | None = None,
+        advanced: Mapping[str, Any] | None = None,
+        expected_files: int = 0,
+        expected_bytes: int = 0,
     ) -> DownloadJob:
         self.get_account(account_id)
         clean_links = validate_message_links(links) if links else []
@@ -905,6 +1094,13 @@ class Store:
             group=prefs.group if group is None else bool(group),
             concurrency=count,
             title=clean_title,
+            advanced=(
+                prefs.download_advanced()
+                if advanced is None
+                else normalize_download_advanced(advanced)
+            ),
+            expected_files=_non_negative_int(expected_files),
+            expected_bytes=_non_negative_int(expected_bytes),
         )
         # Preserve the manifest before publishing the durable queue row.  A
         # failed copy therefore cannot leave a resumable job pointing at a
@@ -955,7 +1151,152 @@ class Store:
     def finish_job(self, job_id: str, status: str, *, error: str | None = None) -> DownloadJob:
         if status not in {"completed", "failed", "cancelled", "interrupted", "paused"}:
             raise ValidationError("下載完成狀態無效")
-        return self._update_job(job_id, status=status, finished_at=_utc_now(), error=error)
+        if status != "completed":
+            return self._update_job(job_id, status=status, finished_at=_utc_now(), error=error)
+        return self._complete_job(job_id, error=error)
+
+    def _complete_job(self, job_id: str, *, error: str | None) -> DownloadJob:
+        """Record a completed job and release everything kept for a resume.
+
+        A finished job is never restarted, so its per-file rows (thousands
+        for a channel) would only make every later queue write slower.  Both
+        records keep the totals instead; the queue copy itself is dropped by
+        ``prune_completed_queue`` on the next launch.
+        """
+
+        with self._lock:
+            queue_items = self._read_items(self._queue_path)
+            history_items = self._read_items(self._history_path)
+            found: Optional[dict[str, Any]] = None
+            for items in (queue_items, history_items):
+                for item in items:
+                    if str(item.get("id")) != str(job_id):
+                        continue
+                    rows = _normalize_file_progress(item.get("file_progress", {}))
+                    item.update(status="completed", finished_at=_utc_now(), error=error)
+                    if rows:
+                        item["file_count"] = len(rows)
+                        item["total_bytes"] = sum(int(row.get("total", 0) or 0) for row in rows.values())
+                    item["file_progress"] = {}
+                    item["file_snapshots"] = []
+                    if found is None:
+                        found = item
+            if found is None:
+                raise StoreError("找不到下載工作")
+            self._save_items(self._queue_path, queue_items)
+            self._save_items(self._history_path, history_items)
+            job = DownloadJob.from_dict(found)
+        self._remove_job_data(job.account_id, job.id)
+        return job
+
+    def prune_completed_queue(self) -> int:
+        """Drop completed jobs of earlier sessions from the queue file."""
+
+        with self._lock:
+            queue_items = self._read_items(self._queue_path)
+            kept = [item for item in queue_items if str(item.get("status")) != "completed"]
+            if len(kept) != len(queue_items):
+                self._save_items(self._queue_path, kept)
+            return len(queue_items) - len(kept)
+
+    def _remove_job_data(self, account_id: str, job_id: str) -> None:
+        """Delete one job's private manifest copies; never fails the caller."""
+
+        if not _is_uuid(str(job_id)):
+            return
+        try:
+            jobdata = self.account_root(account_id, create=False) / "jobdata"
+            target = _safe_child(jobdata, str(job_id))
+            if target.parent != jobdata.resolve() or target.is_symlink():
+                return
+            shutil.rmtree(target)
+        except (BackendError, OSError):
+            pass
+
+    def clear_finished_jobs(self) -> list[str]:
+        """Drop ended jobs from the queue; the history keeps their records.
+
+        Failed and cancelled jobs stay in the queue so they can be retried,
+        which also means they return on every launch until the user clears
+        them.  Jobs that may still resume on their own are left untouched.
+        """
+
+        removable = {"completed", "failed", "cancelled"}
+        removed: list[tuple[str, str]] = []
+        with self._lock:
+            kept: list[dict[str, Any]] = []
+            for item in self._read_items(self._queue_path):
+                if str(item.get("status")) in removable:
+                    removed.append((str(item.get("account_id", "")), str(item.get("id", ""))))
+                else:
+                    kept.append(item)
+            if removed:
+                self._save_items(self._queue_path, kept)
+                history_items = self._read_items(self._history_path)
+                cleared = {job_id for _account_id, job_id in removed}
+                for item in history_items:
+                    if str(item.get("id")) in cleared:
+                        item["file_progress"] = {}
+                        item["file_snapshots"] = []
+                self._save_items(self._history_path, history_items)
+        for account_id, job_id in removed:
+            self._remove_job_data(account_id, job_id)
+        return [job_id for _account_id, job_id in removed]
+
+    def purge_stale_exports(self, *, max_age_seconds: float = _EXPORT_RETENTION_SECONDS) -> int:
+        """Remove old channel scan manifests no resumable job still names."""
+
+        with self._lock:
+            referenced = {
+                os.path.normcase(str(Path(path)))
+                for job in self.list_resumable_jobs()
+                for path in job.files
+            }
+        cutoff = time.time() - max_age_seconds
+        removed = 0
+        for account in self.list_accounts():
+            try:
+                exports = self.account_root(account.id, create=False) / "exports"
+                if exports.is_symlink() or not exports.is_dir():
+                    continue
+                for path in exports.glob("*.json"):
+                    if path.is_symlink() or os.path.normcase(str(path.resolve())) in referenced:
+                        continue
+                    if path.stat().st_mtime < cutoff:
+                        path.unlink()
+                        removed += 1
+            except (BackendError, OSError):
+                continue
+        return removed
+
+    def save_chat_cache(self, account_id: str, chats: Sequence[Mapping[str, Any]]) -> None:
+        """Remember one account's chat list so pickers work before a refresh.
+
+        Chat titles are private, so the list gets the same DPAPI envelope as
+        the session instead of a readable JSON file.
+        """
+
+        payload = json.dumps(
+            {"version": _JSON_VERSION, "saved_at": _utc_now(), "chats": [dict(chat) for chat in chats]},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        path = self.account_root(account_id, create=True) / CHAT_CACHE_FILE_NAME
+        _atomic_write_bytes(path, _dpapi_protect(payload), strict_permissions=True)
+
+    def load_chat_cache(self, account_id: str) -> tuple[list[dict[str, Any]], str]:
+        """Return ``(chats, saved_at)``; an absent or unreadable cache is empty."""
+
+        try:
+            path = self.account_root(account_id, create=False) / CHAT_CACHE_FILE_NAME
+            if path.is_symlink() or not path.is_file():
+                return [], ""
+            raw = json.loads(_dpapi_unprotect(path.read_bytes()).decode("utf-8"))
+        except (BackendError, OSError, ValueError):
+            return [], ""
+        if not isinstance(raw, Mapping) or not isinstance(raw.get("chats"), list):
+            return [], ""
+        chats = [dict(chat) for chat in raw["chats"] if isinstance(chat, Mapping)]
+        return chats, str(raw.get("saved_at") or "")
 
     def get_job(self, job_id: str) -> DownloadJob:
         with self._lock:
@@ -1446,6 +1787,115 @@ def validate_topic_id(topic_id: str | int | None) -> Optional[int]:
     return value
 
 
+_DESTINATION_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
+
+
+def validate_destination(value: Any) -> str:
+    """Validate an upload/forward target chat; empty means Saved Messages.
+
+    Accepts the typed reference from the chat list (``channel:123``), a
+    numeric ID, or a public username with or without ``@``.  Anything else is
+    refused because the core would otherwise evaluate it as an expression.
+    """
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if _CHAT_ID_RE.fullmatch(text) or _CHAT_REF_RE.fullmatch(text):
+        return validate_chat_id(text)
+    username = text.lstrip("@")
+    if _DESTINATION_USERNAME_RE.fullmatch(username):
+        return username
+    raise ValidationError("目的地必須是清單中的對話、數字 ID 或 @username")
+
+
+def validate_upload_paths(paths: Sequence[str | os.PathLike[str]]) -> list[str]:
+    """Validate the local files or folders handed to ``tdl up --path``."""
+
+    if isinstance(paths, (str, bytes)) or not paths:
+        raise ValidationError("請先選擇要上傳的檔案或資料夾")
+    result: list[str] = []
+    for raw in paths:
+        if not isinstance(raw, (str, os.PathLike)) or not str(raw).strip():
+            raise ValidationError("上傳路徑格式無效")
+        path = Path(raw).expanduser().resolve()
+        if not path.exists():
+            raise ValidationError(f"找不到要上傳的項目：{path.name}")
+        if str(path) not in result:
+            result.append(str(path))
+    if len(result) > 500:
+        raise ValidationError("一次最多只能加入 500 個上傳項目")
+    return result
+
+
+def validate_forward_sources(sources: Sequence[str | os.PathLike[str]]) -> list[str]:
+    """Validate ``tdl forward --from`` values: message links or export JSON."""
+
+    if isinstance(sources, (str, bytes)) or not sources:
+        raise ValidationError("請先加入要轉傳的訊息連結或 JSON 清單")
+    result: list[str] = []
+    for raw in sources:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        # The core decides link versus file by the ``http`` prefix.
+        value = validate_message_link(text) if text.lower().startswith("http") else validate_export_file(text)
+        if value not in result:
+            result.append(value)
+    if not result:
+        raise ValidationError("請先加入要轉傳的訊息連結或 JSON 清單")
+    if len(result) > 1000:
+        raise ValidationError("一次最多只能加入 1000 個轉傳來源")
+    return result
+
+
+def validate_backup_destination(path: str | os.PathLike[str]) -> str:
+    if not isinstance(path, (str, os.PathLike)) or not str(path).strip():
+        raise ValidationError("請選擇備份檔的儲存位置")
+    target = Path(path).expanduser().resolve()
+    if target.suffix.lower() != ".tdl":
+        raise ValidationError("備份檔必須使用 .tdl 副檔名")
+    if not target.parent.is_dir():
+        raise ValidationError("備份檔的資料夾不存在")
+    if target.is_dir():
+        raise ValidationError("備份檔位置是一個資料夾")
+    return str(target)
+
+
+def validate_backup_source(path: str | os.PathLike[str]) -> str:
+    if not isinstance(path, (str, os.PathLike)) or not str(path).strip():
+        raise ValidationError("請選擇要還原的備份檔")
+    source = Path(path).expanduser()
+    if source.is_symlink():
+        raise ValidationError("備份檔不可是符號連結")
+    source = source.resolve()
+    if source.suffix.lower() != ".tdl" or not source.is_file():
+        raise ValidationError("備份檔不存在或副檔名不是 .tdl")
+    return str(source)
+
+
+def upload_caption_expression(mode: Any, text: Any = "") -> str:
+    """Build the ``tdl up --caption`` expression for a friendly caption mode.
+
+    The core evaluates the flag as an expression and then parses the result
+    as HTML, so literal text is HTML-escaped and quoted as a string literal.
+    """
+
+    kind = str(mode or "none").strip().lower()
+    if kind == "filename":
+        return "FileName + FileExt"
+    if kind == "text":
+        clean = str(text or "").strip()
+        if len(clean) > 1024:
+            raise ValidationError("說明文字最多 1024 個字元")
+        if clean:
+            escaped = clean.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            return json.dumps(escaped, ensure_ascii=False)
+    elif kind != "none":
+        raise ValidationError("說明文字模式無效")
+    return '""'
+
+
 def validate_media_types(media_types: Sequence[str]) -> tuple[str, ...]:
     """Normalize the four media filters accepted by the desktop workflow."""
 
@@ -1531,6 +1981,16 @@ _ERROR_TRANSLATIONS: tuple[tuple[str, str], ...] = (
     ("code_expired", "Telegram 驗證碼已過期，請重新取得驗證碼。"),
     ("password_hash_invalid", "Telegram 兩步驟驗證密碼無效，請重新輸入。"),
     ("flood_wait", "Telegram 要求稍後再試，請等待一段時間。"),
+    ("takeout_init_delay", "Telegram 要求等待一段時間（或在其他裝置確認）後才能使用 Takeout 模式，請先到設定關閉此選項。"),
+    ("chat_forwards_restricted", "來源對話禁止轉傳，請改用「複製」方式。"),
+    ("chat_write_forbidden", "這個帳號沒有在目的地發送訊息的權限。"),
+    ("chat_admin_required", "這個操作需要目的地的管理員權限。"),
+    ("user_banned_in_channel", "這個帳號在目的地被限制發言。"),
+    ("username_not_occupied", "找不到這個 @username，請確認拼字。"),
+    ("username_invalid", "找不到這個 @username，請確認拼字。"),
+    ("peer_id_invalid", "找不到目的地對話，請確認帳號已加入該對話後更新清單。"),
+    ("execute template", "檔名格式有誤，請到「設定」檢查檔名格式。"),
+    ("template: dl", "檔名格式有誤，請到「設定」檢查檔名格式。"),
     ("timeout", "網路連線逾時，請檢查網路後重試。"),
     ("deadline exceeded", "網路連線逾時，請檢查網路後重試。"),
     ("network is unreachable", "目前無法連線網路，請檢查網路設定。"),
@@ -1725,10 +2185,17 @@ def normalize_event(raw: Mapping[str, Any]) -> dict[str, Any]:
                 result["total_bytes"] = max(0, total_bytes)
         return result
     if name in {"status", "state", "message"}:
-        return {
+        result = {
             "event": "status",
             "message": sanitize_text(raw.get("message", raw.get("text", raw.get("status", "")))),
         }
+        # Upload and forward announce how many items they are about to send.
+        if raw.get("count") not in (None, "") and not isinstance(raw.get("count"), bool):
+            try:
+                result["count"] = max(0, int(raw["count"]))
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return result
     if name in {"progress", "download_progress"}:
         result = {"event": "progress"}
         # ``file_id`` and ``state`` are part of the desktop protocol's
@@ -1815,6 +2282,91 @@ class DownloadRequest:
     proxy: Optional[str] = None
     job_id: Optional[str] = None
     title: Optional[str] = None
+    # ``None`` inherits the preferences; see ``normalize_download_advanced``.
+    advanced: Optional[Mapping[str, Any]] = None
+    expected_files: int = 0
+    expected_bytes: int = 0
+
+
+@dataclass
+class UploadRequest:
+    account_id: str
+    paths: Sequence[str]
+    # Empty uploads to Saved Messages; see ``validate_destination``.
+    chat: str = ""
+    topic_id: Optional[int] = None
+    as_photo: bool = False
+    remove_after: bool = False
+    caption_mode: str = "none"
+    caption_text: str = ""
+    include: Sequence[str] = ()
+    exclude: Sequence[str] = ()
+    concurrency: Optional[int] = None
+    threads: Optional[int] = None
+    proxy: Optional[str] = None
+
+
+@dataclass
+class ForwardRequest:
+    account_id: str
+    # Message links and/or export JSON files.
+    sources: Sequence[str]
+    to: str = ""
+    mode: str = "direct"
+    silent: bool = False
+    dry_run: bool = False
+    single: bool = False
+    desc: bool = False
+    proxy: Optional[str] = None
+
+
+@dataclass
+class BackupRequest:
+    account_id: str
+    destination: str
+    proxy: Optional[str] = None
+
+
+@dataclass
+class RecoverRequest:
+    account_id: str
+    source: str
+    proxy: Optional[str] = None
+
+
+@dataclass
+class WhoamiRequest:
+    """Ask Telegram who the stored session belongs to and record the answer."""
+
+    account_id: str
+    proxy: Optional[str] = None
+
+
+# Operations that never create a download record.  They share the per-account
+# core lock with downloads and wait their turn instead of failing fast.
+_TransferRequest = (UploadRequest, ForwardRequest, BackupRequest, RecoverRequest, WhoamiRequest)
+
+CoreRequest = (
+    LoginRequest
+    | ListChatsRequest
+    | ListTopicsRequest
+    | ExportRequest
+    | DownloadRequest
+    | UploadRequest
+    | ForwardRequest
+    | BackupRequest
+    | RecoverRequest
+    | WhoamiRequest
+)
+
+
+def _csv_arg(value: str) -> str:
+    """Quote one value for a cobra StringSlice flag, which splits on commas."""
+
+    text = str(value)
+    if "," in text or '"' in text:
+        return '"' + text.replace('"', '""') + '"'
+    return text
 
 
 @dataclass
@@ -2025,9 +2577,41 @@ class Runner:
         _restrict_permissions(candidate.parent)
         return str(candidate)
 
+    @staticmethod
+    def _validate_transfer(request: Any) -> None:
+        """Normalize an upload/forward/backup request before a worker starts."""
+
+        request.proxy = validate_proxy(request.proxy) if request.proxy is not None else None
+        if isinstance(request, UploadRequest):
+            request.paths = validate_upload_paths(request.paths)
+            request.chat = validate_destination(request.chat)
+            request.topic_id = validate_topic_id(request.topic_id)
+            if request.topic_id is not None and not request.chat:
+                raise ValidationError("指定論壇主題時必須同時選擇目的地群組")
+            request.include = normalize_extensions(request.include)
+            request.exclude = normalize_extensions(request.exclude)
+            if request.include and request.exclude:
+                raise ValidationError("「只上傳」與「排除」副檔名只能擇一設定")
+            # Fail on a bad caption here rather than after the core connects.
+            upload_caption_expression(request.caption_mode, request.caption_text)
+            for name in ("concurrency", "threads"):
+                value = getattr(request, name)
+                if value is not None and not 1 <= int(value) <= 16:
+                    raise ValidationError("同時數量必須介於 1 到 16")
+        elif isinstance(request, ForwardRequest):
+            request.sources = validate_forward_sources(request.sources)
+            request.to = validate_destination(request.to)
+            request.mode = str(request.mode or "direct").strip().lower()
+            if request.mode not in FORWARD_MODES:
+                raise ValidationError("轉傳方式只能是直接轉傳或複製")
+        elif isinstance(request, BackupRequest):
+            request.destination = validate_backup_destination(request.destination)
+        elif isinstance(request, RecoverRequest):
+            request.source = validate_backup_source(request.source)
+
     def start(
         self,
-        request: LoginRequest | ListChatsRequest | ListTopicsRequest | ExportRequest | DownloadRequest,
+        request: CoreRequest,
         *,
         on_event: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> RunHandle:
@@ -2056,6 +2640,8 @@ class Runner:
                 request.end_unix = end_unix
                 request.proxy = validate_proxy(request.proxy) if request.proxy is not None else None
                 self._validate_export_output_path(request.account_id, request.output_path)
+            elif isinstance(request, _TransferRequest):
+                self._validate_transfer(request)
             if isinstance(request, DownloadRequest) and request.job_id:
                 stored_job = self.store.get_job(request.job_id)
                 if stored_job.account_id != str(request.account_id):
@@ -2080,6 +2666,7 @@ class Runner:
                 request.group = stored_job.group
                 request.concurrency = stored_job.concurrency
                 request.title = stored_job.title
+                request.advanced = stored_job.advanced
             lock = self._account_lock(request.account_id)
             # A single account must never have two Bolt-backed core processes
             # at once.  Downloads and chat operations are queued in the
@@ -2102,8 +2689,12 @@ class Runner:
                     group=request.group,
                     concurrency=request.concurrency,
                     title=request.title,
+                    advanced=request.advanced,
+                    expected_files=request.expected_files,
+                    expected_bytes=request.expected_bytes,
                 )
                 request.job_id = job.id
+                request.advanced = job.advanced
             handle = RunHandle(request.account_id, callback=on_event)
             with self._handles_guard:
                 self._handles.add(handle)
@@ -2308,9 +2899,125 @@ class Runner:
             on_event=on_event,
         )
 
+    def start_upload(
+        self,
+        account_id: str,
+        paths: Sequence[str | os.PathLike[str]],
+        *,
+        chat: str = "",
+        topic_id: str | int | None = None,
+        as_photo: bool = False,
+        remove_after: bool = False,
+        caption_mode: str = "none",
+        caption_text: str = "",
+        include: Sequence[str] | str = (),
+        exclude: Sequence[str] | str = (),
+        concurrency: int | None = None,
+        threads: int | None = None,
+        proxy: str | None = None,
+        on_event: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> RunHandle:
+        """Upload local files to a chat; an empty chat is Saved Messages."""
+
+        return self.start(
+            UploadRequest(
+                account_id=str(account_id),
+                paths=list(paths),
+                chat=chat,
+                topic_id=validate_topic_id(topic_id),
+                as_photo=bool(as_photo),
+                remove_after=bool(remove_after),
+                caption_mode=caption_mode,
+                caption_text=caption_text,
+                include=include,
+                exclude=exclude,
+                concurrency=concurrency,
+                threads=threads,
+                proxy=proxy,
+            ),
+            on_event=on_event,
+        )
+
+    def start_forward(
+        self,
+        account_id: str,
+        sources: Sequence[str | os.PathLike[str]],
+        *,
+        to: str = "",
+        mode: str = "direct",
+        silent: bool = False,
+        dry_run: bool = False,
+        single: bool = False,
+        desc: bool = False,
+        proxy: str | None = None,
+        on_event: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> RunHandle:
+        """Forward messages named by links or export JSON files."""
+
+        return self.start(
+            ForwardRequest(
+                account_id=str(account_id),
+                sources=list(sources),
+                to=to,
+                mode=mode,
+                silent=bool(silent),
+                dry_run=bool(dry_run),
+                single=bool(single),
+                desc=bool(desc),
+                proxy=proxy,
+            ),
+            on_event=on_event,
+        )
+
+    def start_backup(
+        self,
+        account_id: str,
+        destination: str | os.PathLike[str],
+        *,
+        on_event: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> RunHandle:
+        """Write the account's session to a portable ``.tdl`` backup file.
+
+        The backup is the core's own format and is not DPAPI-protected, which
+        is what lets it move to another computer; callers must warn the user.
+        """
+
+        return self.start(
+            BackupRequest(account_id=str(account_id), destination=str(destination)),
+            on_event=on_event,
+        )
+
+    def start_recover(
+        self,
+        account_id: str,
+        source: str | os.PathLike[str],
+        *,
+        on_event: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> RunHandle:
+        """Load a ``.tdl`` backup into an account; follow with ``start_whoami``."""
+
+        return self.start(
+            RecoverRequest(account_id=str(account_id), source=str(source)),
+            on_event=on_event,
+        )
+
+    def start_whoami(
+        self,
+        account_id: str,
+        *,
+        proxy: str | None = None,
+        on_event: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> RunHandle:
+        """Confirm the stored session with Telegram and mark it logged in."""
+
+        return self.start(
+            WhoamiRequest(account_id=str(account_id), proxy=proxy),
+            on_event=on_event,
+        )
+
     def run(
         self,
-        request: LoginRequest | ListChatsRequest | ListTopicsRequest | ExportRequest | DownloadRequest,
+        request: CoreRequest,
     ) -> RunResult:
         handle = self.start(request)
         result = handle.wait()
@@ -2334,7 +3041,7 @@ class Runner:
 
     def _build_args(
         self,
-        request: LoginRequest | ListChatsRequest | ListTopicsRequest | ExportRequest | DownloadRequest,
+        request: CoreRequest,
         runtime: Path,
     ) -> list[str]:
         executable = self.resolve_executable()
@@ -2411,13 +3118,70 @@ class Runner:
                 args.extend(["--topic", str(validate_topic_id(request.topic_id))])
             return args
 
+        if isinstance(request, UploadRequest):
+            args.append("up")
+            for path in validate_upload_paths(request.paths):
+                args.extend(["--path", _csv_arg(path)])
+            # Without --chat the core uploads to Saved Messages.
+            destination = validate_destination(request.chat)
+            if destination:
+                args.extend(["--chat", destination])
+            if request.topic_id is not None:
+                args.extend(["--topic", str(validate_topic_id(request.topic_id))])
+            args.extend(["--caption", upload_caption_expression(request.caption_mode, request.caption_text)])
+            include = normalize_extensions(request.include)
+            exclude = normalize_extensions(request.exclude)
+            if include:
+                args.extend(["--include", ",".join(include)])
+            elif exclude:
+                args.extend(["--exclude", ",".join(exclude)])
+            if request.as_photo:
+                args.append("--photo")
+            if request.remove_after:
+                args.append("--rm")
+            if request.concurrency is not None:
+                args.extend(["--limit", str(int(request.concurrency))])
+            if request.threads is not None:
+                args.extend(["--threads", str(int(request.threads))])
+            return args
+
+        if isinstance(request, ForwardRequest):
+            args.append("forward")
+            for source in validate_forward_sources(request.sources):
+                args.extend(["--from", source])
+            destination = validate_destination(request.to)
+            if destination:
+                args.extend(["--to", destination])
+            args.extend(["--mode", request.mode])
+            for enabled, flag in (
+                (request.silent, "--silent"),
+                (request.dry_run, "--dry-run"),
+                (request.single, "--single"),
+                (request.desc, "--desc"),
+            ):
+                if enabled:
+                    args.append(flag)
+            return args
+
+        if isinstance(request, BackupRequest):
+            args.extend(["backup", "--dst", validate_backup_destination(request.destination)])
+            return args
+
+        if isinstance(request, RecoverRequest):
+            args.extend(["recover", "--file", validate_backup_source(request.source)])
+            return args
+
+        if isinstance(request, WhoamiRequest):
+            args.append("whoami")
+            return args
+
         prefs = self.store.get_preferences()
         output = Path(request.output_dir or prefs.download_dir).expanduser().resolve()
         args.extend(["dl"])
         for link in validate_message_links(request.links) if request.links else []:
             args.extend(["--url", link])
         for exported_file in validate_export_files(request.files or []):
-            args.extend(["--file", exported_file])
+            args.extend(["--file", _csv_arg(exported_file)])
         args.extend(["--dir", str(output)])
         if request.continue_download if request.continue_download is not None else prefs.continue_download:
             args.append("--continue")
@@ -2429,6 +3193,24 @@ class Runner:
         if int(concurrency) < 1 or int(concurrency) > 64:
             raise ValidationError("同時下載數量必須介於 1 到 64")
         args.extend(["--limit", str(int(concurrency))])
+        advanced = (
+            prefs.download_advanced()
+            if request.advanced is None
+            else normalize_download_advanced(request.advanced)
+        )
+        if advanced["template"]:
+            args.extend(["--template", advanced["template"]])
+        if advanced["include"]:
+            args.extend(["--include", ",".join(advanced["include"])])
+        elif advanced["exclude"]:
+            args.extend(["--exclude", ",".join(advanced["exclude"])])
+        for key, flag in (("desc", "--desc"), ("takeout", "--takeout"), ("rewrite_ext", "--rewrite-ext")):
+            if advanced[key]:
+                args.append(flag)
+        if advanced["threads"] != 4:  # the core default
+            args.extend(["--threads", str(advanced["threads"])])
+        if advanced["delay_ms"]:
+            args.extend(["--delay", f"{advanced['delay_ms']}ms"])
         return args
 
     @staticmethod
@@ -2443,7 +3225,7 @@ class Runner:
 
     def _worker(
         self,
-        request: LoginRequest | ListChatsRequest | ListTopicsRequest | ExportRequest | DownloadRequest,
+        request: CoreRequest,
         handle: RunHandle,
         lock: threading.Lock,
         lock_preacquired: bool,
@@ -2460,11 +3242,33 @@ class Runner:
         lock_held = lock_preacquired
         runtime_prepared = False
         export_output_created = False
+        # Per-file rows live here between durable writes; see
+        # ``_PROGRESS_PERSIST_INTERVAL``.
+        file_progress: dict[str, dict[str, Any]] = {}
+        pending_progress: dict[str, Any] = {}
+        last_progress_write = 0.0
+        transfer_counts = {"total": 0, "completed": 0, "failed": 0}
+
+        def persist_progress(*, force: bool = False) -> None:
+            nonlocal last_progress_write
+            if job is None or not pending_progress:
+                return
+            now = time.monotonic()
+            if not force and now - last_progress_write < _PROGRESS_PERSIST_INTERVAL:
+                return
+            updates = dict(pending_progress)
+            pending_progress.clear()
+            last_progress_write = now
+            self.store.update_job_progress(job.id, **updates)
+
         try:
             if not lock_held:
                 waiting_status_sent = False
                 while not lock.acquire(blocking=False):
-                    if isinstance(request, (ListChatsRequest, ListTopicsRequest, ExportRequest)) and not waiting_status_sent:
+                    if (
+                        isinstance(request, (ListChatsRequest, ListTopicsRequest, ExportRequest, *_TransferRequest))
+                        and not waiting_status_sent
+                    ):
                         self._emit(
                             handle,
                             {"event": "status", "message": "前面仍有帳號操作，查詢已排隊。"},
@@ -2510,8 +3314,12 @@ class Runner:
                         group=request.group,
                         concurrency=request.concurrency,
                         title=request.title,
+                        advanced=request.advanced,
+                        expected_files=request.expected_files,
+                        expected_bytes=request.expected_bytes,
                     )
                 self.store.mark_job_running(job.id)
+                file_progress = {key: dict(row) for key, row in job.file_progress.items()}
 
             runtime = self.vault.prepare(request.account_id)
             runtime_prepared = True
@@ -2532,10 +3340,13 @@ class Runner:
             env = os.environ.copy()
             env[GUI_ENV] = "1"
             env[DATA_ENV] = str(runtime)
-            # Prevent an inherited GUI setting from selecting an unrelated
-            # storage file.  The explicit --storage argument remains primary.
-            env.pop("TDL_STORAGE", None)
-            env.pop("TDL_NS", None)
+            # The core reads every TDL_<FLAG> variable as a default.  Drop
+            # inherited ones so a developer shell cannot select an unrelated
+            # storage file or change options the GUI did not pass explicitly.
+            # TDL_DESKTOP_* belongs to this front end (data root, fixtures).
+            for name in [key for key in env if key.upper().startswith("TDL_")]:
+                if name.upper() not in {GUI_ENV, DATA_ENV} and not name.upper().startswith("TDL_DESKTOP_"):
+                    del env[name]
             process = subprocess.Popen(
                 args,
                 cwd=str(self.project_root),
@@ -2589,14 +3400,14 @@ class Runner:
                     if event.get("event") == "error":
                         auth_invalid_seen = auth_invalid_seen or _is_auth_invalid_error(decoded, event)
                         last_error = str(event.get("message") or "核心程式執行失敗。")
+                        if event.get("file_id"):
+                            transfer_counts["failed"] += 1
                         if job is not None and event.get("file_id"):
                             file_id = sanitize_text(event.get("file_id"))[:200]
-                            file_progress = dict(job.file_progress)
-                            row = dict(file_progress.get(file_id, {}))
-                            row["file_id"] = file_id
+                            row = file_progress.setdefault(file_id, {"file_id": file_id})
                             row["state"] = sanitize_text(event.get("state") or "failed")
-                            file_progress[file_id] = row
-                            job = self.store.update_job_progress(job.id, file_progress=file_progress)
+                            pending_progress["file_progress"] = file_progress
+                            persist_progress(force=True)
                     elif event.get("event") == "authenticated":
                         # Do not mark an account logged in until the child has
                         # exited successfully and the session vault has sealed
@@ -2670,24 +3481,30 @@ class Runner:
                                 last_error = "匯出核心回報的檔案大小無效。"
                                 self._emit(handle, {"event": "error", "message": last_error})
                     elif event.get("event") == "progress" and job is not None:
-                        progress_updates: dict[str, Any] = {
-                            "percent": event.get("percent"),
-                            "current": event.get("current"),
-                            "total": event.get("total"),
-                            "speed": event.get("speed"),
-                            "filename": event.get("filename"),
-                        }
+                        pending_progress.update(
+                            percent=event.get("percent"),
+                            current=event.get("current"),
+                            total=event.get("total"),
+                            speed=event.get("speed"),
+                            filename=event.get("filename"),
+                        )
                         if event.get("file_id"):
                             file_id = sanitize_text(event.get("file_id"))[:200]
-                            file_progress = dict(job.file_progress)
-                            row = dict(file_progress.get(file_id, {}))
-                            row["file_id"] = file_id
+                            row = file_progress.setdefault(file_id, {"file_id": file_id})
                             for key in ("state", "current", "total", "percent", "filename"):
                                 if event.get(key) is not None:
                                     row[key] = event.get(key)
-                            file_progress[file_id] = row
-                            progress_updates["file_progress"] = file_progress
-                        job = self.store.update_job_progress(job.id, **progress_updates)
+                            pending_progress["file_progress"] = file_progress
+                        # Completions are not forced to disk either: a channel
+                        # of small photos finishes many files per second.  The
+                        # core's own checkpoint and --skip-same decide what a
+                        # resumed job downloads, not these display rows.
+                        persist_progress()
+                    elif event.get("event") == "progress" and isinstance(request, (UploadRequest, ForwardRequest)):
+                        if event.get("state") == "completed":
+                            transfer_counts["completed"] += 1
+                    elif event.get("event") == "status" and isinstance(request, (UploadRequest, ForwardRequest)):
+                        transfer_counts["total"] = int(event.get("count", transfer_counts["total"]) or 0)
             returncode = process.wait()
             stderr_thread.join(timeout=2)
             if handle.cancel_requested.is_set():
@@ -2786,8 +3603,9 @@ class Runner:
                     # this is only a defensive guard for a corrupted store.
                     pass
             authenticated_ok = authenticated_event is not None and bool(authenticated_event.get("id"))
+            identifies_account = isinstance(request, (LoginRequest, WhoamiRequest))
             if (
-                isinstance(request, LoginRequest)
+                identifies_account
                 and not stopped
                 and returncode == 0
                 and not last_error
@@ -2797,7 +3615,7 @@ class Runner:
                 last_error = "登入核心未回報完整的已驗證帳號資訊。"
                 self._emit(handle, {"event": "error", "message": last_error})
             if (
-                isinstance(request, LoginRequest)
+                identifies_account
                 and authenticated_ok
                 and not stopped
                 and returncode == 0
@@ -2825,10 +3643,20 @@ class Runner:
                 else:
                     status = "completed"
                 try:
+                    persist_progress(force=True)
                     self.store.finish_job(job.id, status, error=last_error)
                 except StoreError:
                     pass
             success = not stopped and not last_error and returncode == 0
+            if isinstance(request, (UploadRequest, ForwardRequest)):
+                operation_data = dict(transfer_counts)
+            elif isinstance(request, ListChatsRequest) and success and operation_data is not None:
+                try:
+                    self.store.save_chat_cache(request.account_id, operation_data.get("chats", []))
+                except (BackendError, OSError, TypeError, ValueError):
+                    # The cache only spares the user a refresh on the next
+                    # launch; the list just returned is still valid.
+                    pass
             result = RunResult(
                 success=success,
                 returncode=returncode,
@@ -2850,17 +3678,21 @@ class Runner:
 __all__ = [
     "Account",
     "BackendError",
+    "BackupRequest",
     "CoreNotFound",
+    "DEFAULT_TEMPLATE",
     "DataProtectionError",
     "DownloadJob",
     "DownloadRequest",
     "EVENT_PREFIX",
     "EXPORT_MEDIA_TYPES",
     "ExportRequest",
+    "ForwardRequest",
     "LoginRequest",
     "ListChatsRequest",
     "ListTopicsRequest",
     "Preferences",
+    "RecoverRequest",
     "RunHandle",
     "RunResult",
     "Runner",
@@ -2869,17 +3701,28 @@ __all__ = [
     "SessionVault",
     "Store",
     "StoreError",
+    "UploadRequest",
     "ValidationError",
+    "WhoamiRequest",
+    "normalize_download_advanced",
     "normalize_event",
+    "normalize_extensions",
     "sanitize_text",
     "translate_error",
+    "upload_caption_expression",
+    "validate_backup_destination",
+    "validate_backup_source",
     "validate_chat_id",
+    "validate_destination",
     "validate_export_window",
+    "validate_forward_sources",
     "validate_message_link",
     "validate_message_links",
     "validate_export_file",
     "validate_export_files",
     "validate_media_types",
+    "validate_template",
     "validate_topic_id",
+    "validate_upload_paths",
     "validate_proxy",
 ]

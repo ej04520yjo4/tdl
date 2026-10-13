@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 
 from verify_release import _run_frozen_check
+from version import VERSION
 
 
 def main(report_path: str | os.PathLike[str] | None = None) -> int:
@@ -33,7 +34,7 @@ def main(report_path: str | os.PathLike[str] | None = None) -> int:
     if not payload.get("ok"):
         raise RuntimeError("native channel UI verification reported failure")
     payload.update(
-        version="1.2.0",
+        version=VERSION,
         sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),
     )
     report.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

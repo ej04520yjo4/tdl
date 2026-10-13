@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 from verify_release import _run_frozen_check
+from version import VERSION
 
 
 def main() -> None:
@@ -28,7 +29,7 @@ def main() -> None:
     payload = json.loads(report.read_text(encoding="utf-8"))
     assert payload["ok"], payload
     payload.update(
-        version="1.2.0",
+        version=VERSION,
         sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),
         actual_executable_clicked_login_and_rendered_qr=True,
         cancelled_before_account_authentication=True,

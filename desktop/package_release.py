@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import stat
 import subprocess
@@ -10,6 +11,8 @@ import sys
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
+
+from version import VERSION
 
 
 def copy_release_file(source: Path, target: Path) -> None:
@@ -20,8 +23,25 @@ def copy_release_file(source: Path, target: Path) -> None:
     shutil.copyfile(source, target)
 
 
+def write_version_info(root: Path) -> Path:
+    """Stamp the EXE version resource from ``desktop/version.py``.
+
+    ``desktop/version_info.txt`` is the template; PyInstaller is pointed at
+    the stamped copy so the resource cannot drift from the release version.
+    """
+    numbers = ",".join((VERSION.split(".") + ["0"] * 4)[:4])
+    text = (root / "desktop" / "version_info.txt").read_text(encoding="utf-8")
+    text = re.sub(r"(filevers|prodvers)=\([\d,]+\)", rf"\1=({numbers})", text)
+    text = re.sub(r"('(?:FileVersion|ProductVersion)', ')[^']*'", rf"\g<1>{VERSION}'", text)
+    target = root / ".build" / "version_info.txt"
+    target.parent.mkdir(exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    return target
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
+    write_version_info(root)
     release = root / "dist"
     release.mkdir(exist_ok=True)
     licenses = release / "licenses"
@@ -29,7 +49,8 @@ def main() -> None:
     copy_release_file(root / "LICENSE", licenses / "TDL-AGPL-3.0.txt")
     copy_release_file(root / "desktop" / "THIRD_PARTY_NOTICES.md", licenses / "THIRD_PARTY_NOTICES.md")
     copy_release_file(root / "README_zh-TW.md", release / "使用說明.md")
-    copy_release_file(root / "desktop" / "handovers" / "1.2.0.md", release / "TDL桌面版交接清冊-1.2.0.md")
+    handover_name = f"TDL桌面版交接清冊-{VERSION}.md"
+    copy_release_file(root / "desktop" / "handovers" / f"{VERSION}.md", release / handover_name)
     copy_release_file(root / "desktop" / "VALIDATION.md", release / "驗證結果.md")
     python_root = Path(sys.prefix)
     base_license = Path(sys.base_prefix) / "LICENSE.txt"
@@ -67,7 +88,7 @@ def main() -> None:
     if executable.exists():
         report = {
             "application": "TDL 繁體中文下載助手",
-            "version": "1.2.0",
+            "version": VERSION,
             "built_at_utc": datetime.now(timezone.utc).isoformat(),
             "base_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
             "sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
@@ -106,9 +127,9 @@ def main() -> None:
     # can both become TDL.zip). Keep friendly local names and publish these
     # unambiguous ASCII aliases, with Chinese descriptions in the release.
     aliases = {
-        "TDL下載助手.exe": "TDL-Desktop-1.2.0.exe",
-        "TDL桌面版原始碼.zip": "TDL-Desktop-Source-1.2.0.zip",
-        "TDL桌面版交接清冊-1.2.0.md": "Handover-1.2.0.zh-TW.md",
+        "TDL下載助手.exe": f"TDL-Desktop-{VERSION}.exe",
+        "TDL桌面版原始碼.zip": f"TDL-Desktop-Source-{VERSION}.zip",
+        handover_name: f"Handover-{VERSION}.zh-TW.md",
         "使用說明.md": "README.zh-TW.md",
         "驗證結果.md": "VALIDATION.zh-TW.md",
     }

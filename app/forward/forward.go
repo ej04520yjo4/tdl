@@ -23,6 +23,7 @@ import (
 	"github.com/iyear/tdl/core/tclient"
 	"github.com/iyear/tdl/core/util/tutil"
 	"github.com/iyear/tdl/pkg/consts"
+	"github.com/iyear/tdl/pkg/desktopio"
 	"github.com/iyear/tdl/pkg/prog"
 	"github.com/iyear/tdl/pkg/texpr"
 	"github.com/iyear/tdl/pkg/tmessage"
@@ -78,12 +79,27 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		return errors.Wrap(err, "resolve edit")
 	}
 
+	gui := desktopio.From(ctx) != nil
+	total := totalMessages(dialogs)
+	if gui {
+		if total == 0 {
+			return errors.New("沒有找到可轉傳的訊息")
+		}
+		_ = desktopio.Emit(ctx, desktopio.Event{
+			Event:   "status",
+			Kind:    "forward",
+			Count:   int64(total),
+			Message: fmt.Sprintf("共 %d 則訊息等待轉傳", total),
+		})
+	}
+
 	fwProgress := prog.New(pw.FormatNumber)
-	fwProgress.SetNumTrackersExpected(totalMessages(dialogs))
-	if !viper.GetBool(consts.FlagDisableProgressPS) {
+	fwProgress.SetNumTrackersExpected(total)
+	if !gui && !viper.GetBool(consts.FlagDisableProgressPS) {
 		prog.EnablePS(ctx, fwProgress)
 	}
 
+	machineProgress := newProgress(ctx, fwProgress)
 	fw := forwarder.New(forwarder.Options{
 		Pool: pool,
 		Iter: newIter(iterOptions{
@@ -98,14 +114,20 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 			grouped: !opts.Single,
 			delay:   viper.GetDuration(consts.FlagDelay),
 		}),
-		Progress: newProgress(fwProgress),
+		Progress: machineProgress,
 		Threads:  viper.GetInt(consts.FlagThreads),
 	})
 
-	go fwProgress.Render()
-	defer prog.Wait(ctx, fwProgress)
+	if !gui {
+		go fwProgress.Render()
+		defer prog.Wait(ctx, fwProgress)
+	}
 
-	return fw.Forward(ctx)
+	err = fw.Forward(ctx)
+	if err == nil && gui && machineProgress.Failures() > 0 {
+		return errors.New("有訊息轉傳失敗，請查看錯誤訊息後重試")
+	}
+	return err
 }
 
 func collectDialogs(ctx context.Context, input []string, desc bool) ([]*tmessage.Dialog, error) {

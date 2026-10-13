@@ -31,6 +31,7 @@ import re
 import sys
 import tempfile
 import threading
+import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -86,6 +87,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -112,13 +114,18 @@ from PySide6.QtWidgets import (
 
 try:
     from desktop.channel_page import ChannelPage
+    from desktop.transfer_page import TransferPage
+    from desktop.version import VERSION
 except ImportError:  # pragma: no cover - direct ``python desktop/app.py``
     from channel_page import ChannelPage
+    from transfer_page import TransferPage
+    from version import VERSION
 
 
 APP_NAME = "tdl 繁中下載器"
 APP_ORG = "tdl"
-VERSION_TEXT = "桌面版 1.2.0"
+VERSION_TEXT = f"桌面版 {VERSION}"
+PAGE_NAMES = ("頻道下載", "下載中心", "上傳與轉傳", "帳號管理", "下載紀錄", "設定與說明")
 
 BG = "#f4f7fb"
 CARD = "#ffffff"
@@ -264,12 +271,25 @@ class HistoryInfo:
     created_at: str = ""
     path: str = ""
     detail: str = ""
+    # "12 個檔案 · 3.4 GB" for a completed job; empty while unknown.
+    summary: str = ""
 
     @classmethod
     def from_value(cls, value: Any, index: int = 0) -> "HistoryInfo":
         created = _extract(value, "created_at", "date", "time", default="")
+        if isinstance(created, str) and created:
+            # The store keeps UTC ISO text; show the user's local wall time.
+            try:
+                created = datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone()
+            except ValueError:
+                pass
         if isinstance(created, datetime):
             created = created.strftime("%Y-%m-%d %H:%M")
+        file_count = int(_extract(value, "file_count", default=0) or 0)
+        total_bytes = int(_extract(value, "total_bytes", default=0) or 0)
+        summary = f"{file_count} 個檔案" if file_count else ""
+        if total_bytes:
+            summary += (" · " if summary else "") + _format_bytes(total_bytes)
         raw_status = _safe_str(_extract(value, "status", default="已完成"))
         status_map = {
             "completed": "已完成",
@@ -291,6 +311,7 @@ class HistoryInfo:
             created_at=_safe_str(created),
             path=_safe_str(_extract(value, "path", "file_path", "directory", default="")),
             detail=_safe_str(_extract(value, "detail", "error", "message", default="")),
+            summary=summary,
         )
 
 
@@ -314,6 +335,9 @@ class DownloadJob:
     resume_on_start: bool = False
     closing_pause: bool = False
     file_progress: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
+    # Totals from a channel scan; zero when the job size is not known yet.
+    expected_files: int = 0
+    expected_bytes: int = 0
     options: dict[str, Any] = field(default_factory=dict, repr=False)
     worker: Any = field(default=None, repr=False)
     thread: Any = field(default=None, repr=False)
@@ -325,6 +349,10 @@ class BackendUnavailable(RuntimeError):
 
 class CancelledError(RuntimeError):
     pass
+
+
+class OperationFailed(RuntimeError):
+    """A core operation ended with a reason that is safe to show the user."""
 
 
 def _load_backend_objects() -> tuple[Any, Any, Any]:
@@ -356,6 +384,9 @@ class BackendBridge:
         self.backend_error = "" if self.available else "Python 下載後端尚未安裝。"
         self._active_login_handle: Any = None
         self._active_login_lock = threading.RLock()
+        self._account_handles: set[Any] = set()
+        self._account_handles_lock = threading.Lock()
+        self._account_operations_stopped = False
 
     def _require_backend(self) -> None:
         if not self.available:
@@ -415,7 +446,74 @@ class BackendBridge:
             skip_same=options.get("skip_existing", options.get("skip_same", True)),
             group=options.get("group_album", options.get("group", True)),
             concurrency=int(options.get("concurrency", 2) or 2), title=job.title,
+            # ``advanced`` is absent for ordinary jobs, which then inherit the
+            # options currently saved on the settings page.
+            advanced=options.get("advanced"),
+            expected_files=job.expected_files, expected_bytes=job.expected_bytes,
         )
+
+    def clear_finished_jobs(self) -> list[str]:
+        self._require_backend()
+        return list(self.store.clear_finished_jobs())
+
+    def _run_account_operation(self, start: Callable[[], Any], fallback: str) -> Any:
+        """Wait for one short account operation; raise its translated error."""
+
+        with self._account_handles_lock:
+            # A restore runs two operations; the window may close between them.
+            if self._account_operations_stopped:
+                raise OperationFailed("操作已取消。")
+            handle = start()
+            self._account_handles.add(handle)
+        try:
+            result = handle.wait()
+        finally:
+            with self._account_handles_lock:
+                self._account_handles.discard(handle)
+        if result is None or not result.success:
+            raise OperationFailed(_safe_str(getattr(result, "error", ""), fallback) or fallback)
+        return result
+
+    def cancel_account_operations(self) -> None:
+        """Stop a backup or restore that is still running when the app closes."""
+
+        with self._account_handles_lock:
+            self._account_operations_stopped = True
+            handles = list(self._account_handles)
+        for handle in handles:
+            handle.cancel()
+
+    def backup_account(self, account_id: str, destination: str) -> str:
+        self._require_backend()
+        self._run_account_operation(
+            lambda: self.runner.start_backup(account_id, destination), "備份沒有完成。"
+        )
+        return destination
+
+    def restore_account(self, label: str, source: str, proxy: str = "") -> str:
+        """Create an account from a ``.tdl`` backup and confirm it with Telegram.
+
+        The new account is removed again when either step fails, so a damaged
+        or revoked backup never leaves a half-usable entry in the list.
+        """
+
+        self._require_backend()
+        account = self.store.add_account(label)
+        try:
+            self._run_account_operation(
+                lambda: self.runner.start_recover(account.id, source), "備份檔無法還原。"
+            )
+            self._run_account_operation(
+                lambda: self.runner.start_whoami(account.id, proxy=proxy or None),
+                "Telegram 沒有接受這份備份的登入資料。",
+            )
+        except Exception:
+            try:
+                self.store.remove_account(account.id)
+            except Exception:
+                pass
+            raise
+        return _safe_str(account.id)
 
     def download(
         self,
@@ -798,6 +896,21 @@ def _diagnostic(exc: BaseException) -> str:
     return text
 
 
+def _last_error_line(detail: str) -> str:
+    """Pick the exception message out of a ``_diagnostic`` traceback.
+
+    Store actions report failures as redacted traceback text.  Its last line
+    is ``ExceptionType: message``; the message is the backend's own
+    Traditional Chinese reason and reads better than a generic sentence.
+    """
+
+    lines = [line.strip() for line in _safe_str(detail).splitlines() if line.strip()]
+    if not lines:
+        return ""
+    _kind, separator, message = lines[-1].partition(": ")
+    return message.strip()[:400] if separator else ""
+
+
 def _safe_error_message(bridge: BackendBridge, exc: BaseException) -> str:
     """Keep the backend's translated reason visible while redacting secrets.
 
@@ -829,7 +942,24 @@ def _preference_values(value: Any) -> dict[str, Any]:
         "download_folder": _safe_str(_extract(value, "download_dir", "download_folder", default="")),
         "proxy": _safe_str(_extract(value, "proxy", default="")),
         "concurrency": int(_extract(value, "concurrency", default=2) or 2),
+        "template": _safe_str(_extract(value, "template", default="")),
+        "include_ext": _safe_str(_extract(value, "include_ext", default="")),
+        "exclude_ext": _safe_str(_extract(value, "exclude_ext", default="")),
+        "desc": bool(_extract(value, "desc", default=False)),
+        "takeout": bool(_extract(value, "takeout", default=False)),
+        "rewrite_ext": bool(_extract(value, "rewrite_ext", default=False)),
+        "threads": int(_extract(value, "threads", default=4) or 4),
+        "delay_ms": int(_extract(value, "delay_ms", default=0) or 0),
     }
+
+
+# Friendly names for ``tdl dl --template``.  An empty template is the core
+# default; every preset keeps the message ID so two files never collide.
+TEMPLATE_PRESETS: tuple[tuple[str, str], ...] = (
+    ("預設：對話編號_訊息編號_原檔名", ""),
+    ("日期開頭：20261013_訊息編號_原檔名", '{{ formatDate .MessageDate "20060102" }}_{{ .MessageID }}_{{ filenamify .FileName }}'),
+    ("精簡：訊息編號_原檔名", "{{ .MessageID }}_{{ filenamify .FileName }}"),
+)
 
 
 class Card(QFrame):
@@ -849,6 +979,10 @@ class Pill(QLabel):
         self.setContentsMargins(10, 1, 10, 1)
 
     def set_tone(self, tone: str) -> None:
+        # Called for every progress event; re-polishing is only needed when
+        # the tone, and therefore the matching style rule, really changes.
+        if self.property("tone") == tone:
+            return
         self.setProperty("tone", tone)
         self.style().unpolish(self)
         self.style().polish(self)
@@ -889,6 +1023,18 @@ class QueueRow(Card):
         self._file_order: list[str] = []
         self._file_rows: dict[str, tuple[QProgressBar, QLabel, QLabel]] = {}
         self._has_file_progress = False
+        # Per-file display state and byte counters, kept so one progress
+        # event updates one row and the totals without rescanning every file.
+        self._file_states: dict[str, str] = {}
+        self._file_bytes: dict[str, tuple[int, int]] = {}
+        self._state_counts: dict[str, int] = {}
+        self._bytes_done = 0
+        self._bytes_known = 0
+        self._expected_files = 0
+        self._expected_bytes = 0
+        self._status = job.status
+        self._speed = 0.0
+        self._speed_sample: Optional[tuple[float, int]] = None
         self.title_label = QLabel(job.title)
         self.title_label.setObjectName("QueueTitle")
         self.title_label.setWordWrap(False)
@@ -943,6 +1089,15 @@ class QueueRow(Card):
         self.file_progress_layout = QVBoxLayout(self.file_progress_host)
         self.file_progress_layout.setContentsMargins(0, 3, 0, 0)
         self.file_progress_layout.setSpacing(3)
+        # Overall size, speed and remaining time.  It lives with the file
+        # rows and keeps a fixed height so filling it in never moves them.
+        self.stats = QLabel()
+        self.stats.setObjectName("QueueStats")
+        self.stats.setWordWrap(False)
+        self.stats.setFixedHeight(20)
+        self.stats.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.stats.setMinimumWidth(0)
+        self.file_progress_layout.addWidget(self.stats)
         self.file_progress_host.setVisible(False)
         left.addWidget(self.file_progress_host)
 
@@ -955,6 +1110,9 @@ class QueueRow(Card):
         actions.addWidget(self.retry_button)
         actions.addWidget(self.open_button)
         right.addLayout(actions)
+        # Keep the pill and buttons at the top once file rows make the row
+        # taller, instead of stretching the pill over the whole height.
+        right.addStretch(1)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(18, 14, 18, 14)
@@ -982,10 +1140,27 @@ class QueueRow(Card):
         self.output_dir = job.output_dir
         self.title_label.setText(job.title)
         self.title_label.setToolTip(job.title)
-        self.url_label.setText(job.url)
-        self.url_label.setToolTip(job.url)
+        # A link is worth showing; a channel or JSON job would only show the
+        # path of an internal manifest, so name the destination instead.
+        subtitle = job.url if job.links or not job.files else f"下載到 {job.output_dir}"
+        self.url_label.setText(subtitle)
+        self.url_label.setToolTip(subtitle)
+        self._expected_files = int(getattr(job, "expected_files", 0) or 0)
+        self._expected_bytes = int(getattr(job, "expected_bytes", 0) or 0)
+        self._status = job.status
         values = getattr(job, "file_progress", None)
         self._set_file_progress(values)
+        self.set_state(job.status, job.progress, job.speed or job.error)
+
+    def update_file(self, job: DownloadJob, file_id: str) -> None:
+        """Apply one file's progress event without touching the other rows."""
+
+        self._status = job.status
+        item = job.file_progress.get(file_id)
+        if item is None:
+            return
+        self._apply_file(self._file_value(file_id, item))
+        self._refresh_summary()
         self.set_state(job.status, job.progress, job.speed or job.error)
 
     @staticmethod
@@ -1064,78 +1239,145 @@ class QueueRow(Card):
             self._has_file_progress = False
             self.file_progress_host.setVisible(False)
             return
-
-        by_id = {item["id"]: item for item in values}
-        for item in values:
-            identifier = item["id"]
-            if identifier not in self._file_order:
-                self._file_order.append(identifier)
         # Keep existing rows, even if a late backend snapshot omits a file;
         # removing it would shift all rows while the user is reading them.
-        for identifier in self._file_order:
-            item = by_id.get(identifier)
-            if item is None:
-                continue
-            row = self._file_rows.get(identifier)
-            if row is None:
-                filename = QLabel(item["filename"])
-                filename.setWordWrap(False)
-                filename.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-                filename.setMinimumWidth(0)
-                filename.setToolTip(item["filename"])
-                bar = QProgressBar()
-                bar.setRange(0, 100)
-                bar.setTextVisible(False)
-                bar.setFixedHeight(6)
-                bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-                detail = QLabel()
-                detail.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                detail.setFixedWidth(68)
-                detail.setObjectName("QueueFileProgressText")
-                line = QWidget(self.file_progress_host)
-                line.setFixedHeight(22)
-                line_layout = QHBoxLayout(line)
-                line_layout.setContentsMargins(0, 0, 0, 0)
-                line_layout.setSpacing(8)
-                line_layout.addWidget(filename, 3)
-                line_layout.addWidget(bar, 2)
-                line_layout.addWidget(detail, 0)
-                self.file_progress_layout.addWidget(line)
-                row = (bar, filename, detail)
-                self._file_rows[identifier] = row
-            bar, filename, detail = row
+        for item in values:
+            self._apply_file(item)
+        self._refresh_summary()
+
+    @staticmethod
+    def _byte_count(value: Any) -> int:
+        if isinstance(value, bool):
+            return 0
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    def _apply_file(self, item: Mapping[str, Any]) -> None:
+        """Create or update one file row and keep the running totals."""
+
+        identifier = item["id"]
+        row = self._file_rows.get(identifier)
+        if row is None:
+            # First-seen order is the display order.  Concurrent downloads
+            # report in any order; sorting by the latest event would make the
+            # visible list jump around on every callback.
+            self._file_order.append(identifier)
+            filename = QLabel(item["filename"])
+            filename.setWordWrap(False)
+            filename.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            filename.setMinimumWidth(0)
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setTextVisible(False)
+            bar.setFixedHeight(6)
+            bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            detail = QLabel()
+            detail.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            detail.setFixedWidth(68)
+            detail.setObjectName("QueueFileProgressText")
+            line = QWidget(self.file_progress_host)
+            line.setFixedHeight(22)
+            line_layout = QHBoxLayout(line)
+            line_layout.setContentsMargins(0, 0, 0, 0)
+            line_layout.setSpacing(8)
+            line_layout.addWidget(filename, 3)
+            line_layout.addWidget(bar, 2)
+            line_layout.addWidget(detail, 0)
+            self.file_progress_layout.addWidget(line)
+            row = (bar, filename, detail)
+            self._file_rows[identifier] = row
+        bar, filename, detail = row
+        if filename.text() != item["filename"]:
             filename.setText(item["filename"])
             filename.setToolTip(item["filename"])
-            state = self._file_state(item["state"], item["percent"])
-            percent = item["percent"]
-            if state == "已完成":
-                bar.setValue(100)
-            elif percent is not None:
-                bar.setValue(max(0, min(100, int(round(percent)))))
-            else:
-                bar.setValue(0)
-            detail.setText(self._file_detail(item, state, percent))
             detail.setToolTip(item["filename"])
+        percent = item["percent"]
+        state = self._file_state(item["state"], percent)
+        if state == "已完成":
+            bar.setValue(100)
+        elif percent is not None:
+            bar.setValue(max(0, min(100, int(round(percent)))))
+        else:
+            bar.setValue(0)
+        detail.setText(self._file_detail(item, state, percent))
 
-        completed = 0
-        active = 0
-        failed = 0
-        for item in values:
-            state = self._file_state(item["state"], item["percent"])
-            if state == "已完成":
-                completed += 1
-            elif state == "下載中":
-                active += 1
-            elif state == "失敗":
-                failed += 1
-        total = max(len(self._file_order), len(values))
-        summary = f"檔案 {completed}/{total} · 進行中 {active}"
+        previous = self._file_states.get(identifier)
+        if previous != state:
+            if previous is not None:
+                self._state_counts[previous] -= 1
+            self._state_counts[state] = self._state_counts.get(state, 0) + 1
+            self._file_states[identifier] = state
+        total = self._byte_count(item["total"])
+        current = total if state == "已完成" and total else min(self._byte_count(item["current"]), total or sys.maxsize)
+        old_current, old_total = self._file_bytes.get(identifier, (0, 0))
+        self._file_bytes[identifier] = (current, total)
+        self._bytes_done += current - old_current
+        self._bytes_known += total - old_total
+
+    def _refresh_summary(self) -> None:
+        """Rebuild the count, size, speed and remaining-time texts."""
+
+        completed = self._state_counts.get("已完成", 0)
+        active = self._state_counts.get("下載中", 0)
+        failed = self._state_counts.get("失敗", 0)
+        total = max(len(self._file_order), self._expected_files)
+        finished = self._status == "已完成"
+        if finished:
+            # The core does not report files it skips, so a finished job can
+            # have fewer rows than the scan counted; "5/12" would look stuck.
+            summary = f"已完成 {completed} 個檔案"
+        else:
+            summary = f"檔案 {completed}/{total} · 進行中 {active}"
         if failed:
             summary += f" · 失敗 {failed}"
         self._has_file_progress = True
         self.file_progress_host.setVisible(True)
         self.percent.setText(summary)
         self.percent.setToolTip(summary)
+
+        # A scan knows the whole job size up front; a pasted link only learns
+        # each file's size as the core reaches it.
+        total_bytes = max(self._expected_bytes, self._bytes_known)
+        downloading = self._status == "下載中"
+        now = time.monotonic()
+        if not downloading:
+            self._speed, self._speed_sample = 0.0, None
+        elif self._speed_sample is None:
+            self._speed_sample = (now, self._bytes_done)
+        elif now - self._speed_sample[0] >= 1.0:
+            elapsed = now - self._speed_sample[0]
+            rate = max(0.0, (self._bytes_done - self._speed_sample[1]) / elapsed)
+            # Smooth the figure so one stalled second does not swing the
+            # remaining time between minutes and hours.
+            self._speed = rate if self._speed <= 0 else self._speed * 0.6 + rate * 0.4
+            self._speed_sample = (now, self._bytes_done)
+
+        parts: list[str] = []
+        if finished:
+            if self._bytes_done > 0:
+                parts.append(_format_bytes(self._bytes_done))
+            if total > completed + failed:
+                parts.append(f"另有 {total - completed - failed} 個已存在或被篩選而略過")
+        elif total_bytes > 0:
+            parts.append(f"{_format_bytes(self._bytes_done)} / {_format_bytes(total_bytes)}")
+        if downloading and self._speed > 0:
+            parts.append(f"{_format_bytes(self._speed)}/s")
+            remaining = total_bytes - self._bytes_done
+            if self._expected_bytes > 0 and remaining > 0:
+                parts.append(f"剩餘約 {_format_duration(remaining / self._speed)}")
+        text = " · ".join(parts)
+        if self.stats.text() != text:
+            self.stats.setText(text)
+            self.stats.setToolTip(text)
+
+    def overall_percent(self) -> Optional[int]:
+        """Whole-job percentage, known only when a scan supplied the size."""
+
+        if self._expected_bytes <= 0:
+            return None
+        return max(0, min(100, int(self._bytes_done * 100 / self._expected_bytes)))
 
     def set_state(self, status: str, progress: Optional[float] = None, detail: str = "") -> None:
         self.status.setText(status)
@@ -1152,9 +1394,13 @@ class QueueRow(Card):
             tone = "danger" if status == "失敗" else "neutral"
         self.status.set_tone(tone)
         if self._has_file_progress:
-            # The aggregate percentage would be misleading while concurrent
-            # files report independently.  Each file row owns its own bar.
-            self.progress.setVisible(False)
+            # Each file row owns its own bar.  A whole-job bar is only shown
+            # when a scan supplied the total size; counting just the files
+            # discovered so far would overstate the progress.
+            overall = self.overall_percent()
+            self.progress.setVisible(overall is not None)
+            if overall is not None:
+                self.progress.setValue(100 if status == "已完成" else overall)
             self.percent.setText(self.percent.text() or "等待核心回報")
         elif progress is None:
             self.progress.setVisible(True)
@@ -1170,7 +1416,11 @@ class QueueRow(Card):
         self.retry_button.setText("繼續下載" if resumable else "重試")
         self.retry_button.setVisible(status in ("失敗", "已取消", "待重試", "已暫停"))
         self.open_button.setVisible(status == "已完成" and bool(self.output_dir))
-        if progress is None:
+        if self._has_file_progress:
+            # The summary text is its own tooltip; see ``_refresh_summary``.
+            if detail:
+                self.percent.setToolTip(f"{self.percent.text()}\n{detail}")
+        elif progress is None:
             self.percent.setToolTip(detail or "等待核心回報")
         elif detail:
             self.percent.setToolTip(detail)
@@ -1239,6 +1489,23 @@ def ask_remove_account(parent: QWidget, label: str) -> bool:
         yes.setText("移除")
     if no is not None:
         no.setText("保留")
+    return box.exec() == QMessageBox.Yes
+
+
+def ask_confirm(parent: QWidget, title: str, message: str, detail: str, accept_label: str) -> bool:
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Warning)
+    box.setWindowTitle(title)
+    box.setText(message)
+    box.setInformativeText(detail)
+    box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+    yes = box.button(QMessageBox.Yes)
+    no = box.button(QMessageBox.No)
+    if yes is not None:
+        yes.setText(accept_label)
+    if no is not None:
+        no.setText("取消")
+    box.setDefaultButton(QMessageBox.No)
     return box.exec() == QMessageBox.Yes
 
 
@@ -1530,6 +1797,7 @@ class DownloadPage(QWidget):
     retry_requested = Signal(str)
     open_requested = Signal(str)
     account_changed = Signal(str)
+    clear_requested = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -1691,6 +1959,10 @@ class DownloadPage(QWidget):
         queue_header.addWidget(queue_title)
         queue_header.addWidget(self.queue_summary)
         queue_header.addStretch(1)
+        self.clear_button = QPushButton("清除已結束")
+        self.clear_button.setToolTip("移除已完成、失敗與已取消的項目；下載紀錄仍會保留")
+        self.clear_button.clicked.connect(self.clear_requested.emit)
+        queue_header.addWidget(self.clear_button)
         queue_layout.addLayout(queue_header)
 
         # Keep the queue in its own bounded viewport.  The page itself is
@@ -1715,6 +1987,9 @@ class DownloadPage(QWidget):
         self.empty_queue.setObjectName("EmptyText")
         self.empty_queue.setAlignment(Qt.AlignCenter)
         self.queue_list.addWidget(self.empty_queue)
+        # Rows are inserted above this stretch so a short queue stays at the
+        # top of the viewport instead of floating in its middle.
+        self.queue_list.addStretch(1)
         self.queue_scroll.setWidget(queue_host)
         queue_layout.addWidget(self.queue_scroll)
         outer.addWidget(queue_card)
@@ -1833,7 +2108,7 @@ class DownloadPage(QWidget):
             row.retry_requested.connect(self.retry_requested.emit)
             row.open_requested.connect(self.open_requested.emit)
             self.rows[job.id] = row
-            self.queue_list.addWidget(row)
+            self.queue_list.insertWidget(self.queue_list.count() - 1, row)
         self._update_queue_summary()
         # Adding a row must never auto-follow the bottom.  Restore the exact
         # prior value after the layout has accepted the new fixed-height row.
@@ -1845,6 +2120,32 @@ class DownloadPage(QWidget):
             return
         scroll_value = self._queue_scroll_position()
         row.set_job(job)
+        self._update_queue_summary()
+        self._restore_queue_scroll_position(scroll_value)
+
+    def update_job_file(self, job: DownloadJob, file_id: str) -> None:
+        """Refresh one file of a running job; the hot path of a download."""
+
+        row = self.rows.get(job.id)
+        if row is None:
+            return
+        scroll_value = self._queue_scroll_position()
+        status_changed = row.status.text() != job.status
+        row.update_file(job, file_id)
+        if status_changed:
+            self._update_queue_summary()
+        self._restore_queue_scroll_position(scroll_value)
+
+    def remove_jobs(self, job_ids: Sequence[str]) -> None:
+        scroll_value = self._queue_scroll_position()
+        for job_id in job_ids:
+            self.jobs.pop(job_id, None)
+            row = self.rows.pop(job_id, None)
+            if row is not None:
+                self.queue_list.removeWidget(row)
+                row.deleteLater()
+        if self.empty_queue is not None:
+            self.empty_queue.setVisible(not self.rows)
         self._update_queue_summary()
         self._restore_queue_scroll_position(scroll_value)
 
@@ -1862,6 +2163,8 @@ class AccountPage(QWidget):
     add_requested = Signal()
     account_deleted = Signal(str)
     account_relogin_requested = Signal(str)
+    backup_requested = Signal(str)
+    restore_requested = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -1880,16 +2183,33 @@ class AccountPage(QWidget):
         text.addWidget(title)
         text.addWidget(desc)
         header.addLayout(text, 1)
+        self.restore_button = QPushButton("從備份還原")
+        self.restore_button.setMinimumHeight(40)
+        self.restore_button.setToolTip("用先前匯出的 .tdl 備份檔加入帳號，不需要重新掃碼")
+        self.restore_button.clicked.connect(self.restore_requested.emit)
+        header.addWidget(self.restore_button, 0, Qt.AlignTop)
         add = QPushButton("＋ 新增帳號")
         add.setObjectName("PrimaryButton")
         add.setMinimumHeight(40)
         add.clicked.connect(self.add_requested.emit)
         header.addWidget(add, 0, Qt.AlignTop)
         outer.addLayout(header)
+        self.operation_status = QLabel("")
+        self.operation_status.setObjectName("MutedText")
+        self.operation_status.setWordWrap(True)
+        self.operation_status.setVisible(False)
+        outer.addWidget(self.operation_status)
         self.list_layout = QVBoxLayout()
         self.list_layout.setSpacing(10)
         outer.addLayout(self.list_layout)
         outer.addStretch(1)
+
+    def set_operation_status(self, text: str, *, error: bool = False) -> None:
+        """Show the outcome of a backup or restore above the account list."""
+
+        self.operation_status.setText(text)
+        self.operation_status.setStyleSheet(f"color: {DANGER};" if error else "")
+        self.operation_status.setVisible(bool(text))
 
     def set_accounts(self, accounts: Sequence[AccountInfo]) -> None:
         while self.list_layout.count():
@@ -1939,6 +2259,11 @@ class AccountPage(QWidget):
             relogin.setToolTip("保留這個帳號的下載紀錄，重新建立 Telegram 工作階段")
             relogin.clicked.connect(lambda: self.account_relogin_requested.emit(account.id))
             layout.addWidget(relogin)
+        else:
+            backup = QPushButton("備份")
+            backup.setToolTip("匯出登入資料，之後可在另一台電腦或重灌後還原")
+            backup.clicked.connect(lambda: self.backup_requested.emit(account.id))
+            layout.addWidget(backup)
         delete = QPushButton("移除")
         delete.setProperty("dangerButton", True)
         delete.setToolTip("移除本機保存的登入工作階段")
@@ -2002,8 +2327,10 @@ class HistoryPage(QWidget):
             self.table.insertRow(row)
             self.table.setItem(row, 0, QTableWidgetItem(item.created_at or "—"))
             title = item.title if not item.url else f"{item.title}\n{item.url}"
+            if item.summary:
+                title = f"{item.title}\n{item.summary}"
             title_item = QTableWidgetItem(title)
-            title_item.setToolTip(item.url)
+            title_item.setToolTip("\n".join(part for part in (item.url, item.summary, item.detail) if part))
             self.table.setItem(row, 1, title_item)
             self.table.setItem(row, 2, QTableWidgetItem(item.status))
             self.table.setItem(row, 3, QTableWidgetItem(item.path or "—"))
@@ -2012,6 +2339,7 @@ class HistoryPage(QWidget):
 
 class SettingsPage(QWidget):
     settings_changed = Signal(dict)
+    advanced_changed = Signal(dict)
 
     def __init__(self, bridge: BackendBridge, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -2064,13 +2392,20 @@ class SettingsPage(QWidget):
             else:
                 widget.valueChanged.connect(lambda _value: self.save())
         outer.addWidget(card)
+        outer.addWidget(self._build_advanced_card())
 
         info = Card()
         info_layout = QVBoxLayout(info)
         info_layout.setContentsMargins(20, 18, 20, 18)
         info_title = QLabel("使用方式")
         info_title.setObjectName("SectionTitle")
-        body = QLabel("1. 在帳號管理完成一次 Telegram 登入。\n2. 到下載中心貼上訊息連結並選擇資料夾。\n3. 下載完成後可從下載佇列開啟資料夾，或在下載紀錄搜尋。")
+        body = QLabel(
+            "1. 在「帳號管理」完成一次 Telegram 登入；換電腦前可先備份，之後用「從備份還原」加入。\n"
+            "2. 整個頻道或群組：到「頻道下載」選對話、日期與類型，掃描後開始下載。\n"
+            "3. 單則或多則訊息：到「下載中心」貼上訊息連結並選擇資料夾。\n"
+            "4. 「上傳與轉傳」可把本機檔案送到 Telegram，或把訊息轉到另一個對話。\n"
+            "5. 下載完成後可從下載佇列開啟資料夾，或在「下載紀錄」搜尋。"
+        )
         body.setObjectName("BodyText")
         body.setWordWrap(True)
         info_layout.addWidget(info_title)
@@ -2089,6 +2424,157 @@ class SettingsPage(QWidget):
         data_layout.addWidget(data_body)
         outer.addWidget(data)
         outer.addStretch(1)
+
+    def _build_advanced_card(self) -> Card:
+        card = Card()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+        title = QLabel("進階下載設定")
+        title.setObjectName("SectionTitle")
+        hint = QLabel("套用後，之後新增的下載會使用這些設定；已在佇列中的工作維持建立時的設定。")
+        hint.setObjectName("MutedText")
+        hint.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(hint)
+
+        form = QFormLayout()
+        form.setHorizontalSpacing(20)
+        form.setVerticalSpacing(12)
+        saved_template = _safe_str(self._preferences.get("template", ""))
+        self.template_combo = QComboBox()
+        for label, template in TEMPLATE_PRESETS:
+            self.template_combo.addItem(label, template)
+        self.template_combo.addItem("自訂格式…", None)
+        self.template_edit = QLineEdit()
+        self.template_edit.setPlaceholderText("例如 {{ .MessageID }}_{{ filenamify .FileName }}")
+        self.template_edit.setToolTip(
+            "可用變數：.DialogID 對話編號、.MessageID 訊息編號、.MessageDate 訊息時間、"
+            ".FileName 原檔名、.FileCaption 訊息文字、.FileSize 檔案大小、.DownloadDate 下載時間。\n"
+            "可用函式：filenamify（移除不可用於檔名的字元）、formatDate（格式化時間）。"
+        )
+        preset_index = self.template_combo.findData(saved_template)
+        if preset_index < 0:
+            preset_index = self.template_combo.count() - 1
+            self.template_edit.setText(saved_template)
+        self.template_combo.setCurrentIndex(preset_index)
+        self.template_combo.currentIndexChanged.connect(self._template_preset_changed)
+        template_wrap = QWidget()
+        template_layout = QVBoxLayout(template_wrap)
+        template_layout.setContentsMargins(0, 0, 0, 0)
+        template_layout.setSpacing(6)
+        template_layout.addWidget(self.template_combo)
+        template_layout.addWidget(self.template_edit)
+        form.addRow("檔名格式", template_wrap)
+
+        self.include_edit = QLineEdit(_safe_str(self._preferences.get("include_ext", "")))
+        self.include_edit.setPlaceholderText("例如 mp4, mkv（留白代表全部）")
+        form.addRow("只下載這些副檔名", self.include_edit)
+        self.exclude_edit = QLineEdit(_safe_str(self._preferences.get("exclude_ext", "")))
+        self.exclude_edit.setPlaceholderText("例如 jpg, png（與上一欄擇一填寫）")
+        form.addRow("排除這些副檔名", self.exclude_edit)
+
+        self.order_combo = QComboBox()
+        self.order_combo.addItem("由舊到新（預設）", False)
+        self.order_combo.addItem("由新到舊", True)
+        self.order_combo.setCurrentIndex(1 if self._preferences.get("desc") else 0)
+        form.addRow("下載順序", self.order_combo)
+
+        self.threads_spin = QSpinBox()
+        self.threads_spin.setRange(1, 16)
+        self.threads_spin.setValue(int(self._preferences.get("threads", 4) or 4))
+        self.threads_spin.setSuffix(" 條")
+        self.threads_spin.setToolTip("每個檔案同時使用的連線數。大檔案可調高，遇到限速時請調低。")
+        form.addRow("每個檔案的連線數", self.threads_spin)
+
+        self.delay_spin = QSpinBox()
+        self.delay_spin.setRange(0, 60000)
+        self.delay_spin.setSingleStep(100)
+        self.delay_spin.setValue(int(self._preferences.get("delay_ms", 0) or 0))
+        self.delay_spin.setSuffix(" 毫秒")
+        self.delay_spin.setToolTip("每個檔案開始前的等待時間。Telegram 經常要求稍後再試時可設為 500 以上。")
+        form.addRow("檔案之間的間隔", self.delay_spin)
+        layout.addLayout(form)
+
+        self.rewrite_check = QCheckBox("依檔案內容修正副檔名（例如沒有副檔名的影片補上 .mp4）")
+        self.rewrite_check.setChecked(bool(self._preferences.get("rewrite_ext")))
+        layout.addWidget(self.rewrite_check)
+        self.takeout_check = QCheckBox("使用 Takeout 模式（大量下載較不易被限速；剛登入的帳號可能需等待 24 小時）")
+        self.takeout_check.setChecked(bool(self._preferences.get("takeout")))
+        layout.addWidget(self.takeout_check)
+
+        action = QHBoxLayout()
+        self.advanced_status = QLabel("")
+        self.advanced_status.setObjectName("MutedText")
+        self.advanced_status.setWordWrap(True)
+        action.addWidget(self.advanced_status, 1)
+        reset = QPushButton("恢復預設")
+        reset.clicked.connect(self._reset_advanced)
+        action.addWidget(reset)
+        apply_button = QPushButton("套用")
+        apply_button.setObjectName("PrimaryButton")
+        apply_button.clicked.connect(self._apply_advanced)
+        action.addWidget(apply_button)
+        layout.addLayout(action)
+        self._template_preset_changed()
+        return card
+
+    def _template_preset_changed(self, _index: int = -1) -> None:
+        custom = self.template_combo.currentData() is None
+        self.template_edit.setVisible(custom)
+
+    def advanced_values(self) -> dict[str, Any]:
+        preset = self.template_combo.currentData()
+        return {
+            "template": self.template_edit.text().strip() if preset is None else _safe_str(preset),
+            "include_ext": self.include_edit.text().strip(),
+            "exclude_ext": self.exclude_edit.text().strip(),
+            "desc": bool(self.order_combo.currentData()),
+            "takeout": self.takeout_check.isChecked(),
+            "rewrite_ext": self.rewrite_check.isChecked(),
+            "threads": self.threads_spin.value(),
+            "delay_ms": self.delay_spin.value(),
+        }
+
+    def _reset_advanced(self) -> None:
+        self.template_combo.setCurrentIndex(0)
+        self.template_edit.clear()
+        self.include_edit.clear()
+        self.exclude_edit.clear()
+        self.order_combo.setCurrentIndex(0)
+        self.threads_spin.setValue(4)
+        self.delay_spin.setValue(0)
+        self.rewrite_check.setChecked(False)
+        self.takeout_check.setChecked(False)
+        self._apply_advanced()
+
+    def _apply_advanced(self) -> None:
+        values = self.advanced_values()
+        if self.template_combo.currentData() is None and not values["template"]:
+            self.set_advanced_status("請填寫自訂檔名格式，或改選其他格式。", error=True)
+            return
+        # Validation is a pure function of the text, so run it here to show
+        # the backend's own message beside the fields instead of a dialog.
+        normalize = getattr(self.bridge.module, "normalize_download_advanced", None)
+        if callable(normalize):
+            try:
+                normalize(
+                    {
+                        "template": values["template"],
+                        "include": values["include_ext"],
+                        "exclude": values["exclude_ext"],
+                    }
+                )
+            except ValueError as exc:
+                self.set_advanced_status(_safe_str(exc), error=True)
+                return
+        self._preferences.update(values)
+        self.set_advanced_status("正在儲存…")
+        self.advanced_changed.emit(values)
+
+    def set_advanced_status(self, text: str, *, error: bool = False) -> None:
+        self.advanced_status.setText(text)
+        self.advanced_status.setStyleSheet(f"color: {DANGER};" if error else "")
 
     def _choose_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "選擇預設下載資料夾", self.folder_edit.text() or str(Path.home() / "Downloads"))
@@ -2176,13 +2662,15 @@ class MainWindow(QMainWindow):
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
         self.nav_buttons: list[SidebarButton] = []
-        nav_specs = (
-            (self.style().standardIcon(QStyle.SP_DirOpenIcon), "頻道下載"),
-            (self.style().standardIcon(QStyle.SP_ArrowDown), "下載中心"),
-            (self.style().standardIcon(QStyle.SP_DirHomeIcon), "帳號管理"),
-            (self.style().standardIcon(QStyle.SP_FileDialogDetailedView), "下載紀錄"),
-            (self.style().standardIcon(QStyle.SP_FileDialogContentsView), "設定與說明"),
+        nav_icons = (
+            QStyle.SP_DirOpenIcon,
+            QStyle.SP_ArrowDown,
+            QStyle.SP_ArrowUp,
+            QStyle.SP_DirHomeIcon,
+            QStyle.SP_FileDialogDetailedView,
+            QStyle.SP_FileDialogContentsView,
         )
+        nav_specs = tuple((self.style().standardIcon(icon), text) for icon, text in zip(nav_icons, PAGE_NAMES))
         for index, (icon, text) in enumerate(nav_specs):
             button = SidebarButton(icon, text)
             self.nav_group.addButton(button, index)
@@ -2216,11 +2704,17 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.channel_page = ChannelPage()
         self.home_page = DownloadPage()
+        self.transfer_page = TransferPage()
         self.account_page = AccountPage()
         self.history_page = HistoryPage()
         self.settings_page = SettingsPage(self.bridge)
         self.channel_page.set_runner(self.bridge.runner)
-        for page in (self.channel_page, self.home_page, self.account_page, self.history_page, self.settings_page):
+        self.transfer_page.set_runner(self.bridge.runner)
+        # Same order as PAGE_NAMES and the sidebar buttons.
+        for page in (
+            self.channel_page, self.home_page, self.transfer_page,
+            self.account_page, self.history_page, self.settings_page,
+        ):
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.NoFrame)
@@ -2241,12 +2735,17 @@ class MainWindow(QMainWindow):
         self.home_page.retry_requested.connect(self.retry_job)
         self.home_page.open_requested.connect(self.open_output)
         self.home_page.account_changed.connect(self._set_active_account)
+        self.home_page.clear_requested.connect(self._clear_finished_jobs)
         self.account_page.add_requested.connect(self._add_account)
         self.account_page.account_deleted.connect(self._remove_account)
+        self.account_page.backup_requested.connect(self._backup_account)
+        self.account_page.restore_requested.connect(self._restore_account)
         self.settings_page.settings_changed.connect(self._settings_changed)
+        self.settings_page.advanced_changed.connect(self._advanced_changed)
         self.account_page.account_relogin_requested.connect(self._relogin_account)
         self.channel_page.account_changed.connect(self._set_active_account)
         self.channel_page.download_requested.connect(self._enqueue_channel_downloads)
+        self.transfer_page.account_changed.connect(self._set_active_account)
 
     def _show_page(self, index: int) -> None:
         self.stack.setCurrentIndex(index)
@@ -2277,6 +2776,7 @@ class MainWindow(QMainWindow):
             proxy=_safe_str(values.get("proxy", "")),
             skip_existing=self.home_page.skip_check.isChecked(),
         )
+        self.transfer_page.set_proxy(_safe_str(values.get("proxy", "")))
 
     def _set_top_account(self, text: str, connected: bool = False) -> None:
         self.top_account.setText(text)
@@ -2297,12 +2797,23 @@ class MainWindow(QMainWindow):
             proxy=_safe_str(values.get("proxy", self.home_page.proxy_value)),
             skip_existing=self.home_page.skip_check.isChecked(),
         )
+        self.transfer_page.set_proxy(self.home_page.proxy_value)
         self._start_store_action(
             lambda: self.bridge.update_preferences(
                 download_dir=_safe_str(values.get("download_folder", "")),
                 proxy=_safe_str(values.get("proxy", "")),
                 concurrency=int(values.get("concurrency", 2) or 2),
             )
+        )
+
+    def _advanced_changed(self, values: Mapping[str, Any]) -> None:
+        payload = dict(values)
+        self._start_store_action(
+            lambda: self.bridge.update_preferences(**payload),
+            lambda _result: self.settings_page.set_advanced_status("已套用，之後新增的下載會使用這些設定。"),
+            lambda detail: self.settings_page.set_advanced_status(
+                _last_error_line(detail) or "設定沒有儲存，請檢查欄位內容。", error=True
+            ),
         )
 
     def refresh_accounts(self) -> None:
@@ -2340,6 +2851,7 @@ class MainWindow(QMainWindow):
             self.home_page.set_accounts(self.accounts, active_id)
             self.account_page.set_accounts(self.accounts)
             self.channel_page.set_accounts(self.accounts, active_id)
+            self.transfer_page.set_accounts(self.accounts, active_id)
             selected_id = self.home_page.account_combo.currentData() or ""
             selected = next((item for item in self.accounts if item.id == selected_id), None)
             # The first launch has no active_account_id yet.  Select a useful
@@ -2398,6 +2910,7 @@ class MainWindow(QMainWindow):
             self.home_page.set_accounts([])
             self.account_page.set_accounts([])
             self.channel_page.set_accounts([])
+            self.transfer_page.set_accounts([])
             self._set_top_account("帳號資料暫不可用")
         elif kind == "history":
             self.history_page.set_history([])
@@ -2416,6 +2929,9 @@ class MainWindow(QMainWindow):
         # channel selection never causes a second Store write loop.
         self.home_page.set_accounts(self.accounts, account_id)
         self.channel_page.set_accounts(self.accounts, account_id)
+        # An upload or forward keeps the account it was started with.
+        if not self.transfer_page.is_busy():
+            self.transfer_page.set_accounts(self.accounts, account_id)
 
         def done(result: Any) -> None:
             if on_success is not None:
@@ -2478,6 +2994,8 @@ class MainWindow(QMainWindow):
             backend_job_id=backend_id,
             resume_on_start=raw_status in {"queued", "running", "interrupted", "paused"},
             file_progress=file_progress,
+            expected_files=int(_extract(value, "expected_files", default=0) or 0),
+            expected_bytes=int(_extract(value, "expected_bytes", default=0) or 0),
             options=options,
         )
 
@@ -2583,6 +3101,78 @@ class MainWindow(QMainWindow):
             lambda detail: show_error(self, "無法移除帳號", "帳號工作階段沒有被移除，請稍後再試。", detail),
         )
 
+    def _backup_account(self, account_id: str) -> None:
+        account = next((item for item in self.accounts if item.id == account_id), None)
+        if account is None:
+            return
+        if not ask_confirm(
+            self,
+            "備份帳號登入資料",
+            f"要匯出「{account.label}」的登入資料嗎？",
+            "備份檔沒有加密：任何拿到這個檔案的人都能直接登入你的 Telegram 帳號。"
+            "請只存放在自己信任的位置，不要上傳或傳給別人。",
+            "選擇儲存位置",
+        ):
+            return
+        suggested = Path.home() / f"tdl-{datetime.now().strftime('%Y%m%d')}.backup.tdl"
+        path, _selected = QFileDialog.getSaveFileName(self, "儲存帳號備份", str(suggested), "tdl 備份檔 (*.tdl)")
+        if not path:
+            return
+        if not path.lower().endswith(".tdl"):
+            path += ".tdl"
+        self.account_page.set_operation_status(f"正在備份「{account.label}」…")
+        self._start_store_action(
+            lambda: self.bridge.backup_account(account_id, path),
+            lambda saved: self.account_page.set_operation_status(f"已備份「{account.label}」到 {saved}"),
+            lambda detail: self.account_page.set_operation_status(
+                f"備份失敗：{_last_error_line(detail) or '請確認儲存位置可以寫入。'}", error=True
+            ),
+        )
+
+    def _restore_account(self) -> None:
+        path, _selected = QFileDialog.getOpenFileName(self, "選擇帳號備份檔", str(Path.home()), "tdl 備份檔 (*.tdl)")
+        if not path:
+            return
+        label, accepted = QInputDialog.getText(
+            self, "從備份還原", "為這個帳號取一個方便辨識的名稱：", text=Path(path).name.split(".")[0][:40]
+        )
+        label = label.strip()
+        if not accepted or not label:
+            return
+        self.account_page.restore_button.setEnabled(False)
+        self.account_page.set_operation_status("正在還原備份並向 Telegram 確認登入狀態…")
+
+        def restored(account_id: Any) -> None:
+            self.account_page.restore_button.setEnabled(True)
+            self.account_page.set_operation_status(f"已還原帳號「{label}」。")
+            self._set_active_account(_safe_str(account_id), lambda _result: self.refresh_accounts())
+
+        def failed(detail: str) -> None:
+            self.account_page.restore_button.setEnabled(True)
+            self.account_page.set_operation_status(
+                f"還原失敗：{_last_error_line(detail) or '備份檔無法使用。'}", error=True
+            )
+            self.refresh_accounts()
+
+        proxy = self.home_page.proxy_value
+        self._start_store_action(lambda: self.bridge.restore_account(label, path, proxy), restored, failed)
+
+    def _clear_finished_jobs(self) -> None:
+        ended = [job_id for job_id, job in self.jobs.items() if job.status in ("已完成", "失敗", "已取消")]
+        if not ended:
+            return
+
+        def cleared(_removed: Any) -> None:
+            for job_id in ended:
+                self.jobs.pop(job_id, None)
+            self.home_page.remove_jobs(ended)
+
+        self._start_store_action(
+            self.bridge.clear_finished_jobs,
+            cleared,
+            lambda detail: show_error(self, "無法清除", "下載佇列沒有變更，請稍後再試。", detail),
+        )
+
     def _enqueue_downloads(self, urls: list[str], options: dict[str, Any]) -> None:
         account_id = options.get("account_id", "")
         files = [str(path) for path in (options.get("files") or []) if isinstance(path, str) and path.strip()]
@@ -2624,6 +3214,8 @@ class MainWindow(QMainWindow):
                 account_id=account_id,
                 links=[],
                 files=files,
+                expected_files=int(options.get("expected_files", 0) or 0),
+                expected_bytes=int(options.get("expected_bytes", 0) or 0),
                 options=dict(options),
             )
             jobs.append(job)
@@ -2717,11 +3309,12 @@ class MainWindow(QMainWindow):
                 if event_name == "error":
                     updated["state"] = "failed"
                 job.file_progress[file_id] = updated
-                completed = sum(item.get("state") == "completed" for item in job.file_progress.values())
                 job.progress = None
-                job.speed = f"已完成 {completed} / 已發現 {len(job.file_progress)} 個檔案"
+                # The row keeps its own running totals; rescanning every file
+                # here made a large channel repaint thousands of rows per event.
+                job.speed = ""
                 job.status = "下載中"
-                self.home_page.update_job(job)
+                self.home_page.update_job_file(job, file_id)
                 return
             if event_name == "error":
                 return
@@ -2841,6 +3434,7 @@ class MainWindow(QMainWindow):
         """Stop background work before QApplication tears down Qt objects."""
 
         self.channel_page.shutdown(timeout_ms=timeout_ms)
+        self.transfer_page.shutdown(timeout_ms=timeout_ms)
         for worker in list(self._workers.values()):
             worker.pause()
         for thread in list(self._threads.values()):
@@ -2853,7 +3447,12 @@ class MainWindow(QMainWindow):
 
     def _background_work_running(self) -> bool:
         all_threads = [*self._threads.values(), *self._store_threads, *self._action_threads]
-        return bool(self._preparing_jobs) or self.channel_page.is_busy() or any(_thread_is_running(thread) for thread in all_threads)
+        return (
+            bool(self._preparing_jobs)
+            or self.channel_page.is_busy()
+            or self.transfer_page.is_busy()
+            or any(_thread_is_running(thread) for thread in all_threads)
+        )
 
     def _cancel_background_work(self) -> None:
         # Closing is a durable pause, distinct from the row's explicit cancel.
@@ -2862,6 +3461,10 @@ class MainWindow(QMainWindow):
             if _qt_object_is_valid(worker):
                 worker.pause()
         self.channel_page.cancel_operations()
+        self.transfer_page.cancel_operations()
+        cancel_account_operations = getattr(self.bridge, "cancel_account_operations", None)
+        if callable(cancel_account_operations):
+            cancel_account_operations()
 
     def _poll_close(self) -> None:
         if not self._closing:
@@ -3024,6 +3627,17 @@ class MainWindow(QMainWindow):
         if self._closing:
             event.ignore()
             return
+        # Downloads pause and resume on the next launch; an upload or forward
+        # cannot, so ask before throwing the rest of it away.
+        if self.transfer_page.is_busy() and not ask_confirm(
+            self,
+            "仍有上傳或轉傳進行中",
+            "現在關閉會中止尚未完成的上傳／轉傳。",
+            "已送出的項目不會收回，未送出的需要重新開始。",
+            "仍要關閉",
+        ):
+            event.ignore()
+            return
 
         self._closing = True
         active = self._active_download_count()
@@ -3057,6 +3671,25 @@ def _format_bytes(value: Any) -> str:
         number /= 1024
     return f"{number:.1f} TB"
 
+
+def _format_duration(seconds: float) -> str:
+    """Round a remaining time to the unit a person would say out loud."""
+
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total} 秒"
+    if total < 3600:
+        return f"{total // 60} 分鐘"
+    hours, minutes = divmod(total // 60, 60)
+    if hours < 24:
+        return f"{hours} 小時 {minutes} 分" if minutes else f"{hours} 小時"
+    return f"{hours // 24} 天 {hours % 24} 小時"
+
+
+# Qt style sheets cannot draw an arrow themselves, and styling a combo or spin
+# box replaces the native one, so the glyphs ship as small images.
+_ARROW_DOWN = _resource_path("assets", "arrow-down.png").as_posix()
+_ARROW_UP = _resource_path("assets", "arrow-up.png").as_posix()
 
 STYLE = f"""
 * {{
@@ -3094,6 +3727,10 @@ QFrame#HeroBadge {{ background: {PRIMARY_LIGHT}; border: 1px solid #dfe3ff; bord
 #CardTitle {{ font-size: 15px; font-weight: 700; }}
 #DialogTitle {{ font-size: 21px; font-weight: 800; }}
 #MutedText, #QueueUrl, #QueueProgressText {{ color: {MUTED}; }}
+#QueueStats {{ color: {PRIMARY_DARK}; font-size: 12px; font-weight: 600; }}
+QPushButton[segment="true"] {{ padding: 8px 16px; }}
+QPushButton[segment="true"]:checked {{ background: {PRIMARY_LIGHT}; border-color: #c7d2fe; color: {PRIMARY_DARK}; font-weight: 700; }}
+#TransferProgress, #UploadList {{ background: #ffffff; border: 1px solid #d8e0ed; border-radius: 8px; padding: 4px; }}
 #BodyText {{ color: #39465c; line-height: 1.5; }}
 #EmptyText {{ color: {SUBTLE}; padding: 22px; }}
 #FieldLabel {{ color: {MUTED}; font-weight: 700; }}
@@ -3107,6 +3744,14 @@ QFrame#HeroBadge {{ background: {PRIMARY_LIGHT}; border: 1px solid #dfe3ff; bord
 QLineEdit:focus, QTextEdit:focus, QComboBox:focus, QSpinBox:focus {{ border-color: {PRIMARY}; }}
 #UrlEdit {{ padding: 10px; }}
 QComboBox::drop-down {{ border: none; width: 28px; }}
+QComboBox::down-arrow, QSpinBox::down-arrow {{ image: url("{_ARROW_DOWN}"); width: 10px; height: 6px; }}
+QSpinBox::up-arrow {{ image: url("{_ARROW_UP}"); width: 10px; height: 6px; }}
+QSpinBox {{ padding-right: 26px; }}
+QSpinBox::up-button, QSpinBox::down-button {{ subcontrol-origin: border; width: 24px; border: none; background: transparent; }}
+QSpinBox::up-button {{ subcontrol-position: top right; margin-top: 3px; }}
+QSpinBox::down-button {{ subcontrol-position: bottom right; margin-bottom: 3px; }}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {PRIMARY_LIGHT}; border-radius: 4px; }}
+#QueueHost {{ background: {CARD}; }}
 QProgressBar {{ background: #edf1f7; border: none; border-radius: 4px; }}
 QProgressBar::chunk {{ background: {PRIMARY}; border-radius: 4px; }}
 QCheckBox {{ spacing: 8px; }}
@@ -3241,7 +3886,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "window": window.windowTitle(),
             "size": [window.width(), window.height()],
             "minimum": [window.minimumWidth(), window.minimumHeight()],
-            "pages": ["頻道下載", "下載中心", "帳號管理", "下載紀錄", "設定與說明"],
+            "pages": list(PAGE_NAMES),
             "backend": type(window.bridge.runner).__name__ if window.bridge.runner is not None else "",
             "backend_available": bool(window.bridge.available),
             "core": core_path,

@@ -30,14 +30,8 @@ type progress struct {
 
 	it *iter
 
-	sampleMu sync.Mutex
-	samples  map[int]progressSample
+	throttle *desktopio.Throttle
 	failures *atomic.Int64
-}
-
-type progressSample struct {
-	at         time.Time
-	downloaded int64
 }
 
 func newProgress(ctx context.Context, p pw.Writer, it *iter, opts Options) *progress {
@@ -47,7 +41,7 @@ func newProgress(ctx context.Context, p pw.Writer, it *iter, opts Options) *prog
 		opts:     opts,
 		ctx:      ctx,
 		it:       it,
-		samples:  make(map[int]progressSample),
+		throttle: desktopio.NewThrottle(desktopio.ProgressInterval),
 		failures: atomic.NewInt64(0),
 	}
 }
@@ -68,12 +62,27 @@ func (p *progress) OnDownload(elem downloader.Elem, state downloader.ProgressSta
 	t := tracker.(*pw.Tracker)
 	t.UpdateTotal(state.Total)
 	t.SetValue(state.Downloaded)
+	if desktopio.From(p.ctx) == nil {
+		return
+	}
+	// WriteAt reports every part. Forwarding each one made the desktop client
+	// persist and repaint dozens of times per second and file, and its pipe
+	// back-pressure throttled the download itself.
 	e := elem.(*iterElem)
-	p.emitMachineState(e, state.Downloaded, state.Total, p.speed(e.id, state), p.machineFilename(e), "downloading")
+	rate, ok := p.throttle.Allow(fmt.Sprintf("%d", e.id), state.Downloaded)
+	if !ok {
+		return
+	}
+	speed := ""
+	if rate > 0 {
+		speed = utils.Byte.FormatBinaryBytes(rate) + "/s"
+	}
+	p.emitMachineState(e, state.Downloaded, state.Total, speed, p.machineFilename(e), "downloading")
 }
 
 func (p *progress) OnDone(elem downloader.Elem, err error) {
 	e := elem.(*iterElem)
+	p.throttle.Forget(fmt.Sprintf("%d", e.id))
 
 	tracker, ok := p.trackers.Load(e.id)
 	if !ok {
@@ -115,31 +124,6 @@ func (p *progress) OnDone(elem downloader.Elem, err error) {
 	// OnDone, but this final event is the completion signal consumed by the
 	// desktop frontend.
 	p.emitMachineState(e, e.file.Size, e.file.Size, "", filepath.Base(finalPath), "completed")
-}
-
-func (p *progress) speed(id int, state downloader.ProgressState) string {
-	now := time.Now()
-	p.sampleMu.Lock()
-	last, ok := p.samples[id]
-	p.samples[id] = progressSample{at: now, downloaded: state.Downloaded}
-	p.sampleMu.Unlock()
-	if !ok {
-		return ""
-	}
-	elapsed := now.Sub(last.at).Seconds()
-	delta := state.Downloaded - last.downloaded
-	if elapsed <= 0 || delta <= 0 {
-		return ""
-	}
-	return utils.Byte.FormatBinaryBytes(int64(float64(delta)/elapsed)) + "/s"
-}
-
-func (p *progress) emitMachine(elem *iterElem, current, total int64, speed string) {
-	p.emitMachineState(elem, current, total, speed, p.machineFilename(elem), "downloading")
-}
-
-func (p *progress) emitMachineFilename(elem *iterElem, current, total int64, speed, filename string) {
-	p.emitMachineState(elem, current, total, speed, filename, "downloading")
 }
 
 func (p *progress) emitMachineState(elem *iterElem, current, total int64, speed, filename, state string) {

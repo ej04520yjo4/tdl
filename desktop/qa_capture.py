@@ -16,7 +16,7 @@ from PySide6.QtCore import QLocale, QTranslator, QLibraryInfo, QEventLoop, QTime
 from PySide6.QtGui import QFont, QFontDatabase
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
-from desktop.app import BackendBridge, MainWindow, LoginDialog, STYLE
+from desktop.app import BackendBridge, DownloadJob, MainWindow, LoginDialog, STYLE
 
 
 def settle(milliseconds):
@@ -53,13 +53,48 @@ def main():
         {"id": "10004", "ref": "channel:10004", "type": "channel", "title": "每週學習筆記", "username": "example_learning"},
     ]})
     channel_page.chat_list.setCurrentRow(0)
-    channel_page._operation_succeeded(channel_page._generation, "export", {"path": str(ROOT / ".build" / "qa-fixture-export.json"), "count": 12})
+    channel_page._operation_succeeded(channel_page._generation, "export", {
+        "path": str(ROOT / ".build" / "qa-fixture-export.json"), "count": 12, "total_bytes": 3_650_722_201,
+    })
     target = ROOT / "desktop" / "qa"
     target.mkdir(exist_ok=True)
-    for index, name in enumerate(("channels", "home", "accounts", "history", "settings")):
+    # A scanned channel job mid-download shows the per-file rows together
+    # with the whole-job size, speed and remaining time.
+    job = DownloadJob(
+        id="qa-channel-job", url="頻道掃描清單", title="旅行影片收藏 · 2026-10-07～2026-10-13",
+        output_dir=str(ROOT / ".build" / "qa-fixtures" / "downloads"), status="下載中",
+        expected_files=12, expected_bytes=3_650_722_201,
+        file_progress={
+            "0": {"filename": "10002_101_京都楓葉.mp4", "state": "completed", "current": 412_000_000, "total": 412_000_000, "percent": 100},
+            "1": {"filename": "10002_102_奈良公園.mp4", "state": "downloading", "current": 188_000_000, "total": 530_000_000, "percent": 35.5},
+            "2": {"filename": "10002_103_大阪夜景.mp4", "state": "downloading", "current": 61_000_000, "total": 298_000_000, "percent": 20.5},
+        },
+    )
+    window.jobs[job.id] = job
+    window.home_page.add_jobs([job])
+    row = window.home_page.rows[job.id]
+    row._speed, row._speed_sample = 14.2 * 1024 * 1024, None
+    row._refresh_summary()
+    row.set_state(job.status, job.progress, "")
+    window.transfer_page.add_upload_paths([str(ROOT / "README_zh-TW.md"), str(ROOT / "desktop" / "assets")])
+    window.transfer_page.upload_destination.set_chats([
+        {"id": "10002", "ref": "channel:10002", "type": "channel", "title": "旅行影片收藏", "username": ""},
+    ])
+    for index, name in enumerate(("channels", "home", "transfer", "accounts", "history", "settings")):
         window._show_page(index)
         settle(200)
         window.grab().save(str(target / f"{name}.png"))
+    # The queue sits below the fold of the download page.
+    window._show_page(1)
+    scroll = window.stack.currentWidget()
+    scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum())
+    settle(200)
+    window.grab().save(str(target / "queue.png"))
+    window._show_page(2)
+    window.transfer_page.forward_tab.click()
+    settle(200)
+    window.grab().save(str(target / "forward.png"))
+    window.transfer_page.upload_tab.click()
     window._show_page(0)
     window.resize(960, 680)
     settle(200)
@@ -89,7 +124,7 @@ def main():
     dialog.close()
     window.close()
     settle(200)
-    print("Captured nine offline widget screenshots, including channel and forum topic selection.")
+    print("Captured twelve offline widget screenshots, including the queue, upload and forward pages.")
 
 
 if __name__ == "__main__":

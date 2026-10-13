@@ -20,6 +20,7 @@ written.
 
 from __future__ import annotations
 
+import shutil
 import threading
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
@@ -52,6 +53,9 @@ _MEDIA_LABELS = {
     "audio": "音訊",
     "document": "文件",
 }
+
+# Telegram opened in August 2013; no message is older than this.
+_TELEGRAM_EPOCH = QDate(2013, 8, 1)
 
 
 def _value(item: Any, *names: str, default: Any = None) -> Any:
@@ -207,6 +211,37 @@ def _thread_running(thread: Any) -> bool:
         return False
 
 
+def _format_bytes(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return ""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(number) < 1024 or unit == "TB":
+            return f"{number:.1f} {unit}"
+        number /= 1024
+    return f"{number:.1f} TB"
+
+
+def _free_bytes(folder: str) -> Optional[int]:
+    """Free space of the drive that will hold ``folder``, if it can be read.
+
+    The download folder is created on demand, so walk up to the nearest
+    directory that already exists.
+    """
+
+    if not folder:
+        return None
+    try:
+        path = Path(folder).expanduser()
+        for candidate in (path, *path.parents):
+            if candidate.is_dir():
+                return int(shutil.disk_usage(candidate).free)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 class _Card(QFrame):
     """Use the main app's global stylesheet without importing app.py."""
 
@@ -343,6 +378,7 @@ class ChannelPage(QWidget):
         self._pending_operation: Optional[tuple[int, str, str, tuple[Any, ...], dict[str, Any]]] = None
         self._export_path = ""
         self._export_count = 0
+        self._export_bytes = 0
         self._download_folder = ""
         self._proxy = ""
         self._concurrency = 2
@@ -490,13 +526,22 @@ class ChannelPage(QWidget):
         self.today_button = QPushButton("今天")
         self.seven_days_button = QPushButton("近 7 日")
         self.thirty_days_button = QPushButton("近 30 日")
-        for button in (self.today_button, self.seven_days_button, self.thirty_days_button):
+        self.ninety_days_button = QPushButton("近 90 日")
+        self.all_time_button = QPushButton("全部時間")
+        self.all_time_button.setToolTip("從頻道的第一則訊息到今天；大型頻道的掃描需要較久")
+        self._date_buttons = (
+            self.today_button, self.seven_days_button, self.thirty_days_button,
+            self.ninety_days_button, self.all_time_button,
+        )
+        for button in self._date_buttons:
             button.setObjectName("LinkButton")
             shortcut_row.addWidget(button)
         shortcut_row.addStretch(1)
         self.today_button.clicked.connect(lambda: self._set_date_range(0))
         self.seven_days_button.clicked.connect(lambda: self._set_date_range(6))
         self.thirty_days_button.clicked.connect(lambda: self._set_date_range(29))
+        self.ninety_days_button.clicked.connect(lambda: self._set_date_range(89))
+        self.all_time_button.clicked.connect(self._set_all_time)
         dates.addLayout(shortcut_row, 2, 0, 1, 2)
         filters_layout.addLayout(dates)
 
@@ -580,6 +625,7 @@ class ChannelPage(QWidget):
         old_selected = previous
         saved_export_path = self._export_path
         saved_export_count = self._export_count
+        saved_export_bytes = self._export_bytes
         self._accounts = values
         self._active_account_id = _text(active_id or previous)
         self.account_combo.blockSignals(True)
@@ -621,6 +667,7 @@ class ChannelPage(QWidget):
             # so the already scanned manifest remains valid and is restored.
             self._export_path = saved_export_path
             self._export_count = saved_export_count
+            self._export_bytes = saved_export_bytes
             if hasattr(self, "download_button") and not self.is_busy():
                 self.download_button.setEnabled(bool(saved_export_path and saved_export_count > 0))
         if not self.account_combo.count():
@@ -628,8 +675,33 @@ class ChannelPage(QWidget):
             self._set_status("尚未有可用帳號。請先到「帳號管理」完成登入。")
         elif not self._current_account_is_authenticated():
             self._set_status("目前帳號尚未登入，請先完成 Telegram 登入。")
-        elif changed:
+        elif changed and not self._load_cached_chats():
             self._set_status("請按「更新清單」載入目前帳號可存取的頻道與群組。")
+
+    def _load_cached_chats(self) -> bool:
+        """Show the list saved by the last refresh so the page is usable at once.
+
+        Listing every dialog takes several seconds on a large account; the
+        cache is only a starting point and 「更新清單」 still replaces it.
+        """
+
+        loader = getattr(getattr(self._runner, "store", None), "load_chat_cache", None)
+        account_id = self.active_account_id()
+        if not callable(loader) or not account_id or not self._current_account_is_authenticated():
+            return False
+        try:
+            chats, saved_at = loader(account_id)
+            chats = self._normalise_chats({"chats": list(chats)})
+        except Exception:
+            return False
+        if not chats:
+            return False
+        self._chats = chats
+        self._apply_filter()
+        day = _text(saved_at)[:10] or "先前"
+        self.chat_hint.setText(f"顯示 {day} 更新的清單，共 {len(chats)} 個對話。")
+        self._set_status("已載入上次的清單，可直接選擇；有新加入的頻道或群組時請按「更新清單」。")
+        return True
 
     def set_download_folder(self, path: str) -> None:
         self._download_folder = _text(path).strip()
@@ -695,7 +767,8 @@ class ChannelPage(QWidget):
             worker.cancel()
         self.account_changed.emit(account_id)
         if account_id and self._current_account_is_authenticated():
-            self._set_status("帳號已切換，請按「更新清單」。")
+            if not self._load_cached_chats():
+                self._set_status("帳號已切換，請按「更新清單」。")
         elif account_id:
             self._set_status("目前帳號尚未登入，請先完成 Telegram 登入。")
         else:
@@ -705,6 +778,11 @@ class ChannelPage(QWidget):
         today = _taipei_qdate()
         self.end_date.setDate(today)
         self.start_date.setDate(today.addDays(-int(days_before_today)))
+        self._clear_scan()
+
+    def _set_all_time(self) -> None:
+        self.end_date.setDate(_taipei_qdate())
+        self.start_date.setDate(_TELEGRAM_EPOCH)
         self._clear_scan()
 
     def _choose_folder(self) -> None:
@@ -1038,6 +1116,9 @@ class ChannelPage(QWidget):
             "continue_download": True,
             "concurrency": self._concurrency,
             "proxy": self._proxy,
+            # Lets the queue show whole-job progress and remaining time.
+            "expected_files": self._export_count,
+            "expected_bytes": self._export_bytes,
         }
         self.download_requested.emit([], options)
         self._set_status(f"已加入下載佇列：{self._export_count} 個媒體。")
@@ -1218,9 +1299,11 @@ class ChannelPage(QWidget):
                 self._set_topic_error("後端回傳的論壇主題格式無法辨識。")
         else:
             path, count = self._normalise_export(data)
+            total_bytes = self._export_total_bytes(data)
             if count <= 0:
                 self._export_path = ""
                 self._export_count = 0
+                self._export_bytes = 0
                 self.download_button.setEnabled(False)
                 self._set_status("掃描完成：符合條件的媒體為 0 個，請調整日期或類型。")
             elif not path:
@@ -1228,8 +1311,14 @@ class ChannelPage(QWidget):
             else:
                 self._export_path = path
                 self._export_count = count
+                self._export_bytes = total_bytes
                 self.download_button.setEnabled(True)
-                self._set_status(f"掃描完成：共 {count} 個媒體，可以開始下載。")
+                size = f"，約 {_format_bytes(total_bytes)}" if total_bytes > 0 else ""
+                status = f"掃描完成：共 {count} 個媒體{size}，可以開始下載。"
+                free = _free_bytes(self.folder_edit.text().strip())
+                if total_bytes > 0 and free is not None and free < total_bytes:
+                    status += f"\n注意：下載資料夾所在磁碟只剩 {_format_bytes(free)}，空間可能不足。"
+                self._set_status(status)
 
     @Slot(int, str)
     def _operation_failed(self, token: int, message: str) -> None:
@@ -1289,6 +1378,15 @@ class ChannelPage(QWidget):
             count = 0
         return path, count
 
+    @staticmethod
+    def _export_total_bytes(data: Any) -> int:
+        if not isinstance(data, Mapping):
+            return 0
+        try:
+            return max(0, int(data.get("total_bytes", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
     # ------------------------------------------------------------------
     # Small visual/state helpers
     # ------------------------------------------------------------------
@@ -1308,9 +1406,8 @@ class ChannelPage(QWidget):
             checkbox.setEnabled(enabled)
         self.start_date.setEnabled(enabled)
         self.end_date.setEnabled(enabled)
-        self.today_button.setEnabled(enabled)
-        self.seven_days_button.setEnabled(enabled)
-        self.thirty_days_button.setEnabled(enabled)
+        for button in self._date_buttons:
+            button.setEnabled(enabled)
         if not enabled:
             self.download_button.setEnabled(False)
         else:
@@ -1341,6 +1438,7 @@ class ChannelPage(QWidget):
     def _clear_scan(self, *_args: Any, keep_status: bool = False) -> None:
         self._export_path = ""
         self._export_count = 0
+        self._export_bytes = 0
         if hasattr(self, "download_button"):
             self.download_button.setEnabled(False)
         if not keep_status and hasattr(self, "status_label"):

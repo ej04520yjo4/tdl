@@ -26,6 +26,7 @@ import (
 	"github.com/iyear/tdl/core/uploader"
 	"github.com/iyear/tdl/core/util/tutil"
 	"github.com/iyear/tdl/pkg/consts"
+	"github.com/iyear/tdl/pkg/desktopio"
 	"github.com/iyear/tdl/pkg/prog"
 	"github.com/iyear/tdl/pkg/texpr"
 	"github.com/iyear/tdl/pkg/utils"
@@ -69,7 +70,20 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		return err
 	}
 
-	color.Blue("Files count: %d", len(files))
+	gui := desktopio.From(ctx) != nil
+	if gui {
+		if len(files) == 0 {
+			return errors.New("沒有找到可上傳的檔案")
+		}
+		_ = desktopio.Emit(ctx, desktopio.Event{
+			Event:   "status",
+			Kind:    "upload",
+			Count:   int64(len(files)),
+			Message: fmt.Sprintf("共 %d 個檔案等待上傳", len(files)),
+		})
+	} else {
+		color.Blue("Files count: %d", len(files))
+	}
 
 	pool := dcpool.NewPool(c,
 		int64(viper.GetInt(consts.FlagPoolSize)),
@@ -90,23 +104,30 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 
 	upProgress := prog.New(utils.Byte.FormatBinaryBytes)
 	upProgress.SetNumTrackersExpected(len(files))
-	if !viper.GetBool(consts.FlagDisableProgressPS) {
+	if !gui && !viper.GetBool(consts.FlagDisableProgressPS) {
 		prog.EnablePS(ctx, upProgress)
 	}
 
+	machineProgress := newProgress(ctx, upProgress)
 	options := uploader.Options{
 		Client:   pool.Default(ctx),
 		Threads:  viper.GetInt(consts.FlagThreads),
 		Iter:     newIter(files, to, caption, opts.Chat, opts.Thread, opts.Photo, opts.Remove, viper.GetDuration(consts.FlagDelay), manager),
-		Progress: newProgress(upProgress),
+		Progress: machineProgress,
 	}
 
 	up := uploader.New(options)
 
-	go upProgress.Render()
-	defer prog.Wait(ctx, upProgress)
+	if !gui {
+		go upProgress.Render()
+		defer prog.Wait(ctx, upProgress)
+	}
 
-	return up.Upload(ctx, viper.GetInt(consts.FlagLimit))
+	err = up.Upload(ctx, viper.GetInt(consts.FlagLimit))
+	if err == nil && gui && machineProgress.Failures() > 0 {
+		return errors.New("有檔案上傳失敗，請查看錯誤訊息後重試")
+	}
+	return err
 }
 
 func resolveDest(ctx context.Context, manager *peers.Manager, input string) (*vm.Program, error) {

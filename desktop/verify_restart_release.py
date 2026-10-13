@@ -8,6 +8,7 @@ import os
 import tempfile
 from pathlib import Path
 from verify_release import _run_frozen_check
+from version import VERSION
 
 
 def main(source=None):
@@ -26,7 +27,7 @@ def main(source=None):
             report = logs / f"{phase}.json"
             _run_frozen_check([str(executable), "--verify-restart", phase, "--smoke-report", str(report)], cwd=root, env=env, log_dir=logs / phase, timeout=60)
             receipts.append(json.loads(report.read_text(encoding="utf-8")))
-    result = {"ok": all(item["ok"] for item in receipts), "version": "1.2.0", "sha256": hashlib.sha256(executable.read_bytes()).hexdigest(), "offline_fixture": True, "separate_exe_processes": 2, "phases": receipts}
+    result = {"ok": all(item["ok"] for item in receipts), "version": VERSION, "sha256": hashlib.sha256(executable.read_bytes()).hexdigest(), "offline_fixture": True, "separate_exe_processes": 2, "phases": receipts}
     (root / "dist" / "restart-verification.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(result, ensure_ascii=False))
 
