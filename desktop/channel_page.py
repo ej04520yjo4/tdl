@@ -46,6 +46,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+try:
+    from .search import normalize_search_text, search_matches
+except ImportError:  # pragma: no cover - direct module execution
+    from search import normalize_search_text, search_matches
+
 
 _MEDIA_LABELS = {
     "video": "影片",
@@ -574,6 +579,10 @@ class ChannelPage(QWidget):
         self.folder_button.clicked.connect(self._choose_folder)
         folder_row.addWidget(self.folder_button)
         filters_layout.addLayout(folder_row)
+        folder_hint = QLabel("檔案會自動放入「群組／頻道名稱」子資料夾，話題下載也會放在所屬群組內。")
+        folder_hint.setObjectName("MutedText")
+        folder_hint.setWordWrap(True)
+        filters_layout.addWidget(folder_hint)
 
         action_card = _Card()
         action_layout = QVBoxLayout(action_card)
@@ -869,7 +878,7 @@ class ChannelPage(QWidget):
     def _apply_topic_filter(self, *_args: Any) -> None:
         if not self._topics_loaded:
             return
-        query = self.topic_search.text().strip().casefold()
+        query = normalize_search_text(self.topic_search.text())
         selected_id = _text((self._selected_topic or {}).get("id", ""))
         selected_item: Optional[QListWidgetItem] = None
         self.topic_list.blockSignals(True)
@@ -877,12 +886,12 @@ class ChannelPage(QWidget):
         all_item = QListWidgetItem("全部主題（掃描整個論壇群組）")
         all_topic = {"id": "", "title": "全部主題", "all": True}
         all_item.setData(Qt.UserRole, all_topic)
-        if not query or "全部主題".casefold() in query:
+        if not query or search_matches(query, "全部主題（掃描整個論壇群組）"):
             self.topic_list.addItem(all_item)
             if not selected_id and self._selected_topic and self._selected_topic.get("all"):
                 selected_item = all_item
         for topic in self._topics:
-            if query and query not in topic["title"].casefold() and query not in topic["id"].casefold():
+            if query and not search_matches(query, topic["title"], topic["id"]):
                 continue
             item = QListWidgetItem(topic["title"])
             item.setData(Qt.UserRole, topic)
@@ -948,7 +957,7 @@ class ChannelPage(QWidget):
         self._update_scan_button()
 
     def _apply_filter(self, *_args: Any) -> None:
-        query = self.search_edit.text().strip().casefold()
+        query = normalize_search_text(self.search_edit.text())
         kind = _text(self.type_combo.currentData() or "all")
         current_id = _chat_ref(self._selected_chat) if self._selected_chat is not None else ""
         saved_export_path = self._export_path
@@ -959,8 +968,7 @@ class ChannelPage(QWidget):
         for chat in self._chats:
             chat_kind = _chat_kind(chat)
             username = _chat_username(chat)
-            haystack = f"{_chat_title(chat)} {username} {_chat_ref(chat)} {_chat_id(chat)}".casefold()
-            if query and query not in haystack:
+            if query and not search_matches(query, _chat_title(chat), username, f"@{username}" if username else "", _chat_ref(chat), _chat_id(chat)):
                 continue
             if kind != "all" and chat_kind != kind:
                 continue
@@ -1112,6 +1120,7 @@ class ChannelPage(QWidget):
             "files": [self._export_path],
             "title": title,
             "group_album": False,
+            "group_by_chat": True,
             "skip_existing": self._skip_existing,
             "continue_download": True,
             "concurrency": self._concurrency,

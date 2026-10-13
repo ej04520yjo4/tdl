@@ -17,7 +17,7 @@ try {
     & $Go build -trimpath -ldflags "-s -w -X github.com/iyear/tdl/pkg/consts.Version=desktop-$version" -o bin/tdl-core.exe .
     if ($LASTEXITCODE -ne 0) { throw 'Go build failed' }
     if (-not $SkipTests) {
-        & $Go test ./pkg/desktopio ./app/chat ./app/dl ./app/up ./app/migrate ./pkg/tmessage ./cmd ./core/downloader ./core/uploader ./core/util/tutil
+        & $Go test ./pkg/desktopio ./pkg/key ./app/chat ./app/dl ./app/up ./app/migrate ./pkg/tmessage ./cmd ./core/downloader ./core/uploader ./core/util/tutil
         if ($LASTEXITCODE -ne 0) { throw 'Go tests failed' }
         & $Python -m pytest desktop/tests -q
         if ($LASTEXITCODE -ne 0) { throw 'Desktop tests failed' }

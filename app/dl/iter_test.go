@@ -82,11 +82,159 @@ func TestIterExtensionFiltersAreCaseInsensitive(t *testing.T) {
 			elem := (<-it.elem).(*iterElem)
 			require.Equal(t, tt.file+tempExt, filepath.Base(elem.to.Name()),
 				"filtering must preserve the original media filename casing")
+			require.Equal(t, root, filepath.Dir(elem.to.Name()),
+				"the default mode must keep the historical flat output path")
 			require.NoError(t, elem.to.Close())
 			require.NoError(t, os.Remove(elem.to.Name()))
 			require.Equal(t, int64(1), it.CandidateCount())
 		})
 	}
+}
+
+func testDocumentMessage(id int, name string, size int64) *tg.Message {
+	message := &tg.Message{ID: id}
+	message.SetMedia(&tg.MessageMediaDocument{
+		Document: &tg.Document{
+			ID:       int64(id),
+			MimeType: "application/octet-stream",
+			Size:     size,
+			DCID:     1,
+			Attributes: []tg.DocumentAttributeClass{
+				&tg.DocumentAttributeFilename{FileName: name},
+			},
+		},
+	})
+	return message
+}
+
+func closeAndRemoveIterElem(t *testing.T, elem *iterElem) {
+	t.Helper()
+	require.NoError(t, elem.to.Close())
+	require.NoError(t, os.Remove(elem.to.Name()))
+}
+
+func TestIterGroupByChatUsesSafeFoldersForMultipleChats(t *testing.T) {
+	root := t.TempDir()
+	manager := (&peers.Options{}).Build(nil)
+	chat := manager.Chat(&tg.Chat{ID: 7, Title: "News: Daily?"})
+	channel := manager.Channel(&tg.Channel{ID: 8, Title: "Channel\\Two"})
+
+	it, err := newIter(nil, nil, [][]*tmessage.Dialog{{
+		{Peer: chat.InputPeer(), Messages: []int{1}},
+		{Peer: channel.InputPeer(), Messages: []int{2}},
+	}}, Options{
+		Dir:         root,
+		Template:    "{{.FileName}}",
+		GroupByChat: true,
+	}, 0)
+	require.NoError(t, err)
+
+	ret, skip := it.processSingle(context.Background(), testDocumentMessage(1, "chat.bin", 3), chat, 0)
+	require.True(t, ret)
+	require.False(t, skip)
+	chatElem := (<-it.elem).(*iterElem)
+	require.Equal(t, "News_ Daily_", safeChatFolder(chat))
+	require.Equal(t, filepath.Join(root, "News_ Daily_", "chat.bin"+tempExt), chatElem.to.Name())
+	closeAndRemoveIterElem(t, chatElem)
+
+	ret, skip = it.processSingle(context.Background(), testDocumentMessage(2, "channel.bin", 1), channel, 1)
+	require.True(t, ret)
+	require.False(t, skip)
+	channelElem := (<-it.elem).(*iterElem)
+	require.Equal(t, "Channel_Two", safeChatFolder(channel))
+	require.Equal(t, filepath.Join(root, "Channel_Two", "channel.bin"+tempExt), channelElem.to.Name())
+	closeAndRemoveIterElem(t, channelElem)
+
+	entries, err := os.ReadDir(root)
+	require.NoError(t, err)
+	require.Len(t, entries, 2, "each peer gets one sibling folder under the output root")
+}
+
+func TestIterGroupByChatDisambiguatesDuplicateTitles(t *testing.T) {
+	root := t.TempDir()
+	manager := (&peers.Options{}).Build(nil)
+	chat := manager.Chat(&tg.Chat{ID: 21, Title: "Shared"})
+	channel := manager.Channel(&tg.Channel{ID: 22, Title: "Shared"})
+	it, err := newIter(nil, nil, [][]*tmessage.Dialog{{
+		{Peer: chat.InputPeer(), Messages: []int{1}},
+		{Peer: channel.InputPeer(), Messages: []int{2}},
+	}}, Options{Dir: root, Template: "{{.FileName}}", GroupByChat: true}, 0)
+	require.NoError(t, err)
+
+	ret, skip := it.processSingle(context.Background(), testDocumentMessage(1, "chat.bin", 1), chat, 0)
+	require.True(t, ret)
+	require.False(t, skip)
+	chatElem := (<-it.elem).(*iterElem)
+	require.Equal(t, filepath.Join(root, "Shared", "chat.bin"+tempExt), chatElem.to.Name())
+	closeAndRemoveIterElem(t, chatElem)
+
+	ret, skip = it.processSingle(context.Background(), testDocumentMessage(2, "channel.bin", 1), channel, 1)
+	require.True(t, ret)
+	require.False(t, skip)
+	channelElem := (<-it.elem).(*iterElem)
+	require.Equal(t, filepath.Join(root, "Shared (channel-22)", "channel.bin"+tempExt), channelElem.to.Name())
+	closeAndRemoveIterElem(t, channelElem)
+}
+
+func TestIterGroupByChatSanitizesReservedAndFallsBackToPeerIdentity(t *testing.T) {
+	manager := (&peers.Options{}).Build(nil)
+	reserved := manager.Chat(&tg.Chat{ID: 11, Title: "CON."})
+	empty := manager.Channel(&tg.Channel{ID: 12})
+
+	require.Equal(t, "_CON", safeChatFolder(reserved), "reserved Windows device names need a safe prefix")
+	require.Equal(t, "channel-12", safeChatFolder(empty), "untitled peers need a stable typed identity")
+
+	unsafe := sanitizeWindowsComponent("..\\folder/name\x00")
+	require.NotEmpty(t, unsafe)
+	require.NotEqual(t, "..", unsafe)
+	require.NotContains(t, unsafe, "\\")
+	require.NotContains(t, unsafe, "/")
+	require.NotContains(t, unsafe, "\x00")
+	require.LessOrEqual(t, len([]rune(sanitizeWindowsComponent(strings.Repeat("x", maxChatFolderRunes+20)))), maxChatFolderRunes)
+	longReserved := sanitizeWindowsComponent("CON." + strings.Repeat("x", 116))
+	require.LessOrEqual(t, len([]rune(longReserved)), maxChatFolderRunes)
+	require.Equal(t, longReserved, sanitizeWindowsComponent(longReserved), "reserved-name truncation must be idempotent")
+	require.Equal(t, "_COM¹", sanitizeWindowsComponent("COM¹"))
+	require.Equal(t, "_LPT³", sanitizeWindowsComponent("LPT³"))
+}
+
+func TestIterGroupByChatSkipSameChecksGroupedPath(t *testing.T) {
+	root := t.TempDir()
+	manager := (&peers.Options{}).Build(nil)
+	chat := manager.Chat(&tg.Chat{ID: 13, Title: "Saved"})
+	chatDir := filepath.Join(root, safeChatFolder(chat))
+	require.NoError(t, os.MkdirAll(chatDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(chatDir, "same.bin"), []byte("abc"), 0o644))
+
+	it, err := newIter(nil, nil, [][]*tmessage.Dialog{{
+		{Peer: chat.InputPeer(), Messages: []int{1}},
+	}}, Options{
+		Dir:         root,
+		Template:    "{{.FileName}}",
+		GroupByChat: true,
+		SkipSame:    true,
+	}, 0)
+	require.NoError(t, err)
+
+	ret, skip := it.processSingle(context.Background(), testDocumentMessage(1, "same.bin", 3), chat, 0)
+	require.False(t, ret)
+	require.True(t, skip)
+	require.Empty(t, it.elem)
+}
+
+func TestIterGroupByChatFingerprintDoesNotReuseLegacyResume(t *testing.T) {
+	dialogs := []*tmessage.Dialog{{
+		Peer:     &tg.InputPeerChannel{ChannelID: 17},
+		Messages: []int{1, 2},
+	}}
+	legacy := fingerprint(dialogs)
+	flat, err := newIter(nil, nil, [][]*tmessage.Dialog{dialogs}, Options{Dir: "downloads", Template: "{{.FileName}}"}, 0)
+	require.NoError(t, err)
+	grouped, err := newIter(nil, nil, [][]*tmessage.Dialog{dialogs}, Options{Dir: "downloads", Template: "{{.FileName}}", GroupByChat: true}, 0)
+	require.NoError(t, err)
+
+	require.Equal(t, legacy, flat.Fingerprint(), "legacy flat jobs retain their old resume key")
+	require.NotEqual(t, legacy, grouped.Fingerprint(), "grouped paths must not consume a flat job checkpoint")
 }
 
 // TestIterDeletedMessageHandling verifies that deleted messages are handled correctly

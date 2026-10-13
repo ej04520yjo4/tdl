@@ -11,6 +11,7 @@ import subprocess
 from pathlib import Path
 
 import pefile
+from version import VERSION
 
 
 _FROZEN_TIMEOUT_SECONDS = 45
@@ -257,10 +258,12 @@ def main() -> None:
     assert json.loads(native_report.read_text(encoding="utf-8"))["ok"]
     payload = json.loads(report.read_text(encoding="utf-8"))
     assert payload["ok"] and payload["backend_available"], payload
+    assert payload["traditional_simplified_search"]
     assert "_MEI" in payload["core"], "Core must come from the one-file bundle"
     assert capture.exists() and capture.stat().st_size > 10_000, "Expected a rendered window"
     receipt = {
         "result": "PASS",
+        "version": VERSION,
         "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "architecture": "Windows x64 GUI",
         "copied_executable_to_independent_directory": True,
@@ -268,6 +271,7 @@ def main() -> None:
         "bundled_backend_and_core": payload["ok"],
         "window_rendered": True,
         "native_windows_window_started": True,
+        "traditional_simplified_search": payload["traditional_simplified_search"],
         "screenshot": str(capture),
         "telegram_live_account_test": "NOT_RUN_BY_OFFLINE_CHECK_SEE_CHANNEL_RECEIPT",
     }

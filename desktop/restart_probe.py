@@ -65,15 +65,23 @@ def run_probe(phase: str, report_path: str) -> int:
     app.setFont(QFont("Microsoft JhengHei UI", 10))
     report = Path(report_path).resolve()
     root = Path(os.environ["TDL_DESKTOP_DATA_DIR"]).resolve()
-    output = root / "downloads"
+    download_root = root / "downloads"
+    output = download_root / "離線驗證群組"
     marker = root / "verification-expectations.json"
     command_flags = []
 
     class FixtureRunner(Runner):
         def _build_args(self, request, runtime):
-            command_flags.append(super()._build_args(request, runtime))
+            flags = super()._build_args(request, runtime)
+            command_flags.append(flags)
+            # This is a local fixture. The actual Go folder resolver is
+            # exercised separately by its iterator tests; here we verify that
+            # the frozen GUI persists and forwards the setting across runs.
+            destination = Path(flags[flags.index("--dir") + 1])
+            if "--group-by-chat" in flags:
+                destination /= "離線驗證群組"
             entry = [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, "-m", "desktop.app"]
-            return [*entry, "--verify-download-child", str(runtime), str(output)]
+            return [*entry, "--verify-download-child", str(runtime), str(destination)]
 
     def pump(predicate, timeout=25):
         deadline = time.monotonic() + timeout
@@ -97,7 +105,7 @@ def run_probe(phase: str, report_path: str) -> int:
     try:
         pump(lambda: window._accounts_loaded and window._queue_loaded)
         if phase == "before-close":
-            window._enqueue_downloads(["https://t.me/telegram/193"], {"account_id": account.id, "output_dir": str(output)})
+            window._enqueue_downloads(["https://t.me/telegram/193"], {"account_id": account.id, "output_dir": str(download_root)})
             pump(lambda: bool(window.jobs) and "second" in next(iter(window.jobs.values())).file_progress)
             job = next(iter(window.jobs.values()))
             marker.write_text(json.dumps({"id": job.backend_job_id, "account_id": account.id, "first_mtime": (output / "first.mp4").stat().st_mtime_ns}), encoding="utf-8")
@@ -107,7 +115,9 @@ def run_probe(phase: str, report_path: str) -> int:
             window.close()
             pump(lambda: window.isHidden() and not window._background_work_running())
             metrics["saved_as_paused"] = bridge.store.get_job(job.backend_job_id).status == "paused"
-            metrics["ok"] = metrics["saved_as_paused"]
+            metrics["group_by_chat_saved"] = bridge.store.get_job(job.backend_job_id).group_by_chat
+            metrics["group_folder_fixture"] = (output / "first.mp4").is_file() and not (download_root / "first.mp4").exists()
+            metrics["ok"] = all(metrics[key] for key in ("saved_as_paused", "group_by_chat_saved", "group_folder_fixture"))
         elif phase == "after-reopen":
             expected = json.loads(marker.read_text(encoding="utf-8"))
             pump(lambda: bridge.store.get_job(expected["id"]).status == "completed" and not window._threads and not window._preparing_jobs)
@@ -117,11 +127,13 @@ def run_probe(phase: str, report_path: str) -> int:
                 completed_file_unchanged=(output / "first.mp4").stat().st_mtime_ns == expected["first_mtime"],
                 remaining_file_written=(output / "second.mp4").is_file(),
                 continue_flag="--continue" in command_flags[-1],
+                group_by_chat_restored=bridge.store.get_job(expected["id"]).group_by_chat and "--group-by-chat" in command_flags[-1],
+                group_folder_fixture=not (download_root / "first.mp4").exists() and not (output / "離線驗證群組").exists(),
                 file_rows_restored=next(iter(window.jobs.values())).file_progress.get("first", {}).get("state") == "completed",
             )
             window.close()
             pump(lambda: window.isHidden() and not window._background_work_running())
-            metrics["ok"] = all(metrics[key] for key in ("resumed_same_job", "original_account", "completed_file_unchanged", "remaining_file_written", "continue_flag", "file_rows_restored"))
+            metrics["ok"] = all(metrics[key] for key in ("resumed_same_job", "original_account", "completed_file_unchanged", "remaining_file_written", "continue_flag", "file_rows_restored", "group_by_chat_restored", "group_folder_fixture"))
         else:
             return 2
     except Exception as exc:

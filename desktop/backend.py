@@ -59,6 +59,11 @@ _PROGRESS_PERSIST_INTERVAL = 2.0
 _EXPORT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_TEMPLATE = "{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}"
 FORWARD_MODES = frozenset({"direct", "clone"})
+# New GUI download jobs keep media under a per-chat folder.  This option is
+# deliberately a job option rather than a global preference: the durable
+# manifest must decide how a resumed job lays out files, while old manifests
+# (which have no such field) must retain their original flat output behavior.
+_DEFAULT_GROUP_BY_CHAT = True
 
 # Operations are tracked at module scope rather than on ``Runner`` instances.
 # The window normally owns one Runner, but keeping the registry shared also
@@ -582,6 +587,10 @@ class DownloadJob:
     # rows, which are dropped once nothing can resume; see ``_complete_job``.
     file_count: int = 0
     total_bytes: int = 0
+    # ``group_by_chat`` was added after the initial queue schema.  Missing
+    # values are intentionally false in ``from_dict`` so resuming an old job
+    # never moves its files into newly-created chat folders.
+    group_by_chat: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -631,6 +640,7 @@ class DownloadJob:
             expected_bytes=_non_negative_int(raw.get("expected_bytes")),
             file_count=_non_negative_int(raw.get("file_count")),
             total_bytes=_non_negative_int(raw.get("total_bytes")),
+            group_by_chat=bool(raw.get("group_by_chat", False)),
         )
 
 
@@ -1071,6 +1081,7 @@ class Store:
         advanced: Mapping[str, Any] | None = None,
         expected_files: int = 0,
         expected_bytes: int = 0,
+        group_by_chat: bool | None = _DEFAULT_GROUP_BY_CHAT,
     ) -> DownloadJob:
         self.get_account(account_id)
         clean_links = validate_message_links(links) if links else []
@@ -1101,6 +1112,11 @@ class Store:
             ),
             expected_files=_non_negative_int(expected_files),
             expected_bytes=_non_negative_int(expected_bytes),
+            group_by_chat=(
+                _DEFAULT_GROUP_BY_CHAT
+                if group_by_chat is None
+                else bool(group_by_chat)
+            ),
         )
         # Preserve the manifest before publishing the durable queue row.  A
         # failed copy therefore cannot leave a resumable job pointing at a
@@ -2286,6 +2302,9 @@ class DownloadRequest:
     advanced: Optional[Mapping[str, Any]] = None
     expected_files: int = 0
     expected_bytes: int = 0
+    # New direct requests default to chat folders.  A persisted job overrides
+    # this value in ``Runner.start`` so legacy manifests remain flat.
+    group_by_chat: bool = _DEFAULT_GROUP_BY_CHAT
 
 
 @dataclass
@@ -2664,6 +2683,7 @@ class Runner:
                     stored_job.skip_same if request.skip_same is None else bool(request.skip_same)
                 )
                 request.group = stored_job.group
+                request.group_by_chat = stored_job.group_by_chat
                 request.concurrency = stored_job.concurrency
                 request.title = stored_job.title
                 request.advanced = stored_job.advanced
@@ -2692,9 +2712,11 @@ class Runner:
                     advanced=request.advanced,
                     expected_files=request.expected_files,
                     expected_bytes=request.expected_bytes,
+                    group_by_chat=request.group_by_chat,
                 )
                 request.job_id = job.id
                 request.advanced = job.advanced
+                request.group_by_chat = job.group_by_chat
             handle = RunHandle(request.account_id, callback=on_event)
             with self._handles_guard:
                 self._handles.add(handle)
@@ -2846,6 +2868,7 @@ class Runner:
         concurrency: int | None = None,
         proxy: str | None = None,
         title: str | None = None,
+        group_by_chat: bool | None = _DEFAULT_GROUP_BY_CHAT,
         on_event: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> RunHandle:
         clean_proxy = validate_proxy(proxy) if proxy is not None else None
@@ -2864,6 +2887,7 @@ class Runner:
             concurrency=concurrency,
             proxy=clean_proxy,
             title=_normalize_job_title(title),
+            group_by_chat=group_by_chat,
         )
         # ``start`` reserves the account and persists this queue item before
         # starting the worker.  That ordering keeps a queued job visible on a
@@ -2895,6 +2919,7 @@ class Runner:
                 proxy=validate_proxy(proxy) if proxy is not None else None,
                 job_id=stored.id,
                 title=stored.title,
+                group_by_chat=stored.group_by_chat,
             ),
             on_event=on_event,
         )
@@ -3189,6 +3214,15 @@ class Runner:
             args.append("--skip-same")
         if request.group if request.group is not None else prefs.group:
             args.append("--group")
+        # This is independent from ``--group`` (album detection).  New
+        # requests default to a chat folder; an old durable job is assigned
+        # ``False`` when it is read and therefore omits this flag.
+        if (
+            request.group_by_chat
+            if request.group_by_chat is not None
+            else _DEFAULT_GROUP_BY_CHAT
+        ):
+            args.append("--group-by-chat")
         concurrency = request.concurrency if request.concurrency is not None else prefs.concurrency
         if int(concurrency) < 1 or int(concurrency) > 64:
             raise ValidationError("同時下載數量必須介於 1 到 64")
@@ -3317,7 +3351,9 @@ class Runner:
                         advanced=request.advanced,
                         expected_files=request.expected_files,
                         expected_bytes=request.expected_bytes,
+                        group_by_chat=request.group_by_chat,
                     )
+                    request.group_by_chat = job.group_by_chat
                 self.store.mark_job_running(job.id)
                 file_progress = {key: dict(row) for key, row in job.file_progress.items()}
 

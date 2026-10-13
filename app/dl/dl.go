@@ -39,6 +39,10 @@ type Options struct {
 	Desc       bool
 	Takeout    bool
 	Group      bool // auto detect grouped message
+	// GroupByChat stores each chat's media under a safe, human-readable
+	// subdirectory below Dir. It is opt-in so existing CLI jobs keep their
+	// historical paths.
+	GroupByChat bool
 
 	// resume opts
 	Continue, Restart bool
@@ -79,6 +83,11 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 	it, err := newIter(pool, manager, dialogs, opts, viper.GetDuration(consts.FlagDelay))
 	if err != nil {
 		return err
+	}
+	if opts.GroupByChat {
+		if err := it.configureChatFolders(ctx, kvd); err != nil {
+			return err
+		}
 	}
 
 	if !opts.Restart {

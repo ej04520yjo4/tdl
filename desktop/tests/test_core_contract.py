@@ -84,7 +84,7 @@ class CoreContractTests(unittest.TestCase):
                 ExportRequest(account.id, "channel:123", "2026-01-01", "2026-01-31", ("video", "photo"), topic_id=7),
                 DownloadRequest(account.id, ["https://t.me/telegram/193"], files=[str(manifest)],
                                 output_dir=temporary, continue_download=True, skip_same=True, group=True,
-                                concurrency=3, advanced=advanced),
+                                concurrency=3, advanced=advanced, group_by_chat=True),
                 DownloadRequest(account.id, ["https://t.me/telegram/193"], advanced={"exclude": "jpg"}),
                 UploadRequest(account.id, [str(manifest)], chat="channel:123", topic_id=7, as_photo=True,
                               remove_after=True, caption_mode="text", caption_text='說明 "x"',

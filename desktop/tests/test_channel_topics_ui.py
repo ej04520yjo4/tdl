@@ -170,6 +170,18 @@ class ForumTopicUiTests(unittest.TestCase):
         page.shutdown()
         page.deleteLater()
 
+    def test_simplified_topic_search_matches_and_preserves_original_title(self):
+        runner = _TopicRunner()
+        page = self._page(runner)
+
+        page.topic_search.setText("问题讨论")
+
+        self.assertEqual(page.topic_list.count(), 1)
+        self.assertEqual(page.topic_list.item(0).text(), "問題討論")
+        self.assertEqual(page.topic_list.item(0).data(256)["id"], "202")
+        page.shutdown()
+        page.deleteLater()
+
     def test_topic_error_is_visible_and_never_falls_back_to_whole_group(self):
         runner = _TopicRunner(topic_error="主題查詢失敗")
         page = self._page(runner)

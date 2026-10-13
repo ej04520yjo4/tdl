@@ -227,6 +227,23 @@ class ChannelPageFixtureTests(unittest.TestCase):
         self.assertFalse(page.scan_button.isEnabled())
         page.deleteLater()
 
+    def test_simplified_search_matches_channel_without_changing_visible_title(self):
+        app = QApplication.instance() or QApplication([])
+        page = ChannelPage()
+        page.set_accounts([{"id": "acct-1", "label": "帳號一", "authenticated": True}], "acct-1")
+        page._chats = list(_FixtureRunner.fixture_chats)
+        page._apply_filter()
+
+        page.search_edit.setText("台湾摄影")
+
+        self.assertEqual(page.chat_list.count(), 1)
+        self.assertEqual(page.chat_list.item(0).text(), "台灣攝影頻道  @taiwan_photo")
+        self.assertEqual(page.chat_list.item(0).data(256)["title"], "台灣攝影頻道")
+        page.search_edit.setText("@TAIWAN_PHOTO")
+        self.assertEqual(page.chat_list.count(), 1)
+        self.assertEqual(page.chat_list.item(0).data(256)["title"], "台灣攝影頻道")
+        page.deleteLater()
+
     def test_empty_partial_chat_result_keeps_incomplete_warning(self):
         app = QApplication.instance() or QApplication([])
         page = ChannelPage()

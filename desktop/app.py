@@ -114,10 +114,12 @@ from PySide6.QtWidgets import (
 
 try:
     from desktop.channel_page import ChannelPage
+    from desktop.search import search_matches
     from desktop.transfer_page import TransferPage
     from desktop.version import VERSION
 except ImportError:  # pragma: no cover - direct ``python desktop/app.py``
     from channel_page import ChannelPage
+    from search import search_matches
     from transfer_page import TransferPage
     from version import VERSION
 
@@ -445,6 +447,7 @@ class BackendBridge:
             continue_download=options.get("continue_download", True),
             skip_same=options.get("skip_existing", options.get("skip_same", True)),
             group=options.get("group_album", options.get("group", True)),
+            group_by_chat=options.get("group_by_chat", True),
             concurrency=int(options.get("concurrency", 2) or 2), title=job.title,
             # ``advanced`` is absent for ordinary jobs, which then inherit the
             # options currently saved on the settings page.
@@ -547,6 +550,7 @@ class BackendBridge:
                 continue_download=options.get("continue_download", True),
                 skip_same=options.get("skip_existing", options.get("skip_same", True)),
                 group=options.get("group_album", options.get("group", True)),
+                group_by_chat=options.get("group_by_chat", True),
                 concurrency=int(options.get("concurrency", 2) or 2),
                 proxy=options.get("proxy") or None,
                 job_id=job.backend_job_id,
@@ -562,6 +566,7 @@ class BackendBridge:
                 continue_download=options.get("continue_download", True),
                 skip_same=options.get("skip_existing", options.get("skip_same", True)),
                 group=options.get("group_album", options.get("group", True)),
+                group_by_chat=options.get("group_by_chat", True),
                 concurrency=int(options.get("concurrency", 2) or 2),
                 proxy=options.get("proxy") or None,
                 title=job.title,
@@ -1918,6 +1923,10 @@ class DownloadPage(QWidget):
         input_layout.addWidget(input_hint)
         input_layout.addWidget(self.url_edit)
         input_layout.addLayout(folder_line)
+        folder_hint = QLabel("新下載會自動放入「群組／頻道名稱」子資料夾。")
+        folder_hint.setObjectName("MutedText")
+        folder_hint.setWordWrap(True)
+        input_layout.addWidget(folder_hint)
         input_layout.addLayout(action_line)
         outer.addWidget(input_card)
 
@@ -2317,8 +2326,11 @@ class HistoryPage(QWidget):
         self._render(self._items)
 
     def _filter(self, text: str) -> None:
-        query = text.strip().lower()
-        self._render([item for item in self._items if not query or query in " ".join((item.title, item.url, item.status, item.path)).lower()])
+        self._render([
+            item
+            for item in self._items
+            if search_matches(text, item.title, item.url, item.status, item.path)
+        ])
 
     def _render(self, items: Sequence[HistoryInfo]) -> None:
         self.table.setRowCount(0)
@@ -2971,6 +2983,7 @@ class MainWindow(QMainWindow):
             "continue_download": bool(_extract(value, "continue_download", default=True)),
             "skip_existing": bool(_extract(value, "skip_same", default=True)),
             "group_album": bool(_extract(value, "group", default=True)),
+            "group_by_chat": bool(_extract(value, "group_by_chat", default=False)),
             "concurrency": int(_extract(value, "concurrency", default=2) or 2),
         }
         saved_files = _extract(value, "file_progress", default={})
@@ -3873,6 +3886,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             app.quit()
 
     if args.smoke_test:
+        search_conversion = all(
+            search_matches(query, value)
+            for query, value in (
+                ("台湾群组", "🎬台灣群組"),
+                ("學習頻道", "📚学习频道"),
+            )
+        )
         core_path = ""
         core_error = ""
         if window.bridge.available:
@@ -3890,7 +3910,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "backend": type(window.bridge.runner).__name__ if window.bridge.runner is not None else "",
             "backend_available": bool(window.bridge.available),
             "core": core_path,
-            "ok": bool(window.bridge.available and core_path),
+            "traditional_simplified_search": search_conversion,
+            "ok": bool(window.bridge.available and core_path and search_conversion),
         }
         if core_error:
             payload["error"] = core_error

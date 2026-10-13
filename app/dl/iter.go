@@ -24,6 +24,7 @@ import (
 	"github.com/iyear/tdl/core/dcpool"
 	"github.com/iyear/tdl/core/downloader"
 	"github.com/iyear/tdl/core/logctx"
+	"github.com/iyear/tdl/core/storage"
 	"github.com/iyear/tdl/core/tmedia"
 	"github.com/iyear/tdl/core/util/fsutil"
 	"github.com/iyear/tdl/core/util/tutil"
@@ -62,8 +63,13 @@ type iter struct {
 	delay   time.Duration
 
 	mu          *sync.Mutex
+	folderMu    sync.Mutex
 	finished    map[int]struct{}
 	fingerprint string
+	chatFolders map[string]string
+	usedFolders map[string]string
+	folderRoot  string
+	folderStore storage.Storage
 	// This param is kept for potential future use but is currently unused.
 	// preSum       []int
 	logicalPos   int // logical position for finished tracking
@@ -95,6 +101,14 @@ func newIter(pool dcpool.Pool, manager *peers.Manager, dialog [][]*tmessage.Dial
 		return nil, errors.Errorf("you must specify at least one message")
 	}
 
+	folderRoot := ""
+	if opts.GroupByChat {
+		folderRoot, err = normalizeChatOutputRoot(opts.Dir)
+		if err != nil {
+			return nil, errors.Wrap(err, "normalize output directory")
+		}
+	}
+
 	// include and exclude
 	includeMap := extensionFilterMap(opts.Include)
 	excludeMap := extensionFilterMap(opts.Exclude)
@@ -114,7 +128,10 @@ func newIter(pool dcpool.Pool, manager *peers.Manager, dialog [][]*tmessage.Dial
 
 		mu:          &sync.Mutex{},
 		finished:    make(map[int]struct{}),
-		fingerprint: fingerprint(dialogs),
+		fingerprint: fingerprintForOptionsAndRoot(dialogs, opts, folderRoot),
+		chatFolders: make(map[string]string),
+		usedFolders: make(map[string]string),
+		folderRoot:  folderRoot,
 		// This param is kept for potential future use but is currently unused.
 		// preSum:       preSum(dialogs),
 		logicalPos:     0,
@@ -250,9 +267,14 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 		return false, false
 	}
 	i.candidates.Inc()
+	outputDir, err := i.outputDir(ctx, from)
+	if err != nil {
+		i.err = err
+		return false, false
+	}
 
 	if i.opts.SkipSame {
-		if stat, err := os.Stat(filepath.Join(i.opts.Dir, toName.String())); err == nil {
+		if stat, err := os.Stat(filepath.Join(outputDir, toName.String())); err == nil {
 			if fsutil.GetNameWithoutExt(toName.String()) == fsutil.GetNameWithoutExt(stat.Name()) &&
 				stat.Size() == item.Size {
 				return false, true
@@ -261,7 +283,7 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 	}
 
 	filename := fmt.Sprintf("%s%s", toName.String(), tempExt)
-	path := filepath.Join(i.opts.Dir, filename)
+	path := filepath.Join(outputDir, filename)
 
 	// #113. If path contains dirs, create it. So now we support nested dirs.
 	if err = os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -401,6 +423,163 @@ func (i *iter) DeletedIDs() []string {
 	return i.deletedIDs
 }
 
+// outputDir returns the directory used for one resolved peer. The default
+// path deliberately remains Dir so legacy CLI jobs and their resume records
+// keep exactly the same layout.
+func (i *iter) outputDir(ctx context.Context, from peers.Peer) (string, error) {
+	if !i.opts.GroupByChat {
+		return i.opts.Dir, nil
+	}
+
+	key := peerFolderKey(from)
+	i.folderMu.Lock()
+	defer i.folderMu.Unlock()
+	if i.chatFolders == nil {
+		i.chatFolders = make(map[string]string)
+	}
+	if i.usedFolders == nil {
+		i.usedFolders = make(map[string]string)
+	}
+	if folder, ok := i.chatFolders[key]; ok {
+		return filepath.Join(i.opts.Dir, folder), nil
+	}
+
+	base := safeChatFolder(from)
+	folder := base
+	for suffix := 0; ; suffix++ {
+		owner, ok := i.usedFolders[folderCollisionKey(folder)]
+		if !ok || owner == key {
+			break
+		}
+		folder = disambiguatedChatFolderN(base, from, suffix)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if i.folderStore != nil {
+		updated := make(map[string]string, len(i.chatFolders)+1)
+		for peerKey, peerFolder := range i.chatFolders {
+			updated[peerKey] = peerFolder
+		}
+		updated[key] = folder
+		if err := persistChatFolders(ctx, i.folderStore, i.folderRoot, updated); err != nil {
+			return "", err
+		}
+	}
+
+	i.chatFolders[key] = folder
+	i.usedFolders[folderCollisionKey(folder)] = key
+	return filepath.Join(i.opts.Dir, folder), nil
+}
+
+const maxChatFolderRunes = 120
+
+// safeChatFolder keeps Telegram titles useful to people while preventing a
+// title from escaping the output directory or being rejected by Windows.
+// When Telegram has no visible name, the peer kind and ID provide a stable
+// fallback that also keeps a chat and channel with the same numeric ID apart.
+func safeChatFolder(peer peers.Peer) string {
+	if peer == nil {
+		return "peer-unknown"
+	}
+
+	name := sanitizeWindowsComponent(peer.VisibleName())
+	if name == "" || name == "." || name == ".." {
+		fallback := sanitizeWindowsComponent(fmt.Sprintf("%s-%d", inputPeerType(peer.InputPeer()), peer.ID()))
+		if fallback != "" && fallback != "." && fallback != ".." {
+			return fallback
+		}
+		return fmt.Sprintf("peer-%d", peer.ID())
+	}
+	return name
+}
+
+func peerFolderKey(peer peers.Peer) string {
+	if peer == nil {
+		return "unknown:0"
+	}
+	return fmt.Sprintf("%s:%d", inputPeerType(peer.InputPeer()), peer.ID())
+}
+
+// disambiguatedChatFolderN is only used when two distinct peers have the same
+// visible title in one account/output-root mapping. The ordinary case keeps
+// the title unchanged; the suffix prevents files from unrelated chats from
+// being mixed. The sequence handles a title that already equals another
+// peer's suffixed name.
+func disambiguatedChatFolderN(base string, peer peers.Peer, sequence int) string {
+	suffix := fmt.Sprintf(" (%s-%d", inputPeerType(peer.InputPeer()), peer.ID())
+	if sequence > 0 {
+		suffix += fmt.Sprintf("-%d", sequence+1)
+	}
+	suffix += ")"
+	baseRunes := []rune(base)
+	suffixRunes := []rune(suffix)
+	if len(baseRunes)+len(suffixRunes) > maxChatFolderRunes {
+		keep := maxChatFolderRunes - len(suffixRunes)
+		if keep > 0 {
+			base = strings.TrimRight(string(baseRunes[:keep]), ". ")
+		} else {
+			base = ""
+		}
+	}
+	if base == "" {
+		base = inputPeerType(peer.InputPeer())
+	}
+	return sanitizeWindowsComponent(base + suffix)
+}
+
+func sanitizeWindowsComponent(value string) string {
+	var b strings.Builder
+	for _, r := range value {
+		switch {
+		case r < 0x20:
+			b.WriteRune('_')
+		case r == '<' || r == '>' || r == ':' || r == '"' || r == '/' || r == '\\' || r == '|' || r == '?' || r == '*':
+			b.WriteRune('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+
+	name := strings.TrimSpace(b.String())
+	name = strings.TrimRight(name, ". ")
+	if name == "" {
+		return ""
+	}
+
+	// Windows reserves these device names even when they have an extension.
+	// Apply the prefix before truncating so the final result stays within the
+	// component limit and sanitizing it again remains idempotent.
+	base := name
+	if dot := strings.IndexByte(base, '.'); dot >= 0 {
+		base = base[:dot]
+	}
+	if isWindowsReservedBase(strings.ToUpper(strings.TrimSpace(base))) {
+		name = "_" + name
+	}
+
+	if runes := []rune(name); len(runes) > maxChatFolderRunes {
+		name = strings.TrimRight(string(runes[:maxChatFolderRunes]), ". ")
+	}
+	if name == "" || name == "." || name == ".." {
+		return ""
+	}
+
+	return name
+}
+
+func isWindowsReservedBase(base string) bool {
+	switch base {
+	case "CON", "PRN", "AUX", "NUL",
+		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+		"COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³":
+		return true
+	}
+	return false
+}
+
 // positionToLogicalIndex converts physical position (dialogIndex, messageIndex) to logical index
 // This method is kept for potential future use but is currently unused.
 // func (i *iter) positionToLogicalIndex(dialogIdx, messageIdx int) int {
@@ -473,6 +652,29 @@ func fingerprint(dialogs []*tmessage.Dialog) string {
 		}
 	}
 
+	return fmt.Sprintf("%x", sha256.Sum256(buf.Bytes()))
+}
+
+// fingerprintForOptions keeps the legacy resume key stable while preventing a
+// new grouped-by-chat job from reusing checkpoints created for flat paths.
+func fingerprintForOptions(dialogs []*tmessage.Dialog, opts Options) string {
+	root := ""
+	if opts.GroupByChat {
+		root, _ = normalizeChatOutputRoot(opts.Dir)
+	}
+	return fingerprintForOptionsAndRoot(dialogs, opts, root)
+}
+
+func fingerprintForOptionsAndRoot(dialogs []*tmessage.Dialog, opts Options, root string) string {
+	base := fingerprint(dialogs)
+	if !opts.GroupByChat {
+		return base
+	}
+
+	buf := bytes.NewBufferString("group-by-chat-v2\x00")
+	buf.WriteString(root)
+	buf.WriteByte(0)
+	buf.WriteString(base)
 	return fmt.Sprintf("%x", sha256.Sum256(buf.Bytes()))
 }
 
