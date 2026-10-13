@@ -1,0 +1,26 @@
+{
+  "ok": true,
+  "version": "1.3.1",
+  "sha256": "3b64e7916e3a70ef8c0110652c096df0865a107aa024529ec586e75f87439e64",
+  "offline_fixture": true,
+  "separate_exe_processes": 2,
+  "phases": [
+    {
+      "ok": true,
+      "phase": "before-close",
+      "offline_fixture": true,
+      "saved_as_paused": true
+    },
+    {
+      "ok": true,
+      "phase": "after-reopen",
+      "offline_fixture": true,
+      "resumed_same_job": true,
+      "original_account": true,
+      "completed_file_unchanged": true,
+      "remaining_file_written": true,
+      "continue_flag": true,
+      "file_rows_restored": true
+    }
+  ]
+}

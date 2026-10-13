@@ -1,0 +1,19 @@
+{
+  "result": "PASS",
+  "sha256": "3b64e7916e3a70ef8c0110652c096df0865a107aa024529ec586e75f87439e64",
+  "architecture": "Windows x64 GUI",
+  "copied_executable_to_independent_directory": true,
+  "python_and_go_removed_from_path": true,
+  "bundled_backend_and_core": true,
+  "window_rendered": true,
+  "native_windows_window_started": true,
+  "screenshot": "D:\\Codex\\Tools\\tdl\\desktop\\qa\\frozen-home.png",
+  "telegram_live_account_test": "NOT_RUN_FOR_1.3.1",
+  "version": "1.3.1",
+  "embedded_core_sha256": "a4287d4def6139298dd8bd49d084d0afff3912d686ff286a959aca441509690a",
+  "embedded_core_matches_tested_build": true,
+  "embedded_core_offline_backup_checks": [
+    "test_backup_and_recover_round_trip_offline",
+    "test_backup_locked_destination_preserves_previous_bytes"
+  ]
+}

@@ -2,16 +2,92 @@ package dl
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/gotd/td/telegram/peers"
 	"github.com/gotd/td/tg"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/iyear/tdl/pkg/tmessage"
 )
+
+func TestIterExtensionFiltersAreCaseInsensitive(t *testing.T) {
+	tests := []struct {
+		name    string
+		include []string
+		exclude []string
+		file    string
+		want    bool
+	}{
+		{
+			name:    "lowercase include matches uppercase filename",
+			include: []string{"mp4"},
+			file:    "video.Mp4",
+			want:    true,
+		},
+		{
+			name:    "uppercase include matches lowercase filename",
+			include: []string{"MP4"},
+			file:    "video.mp4",
+			want:    true,
+		},
+		{
+			name:    "lowercase exclude matches mixed case filename",
+			exclude: []string{"zip"},
+			file:    "archive.ZiP",
+			want:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			it, err := newIter(nil, nil, [][]*tmessage.Dialog{{
+				{Peer: &tg.InputPeerChat{ChatID: 1}, Messages: []int{1}},
+			}}, Options{
+				Dir:      root,
+				Template: "{{.FileName}}",
+				Include:  tt.include,
+				Exclude:  tt.exclude,
+			}, 0)
+			require.NoError(t, err)
+
+			message := &tg.Message{ID: 1}
+			message.SetMedia(&tg.MessageMediaDocument{
+				Document: &tg.Document{
+					ID:       2,
+					MimeType: "application/octet-stream",
+					Size:     1,
+					DCID:     2,
+					Attributes: []tg.DocumentAttributeClass{
+						&tg.DocumentAttributeFilename{FileName: tt.file},
+					},
+				},
+			})
+			from := (&peers.Options{}).Build(nil).Chat(&tg.Chat{ID: 9, Title: "test"})
+
+			ret, skip := it.processSingle(context.Background(), message, from, 0)
+			require.Equal(t, tt.want, ret)
+			require.Equal(t, !tt.want, skip)
+			if !tt.want {
+				require.Equal(t, int64(0), it.CandidateCount())
+				return
+			}
+
+			elem := (<-it.elem).(*iterElem)
+			require.Equal(t, tt.file+tempExt, filepath.Base(elem.to.Name()),
+				"filtering must preserve the original media filename casing")
+			require.NoError(t, elem.to.Close())
+			require.NoError(t, os.Remove(elem.to.Name()))
+			require.Equal(t, int64(1), it.CandidateCount())
+		})
+	}
+}
 
 // TestIterDeletedMessageHandling verifies that deleted messages are handled correctly
 // without causing the program to crash. This test simulates the scenario where GetSingleMessage

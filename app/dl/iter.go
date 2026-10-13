@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"text/template"
 	"time"
@@ -42,6 +43,12 @@ type fileTemplate struct {
 	FileCaption  string
 	FileSize     string
 	DownloadDate int64
+}
+
+func extensionFilterMap(values []string) map[string]struct{} {
+	return filterMap.New(values, func(ext string) string {
+		return strings.ToLower(fsutil.AddPrefixDot(ext))
+	})
 }
 
 type iter struct {
@@ -89,8 +96,8 @@ func newIter(pool dcpool.Pool, manager *peers.Manager, dialog [][]*tmessage.Dial
 	}
 
 	// include and exclude
-	includeMap := filterMap.New(opts.Include, fsutil.AddPrefixDot)
-	excludeMap := filterMap.New(opts.Exclude, fsutil.AddPrefixDot)
+	includeMap := extensionFilterMap(opts.Include)
+	excludeMap := extensionFilterMap(opts.Exclude)
 
 	// to keep fingerprint stable
 	sortDialogs(dialogs, opts.Desc)
@@ -220,7 +227,7 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 	}
 
 	// process include and exclude
-	ext := filepath.Ext(item.Name)
+	ext := strings.ToLower(filepath.Ext(item.Name))
 	if _, ok = i.include[ext]; len(i.include) > 0 && !ok {
 		return false, true
 	}

@@ -3667,12 +3667,17 @@ class Runner:
                 paused=paused,
             )
             handle._result = result
-            handle.done.set()
             with self._handles_guard:
                 self._handles.discard(handle)
             if lock_held:
                 lock.release()
             _release_account_activity(request.account_id)
+            # A caller may remove an account immediately after ``wait``
+            # returns (restore uses that path when Telegram rejects a backup).
+            # Publish completion only after every guard held by this worker
+            # has been released, otherwise the caller can observe a finished
+            # handle while ``Store.remove_account`` still sees it as active.
+            handle.done.set()
 
 
 __all__ = [

@@ -108,6 +108,7 @@ class CoreContractTests(unittest.TestCase):
         """Both commands only touch local storage, so the real core can run."""
         with tempfile.TemporaryDirectory(prefix="core-backup-", dir=ROOT / ".build") as temporary:
             backup = Path(temporary) / "account.tdl"
+            backup.write_bytes(b"existing backup fixture")
             for command, storage in (
                 (["backup", "--dst", str(backup)], "source"),
                 (["recover", "--file", str(backup)], "target"),
@@ -120,6 +121,30 @@ class CoreContractTests(unittest.TestCase):
                 self.assertEqual([event["event"] for event in events], ["status"], output)
                 self.assertEqual(output.strip().count("\n"), 0, output)
             self.assertGreater(backup.stat().st_size, 0)
+            self.assertNotEqual(backup.read_bytes(), b"existing backup fixture")
+            self.assertEqual(list(Path(temporary).glob(".account.tdl-*.tmp")), [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows destination-sharing semantics")
+    def test_backup_locked_destination_preserves_previous_bytes(self):
+        """An actual core replacement failure must retain the old backup."""
+        with tempfile.TemporaryDirectory(prefix="core-backup-locked-", dir=ROOT / ".build") as temporary:
+            backup = Path(temporary) / "account.tdl"
+            original = b"existing backup fixture that must survive"
+            backup.write_bytes(original)
+            args = ["--storage", f"type=bolt,path={Path(temporary) / 'source'}",
+                    "--ns", "default", "backup", "--dst", str(backup)]
+            # The normal Windows file handle permits reads/writes but does
+            # not share deletion, so replacement must fail without truncating.
+            with backup.open("rb") as held:
+                code, output, errors = self._run_core(args, temporary)
+                self.assertNotEqual(code, 0, output + errors)
+                self.assertEqual(held.read(), original)
+            self.assertEqual(backup.read_bytes(), original)
+            self.assertEqual(list(Path(temporary).glob(".account.tdl-*.tmp")), [])
+            events = [json.loads(line[len("@@TDL_GUI@@"):]) for line in output.splitlines()
+                      if line.startswith("@@TDL_GUI@@")]
+            self.assertTrue(any(event["event"] == "error" for event in events), output)
+            self.assertFalse(any(event["event"] == "status" for event in events), output)
 
 
 if __name__ == "__main__":

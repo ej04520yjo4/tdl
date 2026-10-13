@@ -13,9 +13,9 @@ import (
 func walk(paths, includes, excludes []string) ([]*File, error) {
 	files := make([]*File, 0)
 
-	includesMap := filterMap.New(includes, fsutil.AddPrefixDot)
-	excludesMap := filterMap.New(excludes, fsutil.AddPrefixDot)
-	excludesMap[consts.UploadThumbExt] = struct{}{} // ignore thumbnail files
+	includesMap := extensionFilterMap(includes)
+	excludesMap := extensionFilterMap(excludes)
+	excludesMap[strings.ToLower(consts.UploadThumbExt)] = struct{}{} // ignore thumbnail files
 
 	for _, path := range paths {
 		err := filepath.WalkDir(path, func(path string, d fs.DirEntry, err error) error {
@@ -27,7 +27,7 @@ func walk(paths, includes, excludes []string) ([]*File, error) {
 			}
 
 			// process include and exclude
-			ext := filepath.Ext(path)
+			ext := strings.ToLower(filepath.Ext(path))
 			if _, ok := includesMap[ext]; len(includesMap) > 0 && !ok {
 				return nil
 			}
@@ -50,4 +50,10 @@ func walk(paths, includes, excludes []string) ([]*File, error) {
 	}
 
 	return files, nil
+}
+
+func extensionFilterMap(values []string) map[string]struct{} {
+	return filterMap.New(values, func(ext string) string {
+		return strings.ToLower(fsutil.AddPrefixDot(ext))
+	})
 }
