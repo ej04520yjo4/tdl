@@ -7,3 +7,13 @@ downloads
 tdl
 .hugo_build.lock
 .DS_Store
+.build/
+/build/
+bin/
+dist/
+desktop/__pycache__/
+desktop/tests/__pycache__/
+.pytest_cache/
+*.pyc
+desktop/qa/
+desktop/tests/tdl-*-test-*/

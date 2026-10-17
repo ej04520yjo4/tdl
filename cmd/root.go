@@ -138,7 +138,7 @@ func New() *cobra.Command {
 	cmd.AddGroup(groupAccount, groupTools, groupExtensions)
 
 	cmd.AddCommand(NewVersion(), NewLogin(), NewDownload(), NewForward(),
-		NewChat(), NewUpload(), NewBackup(), NewRecover(), NewMigrate(),
+		NewChat(), NewUpload(), NewBackup(), NewRecover(), NewMigrate(), NewWhoami(),
 		NewGen(), NewUpdate(), NewExtension(em))
 
 	// append extension command to root

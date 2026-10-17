@@ -1,0 +1,24 @@
+{
+  "channel_list_ok": true,
+  "chat_count": 618,
+  "channel_list_partial": false,
+  "channel_list_skipped": 0,
+  "event_types": [
+    "chats",
+    "status"
+  ],
+  "public_sample": "https://t.me/telegram",
+  "inclusive_date_filter_ok": true,
+  "video_filter_ok": true,
+  "scan_count": 3,
+  "actual_download_ok": true,
+  "downloaded_files": 1,
+  "downloaded_bytes": 1842304,
+  "core_sha256": "04eb3bb5f81a79d58984aebfc58f8cefa6c9f4130338e6ef47df98dcad32ca5e",
+  "original_account_files_unchanged": true,
+  "ok": true,
+  "elapsed": 22.109,
+  "version": "1.2.0",
+  "sha256": "3ef03c924cf6fa01570318edaf328a115cba558341271035590b6fe715b7b351",
+  "actual_bundled_backend_listed_scanned_and_downloaded": true
+}

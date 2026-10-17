@@ -24,6 +24,10 @@ const MaxPartSize = 512 * 1024
 
 type Uploader struct {
 	opts Options
+
+	// uploadFn is intentionally only used by package tests, so the scheduling
+	// and completion path can be exercised without a live Telegram DC.
+	uploadFn func(context.Context, Elem) error
 }
 
 type Options struct {
@@ -46,9 +50,16 @@ func (u *Uploader) Upload(ctx context.Context, limit int) error {
 
 		wg.Go(func() (rerr error) {
 			u.opts.Progress.OnAdd(elem)
-			defer func() { u.opts.Progress.OnDone(elem, rerr) }()
+			var progressErr error
+			defer func() { u.opts.Progress.OnDone(elem, progressErr) }()
 
-			if err := u.upload(wgctx, elem); err != nil {
+			if err := u.uploadElem(wgctx, elem); err != nil {
+				// Always pass the actual file error to the progress callback. A
+				// nil error here would report a failed upload as done, and the
+				// --rm option would then delete a local file that never
+				// reached Telegram.
+				progressErr = err
+
 				// canceled by user, so we directly return error to stop all
 				if errors.Is(err, context.Canceled) {
 					return errors.Wrap(err, "upload")
@@ -61,11 +72,22 @@ func (u *Uploader) Upload(ctx context.Context, limit int) error {
 		})
 	}
 
-	if err := u.opts.Iter.Err(); err != nil {
-		return errors.Wrap(err, "iter")
+	iterErr := u.opts.Iter.Err()
+	// Wait for every started worker first so OnDone closes its file handles
+	// before Upload returns to the caller.
+	waitErr := wg.Wait()
+	if iterErr != nil {
+		return errors.Wrap(iterErr, "iter")
 	}
 
-	return wg.Wait()
+	return waitErr
+}
+
+func (u *Uploader) uploadElem(ctx context.Context, elem Elem) error {
+	if u.uploadFn != nil {
+		return u.uploadFn(ctx, elem)
+	}
+	return u.upload(ctx, elem)
 }
 
 func (u *Uploader) upload(ctx context.Context, elem Elem) error {

@@ -92,6 +92,20 @@ func ParseMessageLink(ctx context.Context, manager *peers.Manager, s string) (pe
 }
 
 func GetInputPeer(ctx context.Context, manager *peers.Manager, from string) (peers.Peer, error) {
+	// Typed references (channel:123, chat:123, user:123) come from the desktop
+	// chat list. Telegram can reuse one numeric ID across peer kinds, so the
+	// kind must win over the channel -> user -> chat guessing order below.
+	if kind, id, ok := ParseTypedPeer(from); ok {
+		switch kind {
+		case "channel":
+			return manager.ResolveChannelID(ctx, id)
+		case "chat":
+			return manager.ResolveChatID(ctx, id)
+		default:
+			return manager.ResolveUserID(ctx, id)
+		}
+	}
+
 	id, err := strconv.ParseInt(from, 10, 64)
 	if err != nil {
 		// from is username
@@ -115,6 +129,31 @@ func GetInputPeer(ctx context.Context, manager *peers.Manager, from string) (pee
 	}
 
 	return nil, fmt.Errorf("failed to get result from %d：%v", id, err)
+}
+
+// ParseTypedPeer splits a typed chat reference such as "channel:123" into its
+// normalized kind (channel, chat or user) and positive numeric ID. Usernames,
+// plain IDs and links report ok=false so callers keep their usual resolution.
+func ParseTypedPeer(from string) (kind string, id int64, ok bool) {
+	rawKind, rawID, found := strings.Cut(strings.TrimSpace(from), ":")
+	if !found {
+		return "", 0, false
+	}
+	switch strings.ToLower(strings.TrimSpace(rawKind)) {
+	case "channel":
+		kind = "channel"
+	case "chat", "group":
+		kind = "chat"
+	case "user", "private":
+		kind = "user"
+	default:
+		return "", 0, false
+	}
+	id, err := strconv.ParseInt(strings.TrimSpace(rawID), 10, 64)
+	if err != nil || id <= 0 {
+		return "", 0, false
+	}
+	return kind, id, true
 }
 
 func GetPeerID(peer tg.PeerClass) int64 {

@@ -20,6 +20,7 @@ import (
 	"github.com/iyear/tdl/core/storage"
 	"github.com/iyear/tdl/core/tclient"
 	"github.com/iyear/tdl/pkg/consts"
+	"github.com/iyear/tdl/pkg/desktopio"
 	"github.com/iyear/tdl/pkg/key"
 	"github.com/iyear/tdl/pkg/prog"
 	"github.com/iyear/tdl/pkg/tmessage"
@@ -38,6 +39,10 @@ type Options struct {
 	Desc       bool
 	Takeout    bool
 	Group      bool // auto detect grouped message
+	// GroupByChat stores each chat's media under a safe, human-readable
+	// subdirectory below Dir. It is opt-in so existing CLI jobs keep their
+	// historical paths.
+	GroupByChat bool
 
 	// resume opts
 	Continue, Restart bool
@@ -79,6 +84,11 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 	if err != nil {
 		return err
 	}
+	if opts.GroupByChat {
+		if err := it.configureChatFolders(ctx, kvd); err != nil {
+			return err
+		}
+	}
 
 	if !opts.Restart {
 		// resume download and ask user to continue
@@ -86,7 +96,9 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 			return err
 		}
 	} else {
-		color.Yellow("Restart download by 'restart' flag")
+		if desktopio.From(ctx) == nil {
+			color.Yellow("Restart download by 'restart' flag")
+		}
 	}
 
 	defer func() { // save progress
@@ -98,16 +110,18 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 	}()
 
 	dlProgress := prog.New(utils.Byte.FormatBinaryBytes)
+	gui := desktopio.From(ctx) != nil
 	dlProgress.SetNumTrackersExpected(it.Total())
-	if !viper.GetBool(consts.FlagDisableProgressPS) {
+	if !gui && !viper.GetBool(consts.FlagDisableProgressPS) {
 		prog.EnablePS(ctx, dlProgress)
 	}
 
+	machineProgress := newProgress(ctx, dlProgress, it, opts)
 	options := downloader.Options{
 		Pool:     pool,
 		Threads:  viper.GetInt(consts.FlagThreads),
 		Iter:     it,
-		Progress: newProgress(dlProgress, it, opts),
+		Progress: machineProgress,
 	}
 	limit := viper.GetInt(consts.FlagLimit)
 
@@ -118,15 +132,21 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		zap.Int("threads", options.Threads),
 		zap.Int("limit", limit))
 
-	color.Green("All files will be downloaded to '%s' dir", opts.Dir)
+	if !gui {
+		color.Green("All files will be downloaded to '%s' dir", opts.Dir)
+	}
 
-	go dlProgress.Render()
+	if !gui {
+		go dlProgress.Render()
+	}
 	defer func() {
-		prog.Wait(ctx, dlProgress)
+		if !gui {
+			prog.Wait(ctx, dlProgress)
+		}
 
 		// Notify user if any messages were skipped due to deletion
 		// This is deferred to ensure it shows after progress rendering completes
-		if skipped := it.SkippedDeleted(); skipped > 0 {
+		if skipped := it.SkippedDeleted(); skipped > 0 && !gui {
 			deletedIDs := it.DeletedIDs()
 			if len(deletedIDs) <= 5 {
 				// Show all IDs if 5 or fewer
@@ -139,7 +159,16 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		}
 	}()
 
-	return downloader.New(options).Download(ctx, limit)
+	err = downloader.New(options).Download(ctx, limit)
+	if err == nil && machineProgress.Failures() > 0 {
+		return errors.New("有檔案下載失敗，請查看錯誤訊息後重試")
+	}
+	if err == nil && desktopio.From(ctx) != nil {
+		if it.CandidateCount() == 0 {
+			return errors.New("沒有找到可下載的媒體檔案")
+		}
+	}
+	return err
 }
 
 func collectDialogs(parsers []parser) ([][]*tmessage.Dialog, error) {
@@ -178,14 +207,16 @@ func resume(ctx context.Context, kvd storage.Storage, iter *iter, ask bool) erro
 
 	confirm := false
 	resumeStr := fmt.Sprintf("Found unfinished download, continue from '%d/%d'", len(finished), iter.Total())
-	if ask {
+	if ask && desktopio.From(ctx) == nil {
 		if err = survey.AskOne(&survey.Confirm{
 			Message: color.YellowString(resumeStr + "?"),
 		}, &confirm); err != nil {
 			return err
 		}
 	} else {
-		color.Yellow(resumeStr)
+		if desktopio.From(ctx) == nil {
+			color.Yellow(resumeStr)
+		}
 		confirm = true
 	}
 

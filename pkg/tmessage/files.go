@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/bcicen/jstream"
 	"github.com/gotd/td/telegram/peers"
@@ -21,6 +22,7 @@ import (
 
 const (
 	keyID       = "id"
+	keyPeerType = "peer_type"
 	typeMessage = "message"
 )
 
@@ -121,6 +123,7 @@ func getChatInfo(ctx context.Context, client *tg.Client, kvd storage.Storage, r 
 	d := jstream.NewDecoder(r, 1).EmitKV()
 
 	chatID := int64(0)
+	peerType := ""
 
 	for mv := range d.Stream() {
 		_kv, ok := mv.Value.(jstream.KV)
@@ -128,11 +131,20 @@ func getChatInfo(ctx context.Context, client *tg.Client, kvd storage.Storage, r 
 			continue
 		}
 
-		if _kv.Key == keyID {
-			chatID = int64(_kv.Value.(float64))
+		switch _kv.Key {
+		case keyID:
+			// The first id is the export's top-level peer id. Keep it
+			// unchanged while scanning nested message records.
+			if chatID == 0 {
+				chatID = parseChatID(_kv.Value)
+			}
+		case keyPeerType:
+			if value, ok := _kv.Value.(string); ok {
+				peerType = strings.ToLower(strings.TrimSpace(value))
+			}
 		}
 
-		if chatID != 0 {
+		if chatID != 0 && peerType != "" {
 			break
 		}
 	}
@@ -142,5 +154,35 @@ func getChatInfo(ctx context.Context, client *tg.Client, kvd storage.Storage, r 
 	}
 
 	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(client)
+	if peerType != "" {
+		switch peerType {
+		case "channel":
+			return manager.ResolveChannelID(ctx, chatID)
+		case "chat", "group":
+			return manager.ResolveChatID(ctx, chatID)
+		case "user", "private":
+			return manager.ResolveUserID(ctx, chatID)
+		default:
+			return nil, errors.New("unsupported peer_type: " + peerType)
+		}
+	}
 	return tutil.GetInputPeer(ctx, manager, strconv.FormatInt(chatID, 10))
+}
+
+func parseChatID(value any) int64 {
+	switch value := value.(type) {
+	case float64:
+		return int64(value)
+	case float32:
+		return int64(value)
+	case int:
+		return int64(value)
+	case int64:
+		return value
+	case string:
+		id, _ := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		return id
+	default:
+		return 0
+	}
 }

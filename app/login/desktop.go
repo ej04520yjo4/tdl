@@ -17,6 +17,7 @@ import (
 	"github.com/iyear/tdl/core/storage"
 	"github.com/iyear/tdl/core/util/fsutil"
 	"github.com/iyear/tdl/pkg/consts"
+	"github.com/iyear/tdl/pkg/desktopio"
 	"github.com/iyear/tdl/pkg/key"
 	"github.com/iyear/tdl/pkg/kv"
 	"github.com/iyear/tdl/pkg/tclient"
@@ -39,7 +40,10 @@ func Desktop(ctx context.Context, opts Options) error {
 		return err
 	}
 
-	color.Blue("Importing session from desktop client: %s", desktop)
+	gui := desktopio.From(ctx) != nil
+	if !gui {
+		color.Blue("Importing session from desktop client: %s", desktop)
+	}
 
 	accounts, err := tdtdesktop.Read(appendTData(desktop), []byte(opts.Passcode))
 	if err != nil {
@@ -54,14 +58,26 @@ func Desktop(ctx context.Context, opts Options) error {
 		infoMap[id] = acc
 	}
 
-	fmt.Println()
-	sel, acc := &survey.Select{
-		Message: "Choose a user id:",
-		Options: infos,
-		Help:    "You can get user id from @userinfobot",
-	}, ""
-	if err = survey.AskOne(sel, &acc); err != nil {
-		return err
+	if len(infos) == 0 {
+		return errors.New("no Telegram account was found in the desktop session")
+	}
+
+	var acc string
+	if gui {
+		// The desktop front end intentionally handles account selection before
+		// launching this optional import path.  Pick the first account here so
+		// no interactive survey can block a machine-readable session.
+		acc = infos[0]
+	} else {
+		fmt.Println()
+		sel := &survey.Select{
+			Message: "Choose a user id:",
+			Options: infos,
+			Help:    "You can get user id from @userinfobot",
+		}
+		if err = survey.AskOne(sel, &acc); err != nil {
+			return err
+		}
 	}
 
 	data, err := session.TDesktopSession(infoMap[acc])
@@ -78,7 +94,18 @@ func Desktop(ctx context.Context, opts Options) error {
 		return err
 	}
 
-	color.Green("Import %s successfully to '%s' namespace!", acc, ns)
+	if !gui {
+		color.Green("Import %s successfully to '%s' namespace!", acc, ns)
+	}
+	if gui {
+		// GUI logout is a local account-data action owned by the front end.  Do
+		// not mutate Telegram Desktop's files as a side effect of importing.
+		_ = desktopio.Emit(ctx, desktopio.Event{
+			Event: "authenticated",
+			ID:    acc,
+		})
+		return nil
+	}
 
 	// logout
 	confirm, logout := &survey.Confirm{

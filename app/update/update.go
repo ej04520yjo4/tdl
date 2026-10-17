@@ -28,6 +28,7 @@ import (
 
 	"github.com/iyear/tdl/core/util/netutil"
 	"github.com/iyear/tdl/pkg/consts"
+	"github.com/iyear/tdl/pkg/desktopio"
 )
 
 type Options struct {
@@ -97,6 +98,9 @@ func Run(ctx context.Context, opts Options) (rerr error) {
 	}
 
 	if !opts.Yes {
+		if desktopio.From(ctx) != nil {
+			return errors.New("GUI 模式更新需要明確指定 --yes")
+		}
 		ok := false
 
 		if err = survey.AskOne(&survey.Confirm{

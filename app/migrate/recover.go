@@ -11,6 +11,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	"go.uber.org/multierr"
 
+	"github.com/iyear/tdl/pkg/desktopio"
 	"github.com/iyear/tdl/pkg/kv"
 )
 
@@ -41,6 +42,10 @@ func Recover(ctx context.Context, file string) (rerr error) {
 		return errors.Wrap(err, "migrate from")
 	}
 
+	if desktopio.From(ctx) != nil {
+		_ = desktopio.Emit(ctx, desktopio.Event{Event: "status", Kind: "recover", Message: "備份資料已還原"})
+		return nil
+	}
 	color.Green("Recover successfully, file: %s", file)
 	return nil
 }
