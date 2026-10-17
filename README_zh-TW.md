@@ -1,6 +1,6 @@
 # TDL 繁體中文下載助手
 
-直接雙擊下載的 `TDL-Desktop-1.3.2.exe`，或本機專案根目錄的 `TDL下載助手-1.3.2.exe`。已包含桌面視窗與 tdl 核心，不需要另外安裝 Python、Go 或 Telegram Desktop。更新前請先正常關閉舊版，讓下載進度完成保存。
+直接雙擊下載的 `TDL-Desktop-1.3.2.exe`，或本機專案根目錄的 `TDL下載助手.exe`。已包含桌面視窗與 tdl 核心，不需要另外安裝 Python、Go 或 Telegram Desktop。更新前請先正常關閉舊版，讓下載進度完成保存。
 
 適用 Windows 10／11 64 位元。第一次啟動單檔程式需要解壓縮內含元件，可能稍等數秒。
 

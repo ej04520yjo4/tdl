@@ -29,7 +29,7 @@ EXE SHA-256：`c9a4bfb2cc7c0e5dcecdf41f8ed4e5f9d25b25727bc959c36636f5d383b09f3c`
 
 收據：`desktop/verification/1.3.2/verification.json`、`restart-verification.json`，皆綁定上述 EXE 雜湊。
 
-`desktop/build.ps1` 的 Go、Python、打包與最終 EXE 驗證通過。最後覆蓋根目錄舊 EXE 因 1.3.1 仍執行而受 Windows 檔案鎖阻擋，因此另交付 `TDL下載助手-1.3.2.exe`；GitHub 附件由已驗證的 dist EXE 產生並逐一核對雜湊。
+`desktop/build.ps1` 的 Go、Python、打包與最終 EXE 驗證通過。最後覆蓋根目錄舊 EXE 因 1.3.1 仍執行而受 Windows 檔案鎖阻擋，因此另交付 `TDL下載助手-1.3.2.exe`；GitHub 附件由已驗證的 dist EXE 產生並逐一核對雜湊。2026-10-17 確認根目錄 `TDL下載助手.exe` 已與上述 EXE 同雜湊，詳見 1.3.2 交接清冊的「交接確認」。
 
 ## 限制
 
