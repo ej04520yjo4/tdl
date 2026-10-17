@@ -10,3 +10,5 @@
 | 1.2.0 | [1.2.0](handovers/1.2.0.md) | 穩定下載佇列、重開接續、群組話題選擇；首次同步完整桌面版來源與發行檔 |
 
 目前版本的測試記錄見 `VALIDATION.md`，執行檔 SHA-256 見 Release 的 `build-info.json`。
+
+2026-10-17：依使用者指示，以 [ej04520yjo4/tdl#1](https://github.com/ej04520yjo4/tdl/pull/1) 將 `codex/traditional-chinese-desktop` 以合併提交併入 `master`，保留分支與各版本的提交紀錄。各版本清冊中「`master` 尚未合併」是當時的狀態。
