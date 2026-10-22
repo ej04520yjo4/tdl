@@ -219,6 +219,44 @@ class _ProgressList(QListWidget):
         return text + (f"，失敗 {failed}" if failed else "")
 
 
+class _DropList(QListWidget):
+    """Upload list that accepts files and folders dragged from Explorer."""
+
+    paths_dropped = Signal(list)
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QListWidget.DropOnly)
+
+    @staticmethod
+    def _local_paths(event: Any) -> list[str]:
+        mime = event.mimeData()
+        if mime is None or not mime.hasUrls():
+            return []
+        return [url.toLocalFile() for url in mime.urls() if url.isLocalFile() and url.toLocalFile()]
+
+    def dragEnterEvent(self, event: Any) -> None:  # type: ignore[override]
+        if self._local_paths(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event: Any) -> None:  # type: ignore[override]
+        if self._local_paths(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: Any) -> None:  # type: ignore[override]
+        paths = self._local_paths(event)
+        if paths:
+            event.acceptProposedAction()
+            self.paths_dropped.emit(paths)
+        else:
+            event.ignore()
+
+
 class TransferPage(QWidget):
     """Upload local files and forward messages for the active account."""
 
@@ -259,14 +297,14 @@ class TransferPage(QWidget):
         account_layout = QHBoxLayout(account_card)
         account_layout.setContentsMargins(18, 15, 18, 15)
         account_layout.setSpacing(12)
-        account_label = QLabel("使用帳號")
-        account_label.setObjectName("FieldLabel")
-        account_layout.addWidget(account_label)
-        self.account_combo = QComboBox()
-        self.account_combo.setMinimumWidth(280)
-        self.account_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        # The account follows the window's top-bar switcher; this combo is
+        # hidden state, kept so an upload keeps the account it started with.
+        self.account_combo = QComboBox(self)
         self.account_combo.currentIndexChanged.connect(self._account_changed)
-        account_layout.addWidget(self.account_combo, 1)
+        self.account_combo.hide()
+        mode_label = QLabel("要做什麼")
+        mode_label.setObjectName("FieldLabel")
+        account_layout.addWidget(mode_label)
         self.mode_group = QButtonGroup(self)
         self.mode_group.setExclusive(True)
         self.upload_tab = QPushButton("上傳檔案")
@@ -276,6 +314,7 @@ class TransferPage(QWidget):
             button.setProperty("segment", True)
             self.mode_group.addButton(button, index)
             account_layout.addWidget(button)
+        account_layout.addStretch(1)
         self.upload_tab.setChecked(True)
         outer.addWidget(account_card)
 
@@ -302,10 +341,12 @@ class TransferPage(QWidget):
         source_layout = QVBoxLayout(source)
         source_layout.setContentsMargins(18, 16, 18, 16)
         source_layout.setSpacing(10)
-        source_title = QLabel("要上傳的檔案或資料夾")
+        source_title = QLabel("要上傳的檔案或資料夾（可直接拖進來）")
         source_title.setObjectName("SectionTitle")
         source_layout.addWidget(source_title)
-        self.upload_list = QListWidget()
+        self.upload_list = _DropList()
+        self.upload_list.paths_dropped.connect(self.add_upload_paths)
+        self.upload_list.setToolTip("可以直接把檔案或資料夾從檔案總管拖進來")
         self.upload_list.setObjectName("UploadList")
         self.upload_list.setSelectionMode(QListWidget.ExtendedSelection)
         self.upload_list.setMinimumHeight(110)

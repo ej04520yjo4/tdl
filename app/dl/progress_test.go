@@ -116,6 +116,7 @@ func TestProgressMachineEventsIdentifyFileAndCompleteAfterPostProcessing(t *test
 		FileID  string  `json:"file_id"`
 		State   string  `json:"state"`
 		Percent float64 `json:"percent"`
+		Path    string  `json:"path"`
 	}
 	var events []event
 	for _, line := range strings.Split(output.String(), "\n") {
@@ -134,6 +135,13 @@ func TestProgressMachineEventsIdentifyFileAndCompleteAfterPostProcessing(t *test
 	require.Equal(t, "downloading", events[1].State)
 	require.Equal(t, "completed", events[2].State)
 	require.Equal(t, 100.0, events[2].Percent)
+	// Every state names the folder the file lives in, so the desktop can open
+	// the per-chat folder instead of the download root.
+	wantFolder, err := filepath.Abs(root)
+	require.NoError(t, err)
+	for _, got := range events {
+		require.Equal(t, wantFolder, got.Path)
+	}
 	require.FileExists(t, filepath.Join(root, "done.bin"))
 	_, finished := it.finished[elem.logicalPos]
 	require.True(t, finished, "logical position should be checkpointed after completion")

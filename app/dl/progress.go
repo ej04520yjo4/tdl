@@ -146,7 +146,18 @@ func (p *progress) emitMachineState(elem *iterElem, current, total int64, speed,
 		Filename: filename,
 		FileID:   fmt.Sprintf("%d", elem.logicalPos),
 		State:    state,
+		// The folder lets the desktop open where the files really are; with
+		// per-chat folders that is below the chosen download directory.
+		Path: p.machineFolder(elem),
 	})
+}
+
+func (p *progress) machineFolder(elem *iterElem) string {
+	folder := filepath.Dir(elem.to.Name())
+	if abs, err := filepath.Abs(folder); err == nil {
+		return abs
+	}
+	return folder
 }
 
 func (p *progress) machineFilename(elem downloader.Elem) string {
