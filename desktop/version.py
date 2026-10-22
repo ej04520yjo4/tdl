@@ -4,7 +4,7 @@ The window, the core build flag, the EXE version resource, the release file
 names and the verification receipts all read this value.
 """
 
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 
 if __name__ == "__main__":
     print(VERSION)

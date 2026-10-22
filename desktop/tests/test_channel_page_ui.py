@@ -213,6 +213,10 @@ class ChannelPageFixtureTests(unittest.TestCase):
         page.chat_list.setCurrentRow(0)
         page._export_path = "C:/fixture/visible.json"
         page._export_count = 2
+        # Model the completed scan state explicitly.  The production page
+        # now requires a snapshot that matches the current source/filters
+        # before it enables the download action.
+        page._export_snapshot = page._current_export_snapshot()
         page.download_button.setEnabled(True)
 
         page.search_edit.setText("台灣攝影")
@@ -393,8 +397,19 @@ class ChannelPageFixtureTests(unittest.TestCase):
                     window.channel_page.download_requested.emit([], options)
                     app.processEvents()
                     current = window.stack.currentWidget().widget()
-                    self.assertIs(current, window.home_page)
+                    # Queue acknowledgement keeps the user on the channel
+                    # page so the result and queue status remain visible.
+                    self.assertIs(current, window.channel_page)
                     self.assertEqual(start_job.call_count, 1)
+                    self.assertIn("下載佇列：", window.channel_page.queue_status_label.text())
+                    self.assertIn("等待中 1", window.channel_page.queue_status_label.text())
+
+                    window.home_page.remove_jobs(list(window.jobs))
+                    app.processEvents()
+                    self.assertEqual(
+                        window.channel_page.queue_status_label.text(),
+                        "下載佇列：尚無項目",
+                    )
 
                 window._show_widget(window.channel_page)
                 before = set(window.jobs)

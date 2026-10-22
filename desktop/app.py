@@ -1795,6 +1795,8 @@ class LoginDialog(QDialog):
 
 class DownloadPage(QWidget):
     download_requested = Signal(list, dict)
+    channel_requested = Signal()
+    queue_summary_changed = Signal(str)
     account_requested = Signal()
     export_requested = Signal()
     import_requested = Signal()
@@ -1968,6 +1970,10 @@ class DownloadPage(QWidget):
         queue_header.addWidget(queue_title)
         queue_header.addWidget(self.queue_summary)
         queue_header.addStretch(1)
+        self.channel_button = QPushButton("繼續選頻道")
+        self.channel_button.setToolTip("回到頻道下載，保留目前的頻道與篩選條件")
+        self.channel_button.clicked.connect(self.channel_requested.emit)
+        queue_header.addWidget(self.channel_button)
         self.clear_button = QPushButton("清除已結束")
         self.clear_button.setToolTip("移除已完成、失敗與已取消的項目；下載紀錄仍會保留")
         self.clear_button.clicked.connect(self.clear_requested.emit)
@@ -1992,7 +1998,8 @@ class DownloadPage(QWidget):
         self.queue_list = QVBoxLayout(queue_host)
         self.queue_list.setContentsMargins(0, 0, 0, 0)
         self.queue_list.setSpacing(9)
-        self.empty_queue = QLabel("貼上連結後，下載項目會顯示在這裡。")
+        self.empty_queue = QLabel("從頻道掃描加入下載，或貼上訊息連結後，工作會顯示在這裡。")
+        self.empty_queue.setWordWrap(True)
         self.empty_queue.setObjectName("EmptyText")
         self.empty_queue.setAlignment(Qt.AlignCenter)
         self.queue_list.addWidget(self.empty_queue)
@@ -2161,11 +2168,13 @@ class DownloadPage(QWidget):
     def _update_queue_summary(self) -> None:
         if not self.jobs:
             self.queue_summary.setText("尚無項目")
+            self.queue_summary_changed.emit("下載佇列：尚無項目")
             return
         counts: dict[str, int] = {}
         for job in self.jobs.values():
             counts[job.status] = counts.get(job.status, 0) + 1
         self.queue_summary.setText("  ·  ".join(f"{k} {v}" for k, v in counts.items()))
+        self.queue_summary_changed.emit("下載佇列：" + self.queue_summary.text())
 
 
 class AccountPage(QWidget):
@@ -2740,6 +2749,8 @@ class MainWindow(QMainWindow):
             button.clicked.connect(lambda checked=False, i=index: self._show_page(i))
         self.nav_buttons[0].setChecked(True)
         self.home_page.account_requested.connect(lambda: self._show_widget(self.account_page))
+        self.home_page.channel_requested.connect(lambda: self._show_widget(self.channel_page))
+        self.home_page.queue_summary_changed.connect(self.channel_page.queue_status_label.setText)
         self.home_page.download_requested.connect(self._enqueue_downloads)
         self.home_page.export_requested.connect(self._export_json)
         self.home_page.import_requested.connect(self._import_json)
@@ -2757,6 +2768,7 @@ class MainWindow(QMainWindow):
         self.account_page.account_relogin_requested.connect(self._relogin_account)
         self.channel_page.account_changed.connect(self._set_active_account)
         self.channel_page.download_requested.connect(self._enqueue_channel_downloads)
+        self.channel_page.view_queue_requested.connect(self._show_download_queue)
         self.transfer_page.account_changed.connect(self._set_active_account)
 
     def _show_page(self, index: int) -> None:
@@ -2775,6 +2787,13 @@ class MainWindow(QMainWindow):
             if page is widget:
                 self._show_page(index)
                 return
+
+    def _show_download_queue(self) -> None:
+        """Land on the queue itself instead of the link editor above it."""
+        self._show_widget(self.home_page)
+        container = self.stack.currentWidget()
+        if isinstance(container, QScrollArea):
+            QTimer.singleShot(0, lambda: container.ensureWidgetVisible(self.home_page.queue_scroll, 0, 24))
 
     def _load_preferences(self) -> None:
         values = self.settings_page.values()
@@ -3238,12 +3257,16 @@ class MainWindow(QMainWindow):
             self._start_job(job, options)
 
     def _enqueue_channel_downloads(self, urls: list[str], options: dict[str, Any]) -> None:
-        """Queue a scanned channel export, then show its real queue row."""
+        """Acknowledge an accepted job while keeping channel browsing in place."""
 
         before = set(self.jobs)
         self._enqueue_downloads(urls, options)
         if any(job_id not in before for job_id in self.jobs):
-            self._show_widget(self.home_page)
+            self.channel_page.download_queued(
+                _safe_str(options.get("title")), int(options.get("expected_files", 0) or 0)
+            )
+        else:
+            self.channel_page.download_rejected("請確認帳號已登入及下載設定，再重試。")
 
     def _start_job(self, job: DownloadJob, options: Mapping[str, Any]) -> None:
         old_thread = self._threads.get(job.id)
@@ -3726,6 +3749,7 @@ QPushButton:disabled {{ color: {SUBTLE}; background: #f3f5f9; }}
 #PrimaryButton {{ background: {PRIMARY}; border: 1px solid {PRIMARY}; color: #ffffff; font-weight: 700; padding: 9px 18px; }}
 #PrimaryButton:hover {{ background: {PRIMARY_DARK}; border-color: {PRIMARY_DARK}; }}
 #PrimaryButton:pressed {{ background: #312e81; }}
+#PrimaryButton:disabled {{ color: {SUBTLE}; background: #f3f5f9; border-color: {BORDER}; }}
 QPushButton[dangerButton="true"] {{ color: {DANGER}; background: {DANGER_LIGHT}; border-color: #ffd5dc; }}
 QPushButton[dangerButton="true"]:hover {{ background: #ffe3e7; }}
 .QPushButton {{ min-height: 20px; }}
@@ -3805,6 +3829,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--verify-channels", action="store_true", help="使用隔離帳號副本驗證頻道清單與公開小型影片下載")
     parser.add_argument("--verify-channel-ui", action="store_true", help="使用隔離帳號副本實際點擊更新清單並驗證視窗執行緒")
     parser.add_argument("--verify-restart", choices=("before-close", "after-reopen"), help=argparse.SUPPRESS)
+    parser.add_argument("--verify-workflow", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--verify-download-child", nargs=2, help=argparse.SUPPRESS)
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -3814,6 +3839,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.verify_restart:
         from desktop.restart_probe import run_probe
         return run_probe(args.verify_restart, args.smoke_report)
+
+    if args.verify_workflow:
+        from desktop.workflow_probe import run_probe
+        return run_probe(args.smoke_report)
 
     if args.verify_qr:
         from desktop.qr_probe import run_probe

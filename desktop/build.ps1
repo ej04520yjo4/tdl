@@ -29,7 +29,7 @@ try {
     $tdlBuildPath = $env:PATH
     try {
         $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
-        & $Python -m PyInstaller --noconfirm --clean --onefile --windowed --name 'TDL下載助手' --icon "$tdlRoot/desktop/assets/app.ico" --version-file "$tdlRoot/.build/version_info.txt" --paths $tdlRoot --hidden-import desktop.backend --hidden-import desktop.channel_page --hidden-import desktop.transfer_page --hidden-import desktop.version --hidden-import desktop.channel_probe --hidden-import desktop.channel_ui_probe --hidden-import desktop.qr_probe --hidden-import desktop.restart_probe --add-binary "$tdlRoot/bin/tdl-core.exe;bin" --add-data "$tdlRoot/desktop/assets;assets" --add-data "$tdlRoot/dist/licenses;licenses" --workpath .build/pyinstaller --specpath .build "$tdlRoot/desktop/app.py"
+        & $Python -m PyInstaller --noconfirm --clean --onefile --windowed --name 'TDL下載助手' --icon "$tdlRoot/desktop/assets/app.ico" --version-file "$tdlRoot/.build/version_info.txt" --paths $tdlRoot --hidden-import desktop.backend --hidden-import desktop.channel_page --hidden-import desktop.transfer_page --hidden-import desktop.version --hidden-import desktop.channel_probe --hidden-import desktop.channel_ui_probe --hidden-import desktop.qr_probe --hidden-import desktop.restart_probe --hidden-import desktop.workflow_probe --add-binary "$tdlRoot/bin/tdl-core.exe;bin" --add-data "$tdlRoot/desktop/assets;assets" --add-data "$tdlRoot/dist/licenses;licenses" --workpath .build/pyinstaller --specpath .build "$tdlRoot/desktop/app.py"
         if ($LASTEXITCODE -ne 0) { throw 'Desktop packaging failed' }
     } finally {
         $env:PATH = $tdlBuildPath
@@ -38,6 +38,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Standalone executable verification failed' }
     & $Python desktop/verify_restart_release.py --source 'dist/TDL下載助手.exe'
     if ($LASTEXITCODE -ne 0) { throw 'Executable restart verification failed' }
+    & $Python desktop/verify_workflow_release.py --source 'dist/TDL下載助手.exe'
+    if ($LASTEXITCODE -ne 0) { throw 'Executable workflow verification failed' }
     Copy-Item -LiteralPath 'dist/TDL下載助手.exe' -Destination 'TDL下載助手.exe' -Force
     & $Python desktop/package_release.py
     if ($LASTEXITCODE -ne 0) { throw 'Release packaging failed' }
