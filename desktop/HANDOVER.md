@@ -13,3 +13,5 @@
 目前版本的測試記錄見 `VALIDATION.md`，執行檔 SHA-256 見 Release 的 `build-info.json`。
 
 2026-10-17：依使用者指示，以 [ej04520yjo4/tdl#1](https://github.com/ej04520yjo4/tdl/pull/1) 將 `codex/traditional-chinese-desktop` 以合併提交併入 `master`，保留分支與各版本的提交紀錄。各版本清冊中「`master` 尚未合併」是當時的狀態。
+
+2026-10-22：依使用者指示，以 [PR #2](https://github.com/ej04520yjo4/tdl/pull/2) 將 `codex/channel-workflow` 的 1.4.0 更新合併至 `master`，並同步本機主分支；EXE 沿用原發布版本，詳見 [1.4.0 主分支同步紀錄](handovers/1.4.0.md)。
