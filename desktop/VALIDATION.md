@@ -1,40 +1,33 @@
 # 桌面版交付驗證
 
-日期：2026-10-13。版本：1.3.2。基底：1.3.1 的 `c04aa5f`。
+日期：2026-10-22。版本：1.4.0。基底：master `14e4d51`。
 
 ## 本次範圍
 
-1. 頻道／群組、論壇話題與下載紀錄共用繁簡搜尋；保留原文，支援 emoji、全形英數、大小寫及 `@username`。
-2. 新工作預設依群組／頻道名稱存放附件。名稱對應在同帳號與下載根目錄中保存，重開、群組改名及同名群組都保持穩定路徑。
-3. 舊工作缺少 `group_by_chat` 時維持原本平面路徑；不搬移過去的檔案。
+頻道／話題選取與掃描來源辨識、切換後重新掃描提示、加入下載留在原頁、直接查看佇列與返回、已加入結果防重複，以及過期非同步結果保護。保留帳號、重開接續、繁簡搜尋與群組資料夾格式。
 
-## 測試結果與證據層級
+## 驗證結果與交付
 
-- Python 完整桌面 suite：**134 passed、22 subtests passed**，30.65 秒。
-- Go 相關套件全部通過：`pkg/desktopio`、`app/chat`、`app/dl`、`app/up`、`app/migrate`、`cmd`、`core/downloader`、`core/uploader`、`core/util/tutil`；`pkg/key`、`pkg/tmessage` 無測試。
-- 搜尋使用 Windows NLS 的真實字元轉換，並以隔離 UI 資料驗證繁簡比對與原始名稱顯示；不連線 Telegram。
-- Go iterator 使用假 peer／訊息及本機檔案，驗證子目錄、安全名稱、同名／大小寫碰撞、skip-same；名稱對應測試包含重新建立 iterator、群組改名、已完成群組被略過、不同輸出根目錄、讀寫失敗及損壞資料。不是網路下載測試。
-- 最終單檔 EXE：複製至獨立目錄，移除 Python／Go PATH；內含核心、繁簡搜尋、畫面繪製、原生 Windows 視窗啟閉均通過。
-- 兩個最終 EXE 程序搭配離線模擬核心：關閉保存、原工作／帳號、分組設定保存及恢復、已完成檔案不重寫、剩餘檔案寫入及每檔進度恢復通過。這項驗證檢查 GUI 傳遞分組旗標；Go 真正資料夾處理由 iterator 測試驗證。
-- 解出最終 EXE 的真實 Go 核心，確認與測試核心雜湊相同；全部桌面參數、備份／還原及鎖住目的備份保護等 **3 個離線核心測試**通過。
-- 本次沒有真實 Telegram 帳號或傳輸驗證，也未實際上傳／轉傳。不沿用舊版真實驗證收據。
+- Python 完整桌面 suite：**145 passed、22 subtests passed**，33.41 秒；最後按鈕文字／停用樣式調整後，頻道相關 **26 項**回歸測試再次通過。
+- Go 相關套件通過：`pkg/desktopio`、`app/chat`、`app/dl`、`app/up`、`app/migrate`、`cmd`、`core/downloader`、`core/uploader`、`core/util/tutil`；`pkg/key`、`pkg/tmessage` 無測試。
+- 最終 EXE 複製至獨立資料夾，移除 Python／Go PATH，內含核心、繁簡搜尋、原生 Windows 視窗啟閉及畫面繪製通過。
+- 最終 EXE 離線頻道流程：清單、掃描、加入後留在頻道頁、查看佇列、返回、換頻道使舊結果失效、論壇話題掃描均通過。GUI 執行緒違規為 0，正常關閉及 worker 清理通過。
+- 1180×800、960×680 各驗證一般頻道與論壇話題，4 組版面檢查無水平裁切、8 項主要按鈕捲動可見性檢查通過；5 張最終 EXE fixture 畫面已檢視。
+- 兩個最終 EXE 程序的離線接續驗證通過：保存暫停狀態、原帳號與工作、已完成附件不重寫、剩餘附件及群組設定恢復。
+- 未執行本版真實 Telegram 帳號或附件傳輸測試，不沿用舊版連線驗證收據。
 
-## 交付檔案
+EXE：Windows x64 GUI，**1.4.0**，**54,567,039 bytes**。
 
-EXE：Windows x64 GUI，**1.3.2**，**54,538,262 bytes**。
+SHA-256：`3bd98b15d452ae59eb9a889d31423d558ea02f7ed2392b6db11fa20e563d1141`。
 
-EXE SHA-256：`c9a4bfb2cc7c0e5dcecdf41f8ed4e5f9d25b25727bc959c36636f5d383b09f3c`。
+內含 Go 核心 SHA-256：`d7cc5ae87814314a37c60d3733e7282194a6102977e4c817051b2d3464a831a5`。
 
-內含 Go 核心 SHA-256：`b97f155321765807638d8e3efbb33b6b4e90d51e7cc07865ddfc9b21bb9c9e34`。
-
-收據：`desktop/verification/1.3.2/verification.json`、`restart-verification.json`，皆綁定上述 EXE 雜湊。
-
-`desktop/build.ps1` 的 Go、Python、打包與最終 EXE 驗證通過。最後覆蓋根目錄舊 EXE 因 1.3.1 仍執行而受 Windows 檔案鎖阻擋，因此另交付 `TDL下載助手-1.3.2.exe`；GitHub 附件由已驗證的 dist EXE 產生並逐一核對雜湊。2026-10-17 確認根目錄 `TDL下載助手.exe` 已與上述 EXE 同雜湊，詳見 1.3.2 交接清冊的「交接確認」。
+根目錄 `TDL下載助手.exe`、`TDL下載助手-1.4.0.exe` 與 `dist/TDL下載助手.exe` 為相同內容。收據與離線 fixture 畫面位於 `desktop/verification/1.4.0/`。
 
 ## 限制
 
-- 繁簡字元轉換不等於同義詞或語意搜尋；Windows 外的開發環境僅提供 Unicode／大小寫正規化。
-- 手動移動／改名下載資料夾不會自動更新群組對應。不同帳號的群組對應各自保存。
-- 下載接續以檔案為單位；尚未完成的單一附件可能重新下載。
-- 完整上游 Go suite 有既有 Windows `app/update/TestBinaryName` 差異，這次只宣稱相關套件通過。
-- EXE 未簽章。
+- 日期按訊息進入目前群組／頻道的日期；轉傳訊息不採原始發布日。
+- 接續下載以檔案為單位，未完成的單一附件可能重新下載。
+- 不改動既有群組資料夾對應或搬移檔案；繁簡比對不提供同義詞搜尋。
+- 上游完整 Go suite 有既有 Windows `app/update/TestBinaryName` 差異，本次只宣稱相關套件通過。
+- Windows EXE 未簽章。

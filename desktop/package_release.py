@@ -116,6 +116,12 @@ def main() -> None:
             if restart.get("ok") and restart.get("sha256") == report["sha256"]:
                 report["restart_test"] = "PASS_TWO_EXE_PROCESSES_OFFLINE_FIXTURE"
                 report["restart_verification_receipt"] = restart_receipt.name
+        workflow_receipt = release / "workflow-verification.json"
+        if workflow_receipt.exists():
+            workflow = json.loads(workflow_receipt.read_text(encoding="utf-8"))
+            if workflow.get("ok") and workflow.get("sha256") == report["sha256"]:
+                report["channel_workflow_test"] = "PASS_OFFLINE_EXE_FIXTURE"
+                report["workflow_verification_receipt"] = workflow_receipt.name
         qr_receipt = release / "qr-login-verification.json"
         if qr_receipt.exists():
             qr = json.loads(qr_receipt.read_text(encoding="utf-8"))
@@ -141,7 +147,7 @@ def main() -> None:
             if path.is_file():
                 archive.write(path, path.relative_to(release).as_posix())
     assets = [*aliases.values(), "THIRD-PARTY-LICENSES.zip", "build-info.json"]
-    for name in ("verification.json", "restart-verification.json", "channel-ui-verification.json", "channel-live-verification.json", "qr-login-verification.json"):
+    for name in ("verification.json", "restart-verification.json", "workflow-verification.json", "channel-ui-verification.json", "channel-live-verification.json", "qr-login-verification.json"):
         path = release / name
         if path.exists() and executable.exists():
             receipt = json.loads(path.read_text(encoding="utf-8"))

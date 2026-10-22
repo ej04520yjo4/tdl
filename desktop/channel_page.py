@@ -359,6 +359,9 @@ class ChannelPage(QWidget):
 
     account_changed = Signal(str)
     download_requested = Signal(list, dict)
+    # The main window owns the durable queue.  The page deliberately waits
+    # for its acknowledgement before claiming that a scan was accepted.
+    view_queue_requested = Signal()
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -374,6 +377,7 @@ class ChannelPage(QWidget):
         self._topics_loading = False
         self._generation = 0
         self._operation_kind = ""
+        self._cancel_status = ""
         self._thread: Optional[QThread] = None
         self._worker: Optional[_RunnerWorker] = None
         # Keep stale workers reachable until their QThread has emitted
@@ -384,6 +388,14 @@ class ChannelPage(QWidget):
         self._export_path = ""
         self._export_count = 0
         self._export_bytes = 0
+        # A manifest is valid only for the exact account/source/topic/date/
+        # media selection that produced it.  Keep the snapshot separate from
+        # the transient status text so a late worker result cannot resurrect a
+        # result after the user changed the form.
+        self._export_snapshot: Optional[dict[str, Any]] = None
+        self._operation_snapshot: Optional[dict[str, Any]] = None
+        self._export_request_pending = False
+        self._export_consumed = False
         self._download_folder = ""
         self._proxy = ""
         self._concurrency = 2
@@ -392,12 +404,14 @@ class ChannelPage(QWidget):
 
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(30, 25, 30, 35)
+        outer.setContentsMargins(20, 14, 20, 22)
         outer.setSpacing(12)
 
         kicker = QLabel("頻道與群組")
         kicker.setObjectName("Kicker")
-        outer.addWidget(kicker)
+        # The sidebar already identifies this page.  Keeping the title and
+        # one-line intro together gives the scan/download controls room at
+        # the default 1180x800 window size.
         title = QLabel("選頻道，先看數量再下載。")
         title.setObjectName("PageTitle")
         outer.addWidget(title)
@@ -408,7 +422,7 @@ class ChannelPage(QWidget):
 
         account_card = _Card()
         account_layout = QHBoxLayout(account_card)
-        account_layout.setContentsMargins(18, 15, 18, 15)
+        account_layout.setContentsMargins(14, 10, 14, 10)
         account_layout.setSpacing(12)
         account_label = QLabel("下載帳號")
         account_label.setObjectName("FieldLabel")
@@ -426,22 +440,32 @@ class ChannelPage(QWidget):
 
         channel_card = _Card()
         channel_layout = QVBoxLayout(channel_card)
-        channel_layout.setContentsMargins(18, 16, 18, 16)
+        channel_layout.setContentsMargins(12, 12, 12, 12)
         channel_layout.setSpacing(10)
         search_row = QHBoxLayout()
-        search_row.setSpacing(10)
+        search_row.setSpacing(6)
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("搜尋頻道、群組名稱或 username")
+        self.search_edit.setClearButtonEnabled(True)
         self.search_edit.textChanged.connect(self._apply_filter)
         search_row.addWidget(self.search_edit, 1)
+        channel_layout.addLayout(search_row)
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(8)
         self.type_combo = QComboBox()
         self.type_combo.addItem("全部", "all")
         self.type_combo.addItem("頻道", "channel")
         self.type_combo.addItem("群組", "group")
         self.type_combo.currentIndexChanged.connect(self._apply_filter)
-        self.type_combo.setMinimumWidth(110)
-        search_row.addWidget(self.type_combo)
-        channel_layout.addLayout(search_row)
+        self.type_combo.setMinimumWidth(86)
+        filter_row.addWidget(self.type_combo, 1)
+        self.clear_search_button = QPushButton("清除")
+        self.clear_search_button.setObjectName("SecondaryButton")
+        self.clear_search_button.setFixedWidth(60)
+        self.clear_search_button.setToolTip("清除搜尋與目前頻道選取，保留日期、媒體類型和資料夾")
+        self.clear_search_button.clicked.connect(self._clear_source_selection)
+        filter_row.addWidget(self.clear_search_button)
+        channel_layout.addLayout(filter_row)
         self.chat_list = QListWidget()
         self.chat_list.setObjectName("ChannelList")
         self.chat_list.setMinimumHeight(180)
@@ -456,6 +480,7 @@ class ChannelPage(QWidget):
         channel_layout.addWidget(self.chat_list)
         self.chat_hint = QLabel("請按「更新清單」載入目前帳號可存取的頻道與群組。")
         self.chat_hint.setObjectName("MutedText")
+        self.chat_hint.setTextFormat(Qt.TextFormat.PlainText)
         self.chat_hint.setWordWrap(True)
         channel_layout.addWidget(self.chat_hint)
 
@@ -477,6 +502,7 @@ class ChannelPage(QWidget):
         topic_layout.addLayout(topic_header)
         self.topic_search = QLineEdit()
         self.topic_search.setPlaceholderText("搜尋主題名稱或 ID")
+        self.topic_search.setClearButtonEnabled(True)
         self.topic_search.textChanged.connect(self._apply_topic_filter)
         topic_layout.addWidget(self.topic_search)
         self.topic_list = QListWidget()
@@ -492,6 +518,7 @@ class ChannelPage(QWidget):
         topic_layout.addWidget(self.topic_list)
         self.topic_hint = QLabel("論壇群組需要先選擇主題，或明確選擇「全部主題」。")
         self.topic_hint.setObjectName("MutedText")
+        self.topic_hint.setTextFormat(Qt.TextFormat.PlainText)
         self.topic_hint.setWordWrap(True)
         topic_layout.addWidget(self.topic_hint)
         self.topic_panel.setVisible(False)
@@ -499,15 +526,15 @@ class ChannelPage(QWidget):
 
         filters = _Card()
         filters_layout = QVBoxLayout(filters)
-        filters_layout.setContentsMargins(18, 16, 18, 16)
-        filters_layout.setSpacing(13)
+        filters_layout.setContentsMargins(14, 10, 14, 10)
+        filters_layout.setSpacing(8)
         filter_title = QLabel("下載條件")
         filter_title.setObjectName("SectionTitle")
         filters_layout.addWidget(filter_title)
 
         dates = QGridLayout()
         dates.setHorizontalSpacing(10)
-        dates.setVerticalSpacing(8)
+        dates.setVerticalSpacing(4)
         start_label = QLabel("起始日期（台灣時間）")
         start_label.setObjectName("FieldLabel")
         end_label = QLabel("結束日期（台灣時間）")
@@ -518,7 +545,7 @@ class ChannelPage(QWidget):
             editor.setCalendarPopup(True)
             editor.setDisplayFormat("yyyy/MM/dd")
             editor.setMinimumWidth(150)
-            editor.dateChanged.connect(self._clear_scan)
+            editor.dateChanged.connect(self._selection_inputs_changed)
         today = _taipei_qdate()
         self.end_date.setDate(today)
         self.start_date.setDate(today.addDays(-6))
@@ -554,14 +581,14 @@ class ChannelPage(QWidget):
         media_label.setObjectName("FieldLabel")
         filters_layout.addWidget(media_label)
         media_row = QHBoxLayout()
-        media_row.setSpacing(18)
+        media_row.setSpacing(12)
         self.video_check = QCheckBox("影片")
         self.photo_check = QCheckBox("照片")
         self.audio_check = QCheckBox("音訊")
         self.document_check = QCheckBox("文件")
         self.video_check.setChecked(True)
         for checkbox in (self.video_check, self.photo_check, self.audio_check, self.document_check):
-            checkbox.stateChanged.connect(self._clear_scan)
+            checkbox.stateChanged.connect(self._selection_inputs_changed)
             media_row.addWidget(checkbox)
         media_row.addStretch(1)
         filters_layout.addLayout(media_row)
@@ -579,17 +606,18 @@ class ChannelPage(QWidget):
         self.folder_button.clicked.connect(self._choose_folder)
         folder_row.addWidget(self.folder_button)
         filters_layout.addLayout(folder_row)
-        folder_hint = QLabel("檔案會自動放入「群組／頻道名稱」子資料夾，話題下載也會放在所屬群組內。")
+        folder_hint = QLabel("檔案會按群組／頻道名稱自動分資料夾。")
         folder_hint.setObjectName("MutedText")
         folder_hint.setWordWrap(True)
         filters_layout.addWidget(folder_hint)
 
         action_card = _Card()
         action_layout = QVBoxLayout(action_card)
-        action_layout.setContentsMargins(18, 16, 18, 16)
-        action_layout.setSpacing(10)
+        action_layout.setContentsMargins(14, 10, 14, 10)
+        action_layout.setSpacing(6)
         self.status_label = QLabel("請選擇帳號並按「更新清單」。")
         self.status_label.setObjectName("MutedText")
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
         self.status_label.setWordWrap(True)
         action_layout.addWidget(self.status_label)
         button_row = QHBoxLayout()
@@ -614,6 +642,45 @@ class ChannelPage(QWidget):
         workflow.addWidget(channel_card, 4)
         right_column = QVBoxLayout()
         right_column.setSpacing(12)
+        context_card = _Card()
+        context_layout = QVBoxLayout(context_card)
+        context_layout.setContentsMargins(10, 6, 10, 6)
+        context_layout.setSpacing(2)
+        self.current_source_label = QLabel("尚未選擇頻道或群組。")
+        self.current_source_label.setObjectName("CurrentSource")
+        self.current_source_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.current_source_label.setStyleSheet("font-weight: 600; color: #3157b7;")
+        self.current_source_label.setWordWrap(True)
+        context_layout.addWidget(self.current_source_label)
+        self.current_source_identity_label = QLabel("識別：尚未選擇")
+        self.current_source_identity_label.setObjectName("MutedText")
+        self.current_source_identity_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.current_source_identity_label.setWordWrap(True)
+        context_layout.addWidget(self.current_source_identity_label)
+        self.scan_summary_label = QLabel("尚未掃描；選好來源、日期與媒體類型後開始掃描。")
+        self.scan_summary_label.setObjectName("ScanSummary")
+        self.scan_summary_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.scan_summary_label.setWordWrap(True)
+        context_layout.addWidget(self.scan_summary_label)
+        self.queue_status_label = QLabel("下載佇列：尚無項目")
+        self.queue_status_label.setObjectName("MutedText")
+        self.queue_status_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.queue_status_label.setWordWrap(True)
+        context_layout.addWidget(self.queue_status_label)
+        context_actions = QHBoxLayout()
+        context_actions.setSpacing(8)
+        self.change_source_button = QPushButton("換另一個頻道")
+        self.change_source_button.setObjectName("SecondaryButton")
+        self.change_source_button.setToolTip("清除目前選取，保留日期、媒體類型和下載資料夾")
+        self.change_source_button.clicked.connect(self._clear_source_selection)
+        context_actions.addWidget(self.change_source_button)
+        self.view_queue_button = QPushButton("查看下載佇列")
+        self.view_queue_button.setObjectName("SecondaryButton")
+        self.view_queue_button.clicked.connect(self.view_queue_requested.emit)
+        context_actions.addWidget(self.view_queue_button)
+        context_actions.addStretch(1)
+        context_layout.addLayout(context_actions)
+        right_column.addWidget(context_card)
         right_column.addWidget(filters)
         right_column.addWidget(action_card)
         right_column.addStretch(1)
@@ -621,6 +688,7 @@ class ChannelPage(QWidget):
         outer.addLayout(workflow, 1)
 
         self._set_controls_enabled(True)
+        self._update_current_source_label()
 
     # ------------------------------------------------------------------
     # Public integration surface
@@ -635,6 +703,10 @@ class ChannelPage(QWidget):
         saved_export_path = self._export_path
         saved_export_count = self._export_count
         saved_export_bytes = self._export_bytes
+        saved_export_snapshot = dict(self._export_snapshot) if self._export_snapshot else None
+        saved_scan_summary = self.scan_summary_label.text()
+        saved_request_pending = self._export_request_pending
+        saved_consumed = self._export_consumed
         self._accounts = values
         self._active_account_id = _text(active_id or previous)
         self.account_combo.blockSignals(True)
@@ -668,17 +740,29 @@ class ChannelPage(QWidget):
             self._clear_chat_selection()
         elif self._chats:
             # Rebuild only the visible rows after account metadata refresh;
-            # the selected chat and an already-scanned manifest stay valid for
-            # the same account.
+            # the selected chat and an unconsumed manifest stay valid for the
+            # same account.  A queued manifest is intentionally never
+            # resurrected by this refresh path.
             self._apply_filter()
             # Rebuilding QListWidget rows can emit currentItemChanged and
-            # clear the preview as a side effect.  The account did not change,
-            # so the already scanned manifest remains valid and is restored.
-            self._export_path = saved_export_path
-            self._export_count = saved_export_count
-            self._export_bytes = saved_export_bytes
-            if hasattr(self, "download_button") and not self.is_busy():
-                self.download_button.setEnabled(bool(saved_export_path and saved_export_count > 0))
+            # clear the preview as a side effect.  Restore only when the
+            # source snapshot still matches the visible selection.
+            if (
+                not saved_consumed
+                and self._selected_chat is not None
+                and saved_export_snapshot is not None
+                and self._current_export_snapshot() is not None
+                and self._snapshots_match(saved_export_snapshot, self._current_export_snapshot() or {})
+            ):
+                self._export_path = saved_export_path
+                self._export_count = saved_export_count
+                self._export_bytes = saved_export_bytes
+                self._export_snapshot = saved_export_snapshot
+                self._export_request_pending = saved_request_pending
+                self._export_consumed = False
+                self.scan_summary_label.setText(saved_scan_summary)
+            self._update_download_button()
+        self._update_current_source_label()
         if not self.account_combo.count():
             self.account_combo.addItem("尚未登入 Telegram")
             self._set_status("尚未有可用帳號。請先到「帳號管理」完成登入。")
@@ -749,15 +833,33 @@ class ChannelPage(QWidget):
         self._start_operation("list", "start_list_chats", (account_id,), kwargs)
 
     def cancel_operations(self) -> None:
+        was_busy = self.is_busy()
+        if not was_busy:
+            # The worker may have stopped while its queued success signal is
+            # still waiting in the GUI event queue.  Invalidate that result
+            # before returning from an explicit cancel.
+            self._generation += 1
+            if self._operation_snapshot is not None:
+                self._operation_snapshot = None
+                self._clear_scan(keep_status=True)
+                self._set_scan_summary("操作已取消；請確認來源與條件後重試。")
+            self._pending_operation = None
+            self._cancel_status = ""
+            self._finish_idle_state()
+            return
+        operation_kind = self._operation_kind
         self._generation += 1
         self._pending_operation = None
+        self._operation_snapshot = None
+        self._cancel_status = "操作已取消。"
+        if operation_kind == "export":
+            self._clear_scan(keep_status=True)
+            self._set_scan_summary("掃描已取消；請確認來源與條件後重試。")
         worker = self._worker
         if worker is not None:
             worker.cancel()
-        if self.is_busy():
+        if was_busy:
             self._set_status("正在取消目前操作…")
-        else:
-            self._finish_idle_state()
 
     def active_account_id(self) -> str:
         return _text(self.account_combo.currentData() or self._active_account_id)
@@ -785,14 +887,22 @@ class ChannelPage(QWidget):
 
     def _set_date_range(self, days_before_today: int) -> None:
         today = _taipei_qdate()
+        self.start_date.blockSignals(True)
+        self.end_date.blockSignals(True)
         self.end_date.setDate(today)
         self.start_date.setDate(today.addDays(-int(days_before_today)))
-        self._clear_scan()
+        self.start_date.blockSignals(False)
+        self.end_date.blockSignals(False)
+        self._selection_inputs_changed()
 
     def _set_all_time(self) -> None:
+        self.start_date.blockSignals(True)
+        self.end_date.blockSignals(True)
         self.end_date.setDate(_taipei_qdate())
         self.start_date.setDate(_TELEGRAM_EPOCH)
-        self._clear_scan()
+        self.start_date.blockSignals(False)
+        self.end_date.blockSignals(False)
+        self._selection_inputs_changed()
 
     def _choose_folder(self) -> None:
         selected = QFileDialog.getExistingDirectory(
@@ -805,7 +915,66 @@ class ChannelPage(QWidget):
 
     def _folder_changed(self, value: str) -> None:
         self._download_folder = value.strip()
-        self._clear_scan()
+
+    def _selection_inputs_changed(self, *_args: Any) -> None:
+        """Invalidate a scan when its source/date/media inputs change.
+
+        The output folder is intentionally excluded: the exported manifest is
+        reusable when the user decides to save the resulting files elsewhere.
+        Account/source/topic changes use the same helper below.
+        """
+
+        self._invalidate_scan("下載條件已變更，請重新掃描。")
+
+    def _invalidate_scan(self, reason: str = "", *, cancel_operation: bool = True) -> None:
+        self._generation += 1
+        self._pending_operation = None
+        self._operation_snapshot = None
+        self._cancel_status = ""
+        if cancel_operation and self._worker is not None:
+            self._worker.cancel()
+        self._clear_scan(keep_status=True)
+        self._update_current_source_label()
+        if reason:
+            self._set_scan_summary(reason)
+            self._set_status(reason)
+
+    def _clear_source_selection(self) -> None:
+        """Reset source/search/topic state while retaining download settings."""
+
+        self._invalidate_scan("已清除目前來源，請選擇另一個頻道或群組。")
+        self._selected_chat = None
+        self._selected_topic = None
+        self._topic_chat_ref = ""
+        self._topics = []
+        self._topics_loaded = False
+        self._topics_loading = False
+        self.topic_panel.setVisible(False)
+        self.topic_state.setText("選擇論壇群組後載入")
+        self.topic_hint.setText("論壇群組需要先選擇主題，或明確選擇「全部主題」。")
+        self.topic_search.blockSignals(True)
+        self.topic_search.clear()
+        self.topic_search.blockSignals(False)
+        self.search_edit.blockSignals(True)
+        self.search_edit.clear()
+        self.search_edit.blockSignals(False)
+        self.type_combo.blockSignals(True)
+        self.type_combo.setCurrentIndex(0)
+        self.type_combo.blockSignals(False)
+        self.chat_list.blockSignals(True)
+        self.chat_list.clearSelection()
+        self.chat_list.setCurrentRow(-1)
+        self.chat_list.blockSignals(False)
+        self._apply_filter()
+        self.chat_list.blockSignals(True)
+        self.chat_list.clearSelection()
+        self.chat_list.setCurrentRow(-1)
+        self.chat_list.blockSignals(False)
+        self._update_current_source_label()
+        self._update_scan_button()
+        self._set_scan_summary("已清除來源；日期、媒體類型和資料夾仍保留。")
+        self._set_status("已清除目前來源，請從清單選擇另一個頻道或群組。")
+        self.search_edit.setFocus()
 
     def _topic_selection_required(self) -> bool:
         return bool(
@@ -838,6 +1007,7 @@ class ChannelPage(QWidget):
         self.topic_panel.setVisible(True)
         self.topic_state.setText("讀取失敗")
         self.topic_hint.setText(_safe_message(message) or "無法讀取論壇主題，請更新清單後重試。")
+        self._update_current_source_label()
         self._update_scan_button(False)
 
     def _populate_topics(self, values: Sequence[Any], *, source: str = "後端") -> None:
@@ -873,6 +1043,7 @@ class ChannelPage(QWidget):
             self.topic_hint.setText("請選擇一個主題；也可以明確選擇「全部主題」。")
         else:
             self.topic_hint.setText("目前沒有可用主題；若要掃描整個群組，請明確選擇「全部主題」。")
+        self._update_current_source_label()
         self._update_scan_button(False)
 
     def _apply_topic_filter(self, *_args: Any) -> None:
@@ -903,8 +1074,9 @@ class ChannelPage(QWidget):
         self.topic_list.blockSignals(False)
         if selected_item is None and self._selected_topic is not None:
             self._selected_topic = None
-            self._clear_scan()
+            self._invalidate_scan("搜尋已隱藏目前話題，請重新選擇並掃描。")
             self.topic_hint.setText("目前搜尋結果沒有原本選取的主題，請重新選擇。")
+        self._update_current_source_label()
         self._update_scan_button()
 
     def _prepare_topics_for_chat(self) -> None:
@@ -918,6 +1090,7 @@ class ChannelPage(QWidget):
         self.topic_list.clear()
         if chat is None or not _chat_is_forum(chat):
             self.topic_panel.setVisible(False)
+            self._update_current_source_label()
             self._update_scan_button()
             return
         self.topic_panel.setVisible(True)
@@ -945,15 +1118,16 @@ class ChannelPage(QWidget):
         current: Optional[QListWidgetItem],
         _previous: Optional[QListWidgetItem],
     ) -> None:
+        self._invalidate_scan("已更換論壇話題，請重新掃描。")
         value = current.data(Qt.UserRole) if current is not None else None
         self._selected_topic = dict(value) if isinstance(value, Mapping) else None
-        self._clear_scan()
         if self._selected_topic is None:
             self.topic_hint.setText("請選擇一個主題；也可以明確選擇「全部主題」。")
         elif self._selected_topic.get("all"):
             self.topic_hint.setText("已明確選擇整個論壇群組，掃描會包含所有主題。")
         else:
             self.topic_hint.setText(f"已選主題：{self._selected_topic.get('title', '未命名主題')}")
+        self._update_current_source_label()
         self._update_scan_button()
 
     def _apply_filter(self, *_args: Any) -> None:
@@ -962,6 +1136,11 @@ class ChannelPage(QWidget):
         current_id = _chat_ref(self._selected_chat) if self._selected_chat is not None else ""
         saved_export_path = self._export_path
         saved_export_count = self._export_count
+        saved_export_bytes = self._export_bytes
+        saved_export_snapshot = dict(self._export_snapshot) if self._export_snapshot else None
+        saved_scan_summary = self.scan_summary_label.text() if hasattr(self, "scan_summary_label") else ""
+        saved_request_pending = self._export_request_pending
+        saved_consumed = self._export_consumed
         self.chat_list.blockSignals(True)
         self.chat_list.clear()
         selected_item: Optional[QListWidgetItem] = None
@@ -987,10 +1166,20 @@ class ChannelPage(QWidget):
             # item is set while QListWidget signals are blocked, so changing
             # the search text cannot accidentally clear a valid manifest.
             self._selected_chat = selected_item.data(Qt.UserRole)
-            self._export_path = saved_export_path
-            self._export_count = saved_export_count
-            if hasattr(self, "download_button") and not self.is_busy():
-                self.download_button.setEnabled(bool(saved_export_path and saved_export_count > 0))
+            if (
+                not saved_consumed
+                and saved_export_snapshot is not None
+                and self._current_export_snapshot() is not None
+                and self._snapshots_match(saved_export_snapshot, self._current_export_snapshot() or {})
+            ):
+                self._export_path = saved_export_path
+                self._export_count = saved_export_count
+                self._export_bytes = saved_export_bytes
+                self._export_snapshot = saved_export_snapshot
+                self._export_request_pending = saved_request_pending
+                self._export_consumed = False
+                self.scan_summary_label.setText(saved_scan_summary)
+            self._update_download_button()
             if hasattr(self, "scan_button") and not self.is_busy():
                 self._update_scan_button()
         elif current_id:
@@ -998,7 +1187,7 @@ class ChannelPage(QWidget):
             # Clear both the selected chat and the previously scanned export.
             self._selected_chat = None
             self._prepare_topics_for_chat()
-            self._clear_scan()
+            self._invalidate_scan("搜尋或篩選已隱藏目前來源，請重新選擇並掃描。")
             if hasattr(self, "scan_button") and not self.is_busy():
                 self._update_scan_button(False)
             self.chat_hint.setText(
@@ -1011,23 +1200,24 @@ class ChannelPage(QWidget):
         elif self._chats:
             self.chat_hint.setText(f"共找到 {self.chat_list.count()} 個可選對話。")
         self.chat_list.blockSignals(False)
+        self._update_current_source_label()
+        self._update_scan_button()
 
     def _chat_selected(self, current: Optional[QListWidgetItem], _previous: Optional[QListWidgetItem]) -> None:
         # A topic result belongs to the chat that started it.  In normal use
         # the list is disabled while loading, but invalidating here also
         # protects programmatic selection and rapid filter changes.
-        self._generation += 1
-        self._pending_operation = None
-        worker = self._worker
-        if worker is not None:
-            worker.cancel()
+        self._invalidate_scan("已更換來源，請重新掃描。")
         self._selected_chat = current.data(Qt.UserRole) if current is not None else None
-        self._clear_scan()
         self._prepare_topics_for_chat()
+        self._update_current_source_label()
         if not self.is_busy():
             self._update_scan_button()
         if self._selected_chat is not None:
-            self.chat_hint.setText(f"已選：{_chat_title(self._selected_chat)}（{_kind_label(_chat_kind(self._selected_chat))}）")
+            self.chat_hint.setText(
+                f"已選：{_chat_title(self._selected_chat)}（{_kind_label(_chat_kind(self._selected_chat))}）；"
+                "請先掃描符合媒體數。"
+            )
 
     def _current_account(self) -> Any:
         account_id = self.active_account_id()
@@ -1048,6 +1238,179 @@ class ChannelPage(QWidget):
             )
             if checkbox.isChecked()
         ]
+
+    def _source_descriptor(
+        self,
+        chat: Any = None,
+        topic: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        chat = self._selected_chat if chat is None else chat
+        if chat is None:
+            return "尚未選擇頻道或群組"
+        title = _chat_title(chat)
+        identity = _chat_ref(chat) or _chat_id(chat) or "無識別碼"
+        username = _chat_username(chat)
+        identity_text = f"{identity} · @{username}" if username else identity
+        value = f"{title}（{_kind_label(_chat_kind(chat))}） · {identity_text}"
+        if _chat_is_forum(chat):
+            if topic is None:
+                value += " · 話題：尚未選擇"
+            elif topic.get("all"):
+                value += " · 話題：全部主題"
+            else:
+                value += f" · 話題：{_text(topic.get('title'), '未命名主題')} · ID {_text(topic.get('id'))}"
+        return value
+
+    def _current_export_snapshot(self) -> Optional[dict[str, Any]]:
+        """Return the inputs that make an export manifest specific."""
+
+        if self._selected_chat is None:
+            return None
+        topic = self._selected_topic
+        return {
+            "account_id": self.active_account_id(),
+            "chat_ref": _chat_ref(self._selected_chat),
+            "chat_id": _chat_id(self._selected_chat),
+            "chat_title": _chat_title(self._selected_chat),
+            "source_label": self._source_descriptor(self._selected_chat, topic),
+            "is_forum": _chat_is_forum(self._selected_chat),
+            "topic_id": _text(topic.get("id")) if topic is not None else "",
+            "topic_title": _text(topic.get("title")) if topic is not None else "",
+            "topic_all": bool(topic and topic.get("all")),
+            "start_date": _date_text(self.start_date.date()),
+            "end_date": _date_text(self.end_date.date()),
+            "media_types": tuple(self._media_types()),
+        }
+
+    def _update_current_source_label(self) -> None:
+        if not hasattr(self, "current_source_label"):
+            return
+        if self._selected_chat is None:
+            self.current_source_label.setText("尚未選擇頻道或群組。")
+            if hasattr(self, "current_source_identity_label"):
+                self.current_source_identity_label.setText("識別：尚未選擇")
+            return
+        title = _chat_title(self._selected_chat)
+        kind = _kind_label(_chat_kind(self._selected_chat))
+        username = _chat_username(self._selected_chat)
+        prominent = f"目前來源：{title}（{kind}）"
+        if username:
+            prominent += f" · @{username}"
+        self.current_source_label.setText(prominent)
+        if hasattr(self, "current_source_identity_label"):
+            identity = _chat_ref(self._selected_chat) or _chat_id(self._selected_chat) or "無識別碼"
+            detail = f"識別：{identity}"
+            if _chat_is_forum(self._selected_chat):
+                topic = self._selected_topic
+                if topic is None:
+                    detail += " · 話題：尚未選擇"
+                elif topic.get("all"):
+                    detail += " · 話題：全部主題"
+                else:
+                    detail += f" · 話題：{_text(topic.get('title'), '未命名主題')} · ID {_text(topic.get('id'))}"
+            self.current_source_identity_label.setText(detail)
+
+    def _set_scan_summary(self, text: str) -> None:
+        if hasattr(self, "scan_summary_label"):
+            self.scan_summary_label.setText(_text(text))
+
+    def _snapshot_display_source(self, snapshot: Mapping[str, Any]) -> str:
+        """Return a compact, human-readable source for the scan summary.
+
+        The context card already displays the full ref/username.  Repeating it
+        in the result line makes long channel identities push the action area
+        below the first viewport, so summaries use the title and explicit
+        forum topic only.
+        """
+
+        title = _text(snapshot.get("chat_title")).strip() or "頻道或群組"
+        if snapshot.get("is_forum"):
+            topic = (
+                "全部主題"
+                if snapshot.get("topic_all")
+                else _text(snapshot.get("topic_title")).strip() or "指定主題"
+            )
+            return f"{title} · 話題：{topic}"
+        return title
+
+    def _format_scan_summary(self, count: int, total_bytes: int = 0) -> str:
+        snapshot = self._export_snapshot or self._operation_snapshot or self._current_export_snapshot()
+        if snapshot is None:
+            return f"掃描結果：{count} 個媒體。"
+        media = "、".join(_MEDIA_LABELS.get(item, item) for item in snapshot.get("media_types", ())) or "未選類型"
+        size = f"，約 {_format_bytes(total_bytes)}" if total_bytes > 0 else ""
+        source = self._snapshot_display_source(snapshot)
+        return (
+            f"掃描結果：{source} · {snapshot.get('start_date', '')}～"
+            f"{snapshot.get('end_date', '')} · {media} · 符合 {count} 個媒體{size}。"
+        )
+
+    def _manifest_matches_current(self) -> bool:
+        snapshot = self._export_snapshot
+        current = self._current_export_snapshot()
+        if snapshot is None or current is None:
+            return False
+        return bool(
+            self._export_path
+            and self._export_count > 0
+            and self._snapshots_match(snapshot, current)
+            and not self._export_request_pending
+            and not self._export_consumed
+        )
+
+    @staticmethod
+    def _snapshots_match(expected: Mapping[str, Any], current: Mapping[str, Any]) -> bool:
+        """Compare only stable inputs, allowing refreshed display metadata."""
+
+        keys = (
+            "account_id", "chat_ref", "chat_id", "is_forum", "topic_id", "topic_all",
+            "start_date", "end_date", "media_types",
+        )
+        return all(expected.get(key) == current.get(key) for key in keys)
+
+    def _update_download_button(self) -> None:
+        if hasattr(self, "download_button"):
+            self.download_button.setEnabled(self._manifest_matches_current() and not self.is_busy())
+
+    def download_queued(self, title: str, count: int) -> bool:
+        """Acknowledge a job accepted by MainWindow's durable queue.
+
+        The page emits ``download_requested`` first but never reports success
+        from that emission alone.  A late acknowledgement after the source
+        was cleared is ignored by the pending-request guard.
+        """
+
+        if not self._export_request_pending:
+            return False
+        self._export_request_pending = False
+        self._export_consumed = True
+        self._export_path = ""
+        self._export_count = 0
+        self._export_bytes = 0
+        self._export_snapshot = None
+        self.download_button.setEnabled(False)
+        self.download_button.setText("已加入佇列")
+        clean_title = _text(title).strip() or "頻道下載"
+        try:
+            safe_count = max(0, int(count or 0))
+        except (TypeError, ValueError):
+            safe_count = 0
+        self._set_scan_summary(f"已加入下載佇列：{clean_title} · 共 {safe_count} 個媒體。")
+        self._set_status(f"已加入下載佇列：{safe_count} 個媒體。")
+        return True
+
+    def download_rejected(self, message: str = "") -> bool:
+        """Release a pending manifest when MainWindow rejected queueing it."""
+
+        if not self._export_request_pending:
+            return False
+        self._export_request_pending = False
+        self._export_consumed = False
+        self._set_status(f"加入下載佇列失敗：{_safe_message(message) or '請稍後重試。'}")
+        self.download_button.setText("開始下載")
+        self._set_scan_summary("掃描結果仍可重試加入下載佇列。")
+        self._update_download_button()
+        return True
 
     def _scan_clicked(self) -> None:
         account_id = self.active_account_id()
@@ -1081,7 +1444,17 @@ class ChannelPage(QWidget):
         if not callable(getattr(self._runner, "start_export", None)):
             self._set_status("目前後端尚未提供頻道掃描功能。")
             return
+        snapshot = self._current_export_snapshot()
+        if snapshot is None:
+            self._set_status("請先從清單選擇一個頻道或群組。")
+            return
         self._clear_scan()
+        self._operation_snapshot = snapshot
+        self._set_scan_summary(
+            f"正在掃描：{self._snapshot_display_source(snapshot)} · "
+            f"{snapshot['start_date']}～{snapshot['end_date']} · "
+            f"{'、'.join(_MEDIA_LABELS.get(item, item) for item in snapshot['media_types'])}"
+        )
         self._set_status("正在掃描符合條件的媒體…")
         kwargs = {"proxy": self._proxy} if self._proxy else {}
         args = (
@@ -1101,21 +1474,33 @@ class ChannelPage(QWidget):
         self._start_operation("export", "start_export", args, kwargs)
 
     def _download_clicked(self) -> None:
+        if self._export_request_pending:
+            self._set_status("正在加入下載佇列，請稍候。")
+            return
+        if self._export_consumed:
+            self._set_status("這份掃描結果已加入佇列；如要下載其他條件，請重新掃描。")
+            return
         if not self._export_path or self._export_count <= 0:
             self._set_status("請先掃描，確認有符合條件的媒體。")
             return
+        if not self._manifest_matches_current():
+            self._set_scan_summary("下載條件已變更或掃描結果已失效，請重新掃描。")
+            self._set_status("下載條件已變更，請先重新掃描。")
+            self._update_download_button()
+            return
+        snapshot = dict(self._export_snapshot or {})
         folder = self.folder_edit.text().strip()
         if not folder:
             self._set_status("請先選擇下載資料夾。")
             return
-        chat_title = _chat_title(self._selected_chat)
-        topic = self._selected_topic
+        chat_title = _text(snapshot.get("chat_title"), _chat_title(self._selected_chat))
+        topic_title = _text(snapshot.get("topic_title"))
         topic_suffix = ""
-        if _chat_is_forum(self._selected_chat) and topic is not None:
-            topic_suffix = f" · {topic.get('title', '全部主題')}"
-        title = f"{chat_title}{topic_suffix} · {_date_text(self.start_date.date())}～{_date_text(self.end_date.date())}"
+        if bool(snapshot.get("is_forum")):
+            topic_suffix = f" · {topic_title or '全部主題'}"
+        title = f"{chat_title}{topic_suffix} · {snapshot.get('start_date', '')}～{snapshot.get('end_date', '')}"
         options = {
-            "account_id": self.active_account_id(),
+            "account_id": snapshot.get("account_id", self.active_account_id()),
             "output_dir": folder,
             "files": [self._export_path],
             "title": title,
@@ -1128,10 +1513,16 @@ class ChannelPage(QWidget):
             # Lets the queue show whole-job progress and remaining time.
             "expected_files": self._export_count,
             "expected_bytes": self._export_bytes,
+            "media_types": list(snapshot.get("media_types", ())),
         }
-        self.download_requested.emit([], options)
-        self._set_status(f"已加入下載佇列：{self._export_count} 個媒體。")
+        # The receiver must explicitly acknowledge acceptance.  This keeps a
+        # failed validation from looking like a successful enqueue and also
+        # prevents a second click from submitting the same manifest twice.
+        self._export_request_pending = True
+        self._export_consumed = True
         self.download_button.setEnabled(False)
+        self._set_status("正在加入下載佇列…")
+        self.download_requested.emit([], options)
 
     # ------------------------------------------------------------------
     # Backend operation lifecycle
@@ -1222,6 +1613,9 @@ class ChannelPage(QWidget):
             return
         self.cancel_button.setVisible(False)
         self._set_controls_enabled(True)
+        if self._cancel_status:
+            self._set_status(self._cancel_status)
+            self._cancel_status = ""
 
     def _closing_parent_window(self) -> bool:
         parent = self.window()
@@ -1307,26 +1701,52 @@ class ChannelPage(QWidget):
             else:
                 self._set_topic_error("後端回傳的論壇主題格式無法辨識。")
         else:
+            snapshot = self._operation_snapshot
+            current_snapshot = self._current_export_snapshot()
+            if (
+                snapshot is None
+                or current_snapshot is None
+                or not self._snapshots_match(snapshot, current_snapshot)
+            ):
+                # A programmatic form change can happen before a queued Qt
+                # result is delivered.  Never let that result restore a
+                # manifest for a different source or date range.
+                self._operation_snapshot = None
+                self._clear_scan(keep_status=True)
+                self._set_scan_summary("掃描結果已失效，請依目前條件重新掃描。")
+                self._set_status("掃描結果已失效，請依目前條件重新掃描。")
+                return
             path, count = self._normalise_export(data)
             total_bytes = self._export_total_bytes(data)
+            self._operation_snapshot = None
+            self._export_snapshot = dict(snapshot)
+            self._export_consumed = False
+            self._export_request_pending = False
             if count <= 0:
                 self._export_path = ""
                 self._export_count = 0
                 self._export_bytes = 0
-                self.download_button.setEnabled(False)
+                self._update_download_button()
+                self._set_scan_summary(self._format_scan_summary(0, total_bytes))
                 self._set_status("掃描完成：符合條件的媒體為 0 個，請調整日期或類型。")
             elif not path:
+                self._export_path = ""
+                self._export_count = 0
+                self._export_bytes = 0
+                self._update_download_button()
+                self._set_scan_summary("掃描完成但找不到匯出檔案，請重新掃描。")
                 self._set_status("掃描完成但找不到匯出檔案，請重試。")
             else:
                 self._export_path = path
                 self._export_count = count
                 self._export_bytes = total_bytes
-                self.download_button.setEnabled(True)
+                self._update_download_button()
                 size = f"，約 {_format_bytes(total_bytes)}" if total_bytes > 0 else ""
                 status = f"掃描完成：共 {count} 個媒體{size}，可以開始下載。"
                 free = _free_bytes(self.folder_edit.text().strip())
                 if total_bytes > 0 and free is not None and free < total_bytes:
                     status += f"\n注意：下載資料夾所在磁碟只剩 {_format_bytes(free)}，空間可能不足。"
+                self._set_scan_summary(self._format_scan_summary(count, total_bytes))
                 self._set_status(status)
 
     @Slot(int, str)
@@ -1335,8 +1755,10 @@ class ChannelPage(QWidget):
             return
         if self._operation_kind == "topics":
             self._set_topic_error(message)
+        self._operation_snapshot = None
         self._set_status(f"操作失敗：{_safe_message(message) or '請稍後重試。'}")
         self._clear_scan(keep_status=True)
+        self._set_scan_summary("掃描或主題讀取未完成，請依目前條件重試。")
 
     @Slot(int)
     def _operation_canceled(self, token: int) -> None:
@@ -1344,6 +1766,9 @@ class ChannelPage(QWidget):
             return
         if self._operation_kind == "topics":
             self._set_topic_error("主題讀取已取消。")
+        self._operation_snapshot = None
+        self._clear_scan(keep_status=True)
+        self._set_scan_summary("操作已取消；請確認來源與條件後重試。")
         self._set_status("操作已取消。")
 
     @staticmethod
@@ -1404,6 +1829,7 @@ class ChannelPage(QWidget):
         self.account_combo.setEnabled(enabled)
         self.search_edit.setEnabled(enabled)
         self.type_combo.setEnabled(enabled)
+        self.clear_search_button.setEnabled(enabled)
         self.chat_list.setEnabled(enabled)
         self._update_scan_button(enabled)
         topic_enabled = bool(enabled and self.topic_panel.isVisible() and not self._topics_loading)
@@ -1417,13 +1843,16 @@ class ChannelPage(QWidget):
         self.end_date.setEnabled(enabled)
         for button in self._date_buttons:
             button.setEnabled(enabled)
-        if not enabled:
-            self.download_button.setEnabled(False)
+        self.change_source_button.setEnabled(enabled)
+        self.view_queue_button.setEnabled(True)
+        if enabled:
+            self._update_download_button()
         else:
-            self.download_button.setEnabled(bool(self._export_path and self._export_count > 0))
+            self.download_button.setEnabled(False)
 
     def _set_status(self, text: str) -> None:
-        self.status_label.setText(_text(text))
+        if hasattr(self, "status_label"):
+            self.status_label.setText(_text(text))
 
     def _clear_chat_selection(self) -> None:
         self._chats = []
@@ -1441,6 +1870,9 @@ class ChannelPage(QWidget):
         self.topic_hint.setText("論壇群組需要先選擇主題，或明確選擇「全部主題」。")
         self.chat_hint.setText("請按「更新清單」載入目前帳號可存取的頻道與群組。")
         self._clear_scan()
+        self._operation_snapshot = None
+        self._update_current_source_label()
+        self._set_scan_summary("尚未掃描；選好來源、日期與媒體類型後開始掃描。")
         if hasattr(self, "scan_button"):
             self.scan_button.setEnabled(False)
 
@@ -1448,8 +1880,12 @@ class ChannelPage(QWidget):
         self._export_path = ""
         self._export_count = 0
         self._export_bytes = 0
+        self._export_snapshot = None
+        self._export_request_pending = False
+        self._export_consumed = False
         if hasattr(self, "download_button"):
             self.download_button.setEnabled(False)
+            self.download_button.setText("開始下載")
         if not keep_status and hasattr(self, "status_label"):
             # Avoid replacing useful account/chats status while the page is
             # being populated; callers can set a more specific message.
