@@ -66,6 +66,7 @@ from PySide6.QtGui import (
     QDesktopServices,
     QFont,
     QFontDatabase,
+    QGuiApplication,
     QIcon,
     QImage,
     QKeySequence,
@@ -89,10 +90,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLayout,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -102,6 +105,7 @@ from PySide6.QtWidgets import (
     QSpacerItem,
     QSpinBox,
     QStackedWidget,
+    QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
     QTextBrowser,
@@ -128,6 +132,10 @@ APP_NAME = "tdl 繁中下載器"
 APP_ORG = "tdl"
 VERSION_TEXT = f"桌面版 {VERSION}"
 PAGE_NAMES = ("頻道下載", "下載中心", "上傳與轉傳", "帳號管理", "下載紀錄", "設定與說明")
+# A running job that reports nothing for this long gets an explanation.
+STALL_SECONDS = 45
+# Window size, position and last page, kept beside the other app data.
+UI_STATE_FILE = "ui-state.json"
 
 BG = "#f4f7fb"
 CARD = "#ffffff"
@@ -275,6 +283,20 @@ class HistoryInfo:
     detail: str = ""
     # "12 個檔案 · 3.4 GB" for a completed job; empty while unknown.
     summary: str = ""
+    folders: list[str] = field(default_factory=list)
+
+    @property
+    def open_path(self) -> str:
+        """Where 「開啟資料夾」 should go for this record."""
+
+        if len(self.folders) == 1:
+            return self.folders[0]
+        if self.folders:
+            try:
+                return os.path.commonpath(self.folders)
+            except ValueError:
+                pass
+        return self.path
 
     @classmethod
     def from_value(cls, value: Any, index: int = 0) -> "HistoryInfo":
@@ -314,6 +336,7 @@ class HistoryInfo:
             path=_safe_str(_extract(value, "path", "file_path", "directory", default="")),
             detail=_safe_str(_extract(value, "detail", "error", "message", default="")),
             summary=summary,
+            folders=[str(value) for value in (_extract(value, "folders", default=[]) or []) if value],
         )
 
 
@@ -329,6 +352,8 @@ class DownloadJob:
     total: int = 0
     speed: str = ""
     error: str = ""
+    # Redacted diagnostic shown behind 「查看原因」.
+    error_detail: str = field(default="", repr=False)
     result_path: str = ""
     account_id: str = ""
     links: list[str] = field(default_factory=list)
@@ -458,6 +483,10 @@ class BackendBridge:
     def clear_finished_jobs(self) -> list[str]:
         self._require_backend()
         return list(self.store.clear_finished_jobs())
+
+    def remove_history(self, job_ids: Sequence[str]) -> list[str]:
+        self._require_backend()
+        return list(self.store.remove_history_items(job_ids))
 
     def _run_account_operation(self, start: Callable[[], Any], fallback: str) -> Any:
         """Wait for one short account operation; raise its translated error."""
@@ -603,7 +632,11 @@ class BackendBridge:
         event_callback: Callable[[Any], None],
     ) -> Any:
         self._require_backend()
-        label = _safe_str(payload.get("label"), "Telegram 帳號")
+        # An empty name is replaced by the Telegram name after login.  The
+        # phone number is never used as a name: it would be saved in
+        # accounts.json and shown on every page.
+        chosen_label = _safe_str(payload.get("label")).strip()
+        label = chosen_label or _safe_str(getattr(self.module, "DEFAULT_ACCOUNT_NAME", ""), "Telegram 帳號")
         account_id = _safe_str(payload.get("account_id"))
         created = False
         if not account_id:
@@ -670,6 +703,14 @@ class BackendBridge:
                 except Exception:
                     pass
             raise RuntimeError(_safe_str(getattr(result, "error", "登入核心未完成工作。")))
+        if created and not chosen_label:
+            try:
+                saved = self.store.get_account(account_id)
+                self.store.update_account(account_id, name=self.store.friendly_account_name(saved))
+            except Exception:
+                # The login itself succeeded; a generic name is still usable
+                # and can be changed later.
+                pass
         return {"authenticated": True, "account_id": account_id}
 
     def respond_login(self, value: str) -> bool:
@@ -947,6 +988,8 @@ def _preference_values(value: Any) -> dict[str, Any]:
         "download_folder": _safe_str(_extract(value, "download_dir", "download_folder", default="")),
         "proxy": _safe_str(_extract(value, "proxy", default="")),
         "concurrency": int(_extract(value, "concurrency", default=2) or 2),
+        "group": bool(_extract(value, "group", default=True)),
+        "skip_same": bool(_extract(value, "skip_same", default=True)),
         "template": _safe_str(_extract(value, "template", default="")),
         "include_ext": _safe_str(_extract(value, "include_ext", default="")),
         "exclude_ext": _safe_str(_extract(value, "exclude_ext", default="")),
@@ -993,6 +1036,224 @@ class Pill(QLabel):
         self.style().polish(self)
 
 
+def _nav_icon(kind: str) -> QIcon:
+    """Draw one sidebar glyph so every page has its own recognisable icon.
+
+    The Qt standard icons gave two pages the same folder.  Painting simple
+    line glyphs needs no font or image file and follows the theme colours:
+    muted when idle, the primary colour on the current page.
+    """
+
+    icon = QIcon()
+    for color, state in ((MUTED, QIcon.Off), (PRIMARY_DARK, QIcon.On)):
+        pixmap = QPixmap(40, 40)
+        pixmap.setDevicePixelRatio(2.0)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        pen = QPen(QColor(color), 1.7, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        if kind == "channel":
+            # A list of chats: three rows with a leading dot.
+            for y in (5.5, 10.0, 14.5):
+                painter.drawEllipse(QRect(3, int(y) - 1, 2, 2))
+                painter.drawLine(8, int(y), 17, int(y))
+        elif kind == "download":
+            painter.drawLine(10, 3, 10, 12)
+            painter.drawLine(6, 8, 10, 12)
+            painter.drawLine(14, 8, 10, 12)
+            painter.drawLine(4, 16, 16, 16)
+        elif kind == "transfer":
+            painter.drawLine(10, 13, 10, 4)
+            painter.drawLine(6, 8, 10, 4)
+            painter.drawLine(14, 8, 10, 4)
+            painter.drawLine(4, 16, 16, 16)
+        elif kind == "account":
+            painter.drawEllipse(QRect(7, 3, 6, 6))
+            path = QPainterPath()
+            path.moveTo(4, 17)
+            path.cubicTo(4, 11, 16, 11, 16, 17)
+            painter.drawPath(path)
+        elif kind == "history":
+            painter.drawEllipse(QRect(3, 3, 14, 14))
+            painter.drawLine(10, 6, 10, 10)
+            painter.drawLine(10, 10, 13, 12)
+        else:  # settings: three sliders
+            for y, knob in ((5, 7), (10, 13), (15, 9)):
+                painter.drawLine(3, y, 17, y)
+                painter.setBrush(QColor("#ffffff"))
+                painter.drawEllipse(QRect(knob - 2, y - 2, 4, 4))
+                painter.setBrush(Qt.NoBrush)
+        painter.end()
+        icon.addPixmap(pixmap, QIcon.Normal, state)
+        icon.addPixmap(pixmap, QIcon.Active, state)
+    return icon
+
+
+class MessageBar(QFrame):
+    """A one-line message across the top of the window.
+
+    Used instead of a modal dialog for things that happen in the background
+    (a download finished or failed, links on the clipboard) and for the
+    account reminder.  Info messages hide themselves after a while; errors
+    and reminders stay until the user acts or closes them.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None, *, closable: bool = True) -> None:
+        super().__init__(parent)
+        self.setObjectName("MessageBar")
+        self.setProperty("tone", "info")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(28, 8, 22, 8)
+        layout.setSpacing(10)
+        self.label = QLabel()
+        self.label.setObjectName("MessageText")
+        self.label.setWordWrap(True)
+        self.label.setTextFormat(Qt.PlainText)
+        layout.addWidget(self.label, 1)
+        self.action_button = QPushButton()
+        self.action_button.setObjectName("MessageAction")
+        self.action_button.clicked.connect(self._run_action)
+        layout.addWidget(self.action_button)
+        self.close_button = QToolButton()
+        self.close_button.setObjectName("MessageClose")
+        self.close_button.setText("✕")
+        self.close_button.setToolTip("關閉")
+        self.close_button.clicked.connect(self.dismiss)
+        self.close_button.setVisible(closable)
+        layout.addWidget(self.close_button)
+        self._action: Optional[Callable[[], None]] = None
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.dismiss)
+        self.hide()
+
+    def show_message(
+        self,
+        text: str,
+        *,
+        tone: str = "info",
+        action_text: str = "",
+        action: Optional[Callable[[], None]] = None,
+        timeout_ms: int = 0,
+    ) -> None:
+        self.label.setText(text)
+        self.label.setToolTip(text)
+        if self.property("tone") != tone:
+            self.setProperty("tone", tone)
+            for widget in (self, self.label):
+                widget.style().unpolish(widget)
+                widget.style().polish(widget)
+        self._action = action
+        self.action_button.setText(action_text)
+        self.action_button.setVisible(bool(action_text and action))
+        self._timer.stop()
+        if timeout_ms > 0:
+            self._timer.start(timeout_ms)
+        self.show()
+
+    def dismiss(self) -> None:
+        self._timer.stop()
+        self._action = None
+        self.hide()
+
+    def _run_action(self) -> None:
+        action = self._action
+        self.dismiss()
+        if action is not None:
+            action()
+
+
+class _TaskbarProgress:
+    """Progress on the window's taskbar button (Windows ITaskbarList3).
+
+    Talks to the shell through ctypes, so there is no extra dependency.  Any
+    failure leaves the object inert: the progress is a convenience and must
+    never stop the application.
+    """
+
+    NOPROGRESS = 0
+    INDETERMINATE = 1
+    NORMAL = 2
+    ERROR = 4
+    PAUSED = 8
+
+    def __init__(self) -> None:
+        self._this: Any = None
+        self._set_value: Any = None
+        self._set_state: Any = None
+        self._release: Any = None
+        self._state: Optional[int] = None
+        self._value: Optional[tuple[int, int]] = None
+        if os.name != "nt":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class _Guid(ctypes.Structure):
+                _fields_ = [
+                    ("data1", ctypes.c_ulong),
+                    ("data2", ctypes.c_ushort),
+                    ("data3", ctypes.c_ushort),
+                    ("data4", ctypes.c_ubyte * 8),
+                ]
+
+            ole32 = ctypes.windll.ole32
+            # Qt has already initialised COM on the GUI thread; this call
+            # then only adds a reference (S_FALSE), which is fine.
+            ole32.CoInitialize(None)
+            clsid, iid = _Guid(), _Guid()
+            ole32.CLSIDFromString(ctypes.c_wchar_p("{56FDF344-FD6D-11d0-958A-006097C9A090}"), ctypes.byref(clsid))
+            ole32.CLSIDFromString(ctypes.c_wchar_p("{EA1AFB91-9E28-4B86-90E9-9E9F8A5EEFAF}"), ctypes.byref(iid))
+            this = ctypes.c_void_p()
+            if ole32.CoCreateInstance(ctypes.byref(clsid), None, 1, ctypes.byref(iid), ctypes.byref(this)) != 0 or not this:
+                return
+            vtable = ctypes.cast(this, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+            hresult = ctypes.c_long
+            # ITaskbarList3 vtable: IUnknown 0-2, ITaskbarList 3-7 (HrInit
+            # is 3), ITaskbarList2 8, then SetProgressValue 9 and
+            # SetProgressState 10.
+            hr_init = ctypes.WINFUNCTYPE(hresult, ctypes.c_void_p)(vtable[3])
+            if hr_init(this) != 0:
+                ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtable[2])(this)
+                return
+            self._this = this
+            self._release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtable[2])
+            self._set_value = ctypes.WINFUNCTYPE(
+                hresult, ctypes.c_void_p, wintypes.HWND, ctypes.c_ulonglong, ctypes.c_ulonglong
+            )(vtable[9])
+            self._set_state = ctypes.WINFUNCTYPE(hresult, ctypes.c_void_p, wintypes.HWND, ctypes.c_int)(vtable[10])
+        except Exception:
+            self._this = None
+
+    @property
+    def available(self) -> bool:
+        return self._this is not None
+
+    def update(self, hwnd: int, state: int, done: int = 0, total: int = 0) -> None:
+        if self._this is None or not hwnd:
+            return
+        try:
+            if state != self._state:
+                self._set_state(self._this, hwnd, state)
+                self._state = state
+            if state != self.NOPROGRESS and total > 0 and (done, total) != self._value:
+                self._set_value(self._this, hwnd, max(0, min(done, total)), total)
+                self._value = (done, total)
+        except Exception:
+            self._this = None
+
+    def close(self) -> None:
+        if self._this is not None and self._release is not None:
+            try:
+                self._release(self._this)
+            except Exception:
+                pass
+        self._this = None
+
+
 class SidebarButton(QPushButton):
     def __init__(self, icon: QIcon | str, text: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -1016,6 +1277,7 @@ class QueueRow(Card):
     cancel_requested = Signal(str)
     retry_requested = Signal(str)
     open_requested = Signal(str)
+    detail_requested = Signal(str)
 
     def __init__(self, job: DownloadJob, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -1040,6 +1302,11 @@ class QueueRow(Card):
         self._status = job.status
         self._speed = 0.0
         self._speed_sample: Optional[tuple[float, int]] = None
+        # Folders the core reported writing into, in first-seen order.
+        self._folders: list[str] = []
+        # A line that replaces the size/speed text: why a job failed, or that
+        # it has stopped moving (see ``set_note``).
+        self._note = ""
         self.title_label = QLabel(job.title)
         self.title_label.setObjectName("QueueTitle")
         self.title_label.setWordWrap(False)
@@ -1074,10 +1341,14 @@ class QueueRow(Card):
         self.cancel_button = QPushButton("取消")
         self.retry_button = QPushButton("重試")
         self.open_button = QPushButton("開啟資料夾")
-        for button in (self.cancel_button, self.retry_button, self.open_button):
+        self.open_button.setToolTip("開啟這個工作實際存放檔案的資料夾")
+        self.detail_button = QPushButton("查看原因")
+        self.detail_button.setToolTip("顯示失敗原因、建議的處理方式與診斷細節")
+        for button in (self.cancel_button, self.retry_button, self.open_button, self.detail_button):
             button.setCursor(Qt.PointingHandCursor)
         self.retry_button.setVisible(False)
         self.open_button.setVisible(False)
+        self.detail_button.setVisible(False)
 
         left = QVBoxLayout()
         left.setSpacing(4)
@@ -1113,6 +1384,7 @@ class QueueRow(Card):
         actions.setSpacing(6)
         actions.addWidget(self.cancel_button)
         actions.addWidget(self.retry_button)
+        actions.addWidget(self.detail_button)
         actions.addWidget(self.open_button)
         right.addLayout(actions)
         # Keep the pill and buttons at the top once file rows make the row
@@ -1126,12 +1398,24 @@ class QueueRow(Card):
         layout.addLayout(right, 0)
         self.cancel_button.clicked.connect(lambda: self.cancel_requested.emit(self.job_id))
         self.retry_button.clicked.connect(lambda: self.retry_requested.emit(self.job_id))
-        self.open_button.clicked.connect(lambda: self.open_requested.emit(self.output_dir))
+        self.open_button.clicked.connect(lambda: self.open_requested.emit(self.open_target()))
+        self.detail_button.clicked.connect(lambda: self.detail_requested.emit(self.job_id))
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        # Keep the three-line left column and two-line action column at a
-        # predictable height even when the core changes the current filename.
-        self.setMinimumHeight(96)
+        # The three-line left column and two-line action column never go
+        # below 96px (see ``sizeHint``).  This is deliberately not
+        # setMinimumHeight: an explicit minimum let the queue's scroll area
+        # squeeze rows with file lists down to 96px, cutting files off.
         self.set_job(job)
+
+    _MIN_HEIGHT = 96
+
+    def sizeHint(self) -> QSize:  # type: ignore[override]
+        hint = super().sizeHint()
+        return QSize(hint.width(), max(hint.height(), self._MIN_HEIGHT))
+
+    def minimumSizeHint(self) -> QSize:  # type: ignore[override]
+        hint = super().minimumSizeHint()
+        return QSize(hint.width(), max(hint.height(), self._MIN_HEIGHT))
 
     def set_job(self, job: DownloadJob) -> None:
         """Update the row while keeping a stable per-file presentation.
@@ -1148,8 +1432,12 @@ class QueueRow(Card):
         # A link is worth showing; a channel or JSON job would only show the
         # path of an internal manifest, so name the destination instead.
         subtitle = job.url if job.links or not job.files else f"下載到 {job.output_dir}"
-        self.url_label.setText(subtitle)
-        self.url_label.setToolTip(subtitle)
+        self._subtitle = subtitle
+        if not (self._note and not self._has_file_progress):
+            self.url_label.setText(subtitle)
+            self.url_label.setToolTip(subtitle)
+        for folder in getattr(job, "folders", None) or []:
+            self._remember_folder(folder)
         self._expected_files = int(getattr(job, "expected_files", 0) or 0)
         self._expected_bytes = int(getattr(job, "expected_bytes", 0) or 0)
         self._status = job.status
@@ -1197,6 +1485,7 @@ class QueueRow(Card):
             "percent": cls._number(number),
             "current": data.get("current", data.get("transferred")),
             "total": data.get("total", data.get("size")),
+            "path": str(data.get("path") or ""),
         }
 
     @classmethod
@@ -1294,6 +1583,8 @@ class QueueRow(Card):
             row = (bar, filename, detail)
             self._file_rows[identifier] = row
         bar, filename, detail = row
+        if item.get("path"):
+            self._remember_folder(item["path"])
         if filename.text() != item["filename"]:
             filename.setText(item["filename"])
             filename.setToolTip(item["filename"])
@@ -1372,10 +1663,62 @@ class QueueRow(Card):
             remaining = total_bytes - self._bytes_done
             if self._expected_bytes > 0 and remaining > 0:
                 parts.append(f"剩餘約 {_format_duration(remaining / self._speed)}")
-        text = " · ".join(parts)
+        text = self._note or " · ".join(parts)
         if self.stats.text() != text:
             self.stats.setText(text)
             self.stats.setToolTip(text)
+
+    def set_note(self, text: str, *, tone: str = "warning") -> None:
+        """Show a reason (failure, no progress) on a full-width line.
+
+        Rows with file lists use the size/speed line; a link that failed
+        before any file was found uses the line under its title.
+        """
+
+        tone = tone if text else ""
+        if text == self._note and tone == self.property("noteTone"):
+            return
+        self._note = text
+        self.setProperty("noteTone", tone)
+        for label in (self.stats, self.url_label):
+            label.setProperty("tone", tone)
+            label.style().unpolish(label)
+            label.style().polish(label)
+        if self._has_file_progress:
+            self._refresh_summary()
+        else:
+            shown = text or getattr(self, "_subtitle", "")
+            self.url_label.setText(shown)
+            self.url_label.setToolTip(shown)
+
+    def _remember_folder(self, folder: str) -> None:
+        folder = str(folder or "").strip()
+        if folder and folder not in self._folders and len(self._folders) < 20:
+            self._folders.append(folder)
+            self._update_open_button()
+
+    def open_target(self) -> str:
+        """The folder to open: where the files are, not just the root.
+
+        With per-chat folders a job writes below its download folder.  One
+        reported folder is opened directly; several (a JSON list spanning
+        chats) open their common parent.
+        """
+
+        if len(self._folders) == 1:
+            return self._folders[0]
+        if self._folders:
+            try:
+                common = os.path.commonpath(self._folders)
+            except ValueError:
+                common = ""
+            if common:
+                return common
+        return self.output_dir
+
+    def _update_open_button(self) -> None:
+        has_folder = bool(self._folders) or (self._status == "已完成" and bool(self.output_dir))
+        self.open_button.setVisible(has_folder and self._status not in ("等待中", "處理中"))
 
     def overall_percent(self) -> Optional[int]:
         """Whole-job percentage, known only when a scan supplied the size."""
@@ -1407,6 +1750,11 @@ class QueueRow(Card):
             if overall is not None:
                 self.progress.setValue(100 if status == "已完成" else overall)
             self.percent.setText(self.percent.text() or "等待核心回報")
+        elif status == "失敗":
+            # The reason is on the full-width line (``set_note``); this
+            # narrow right-hand label would only show its last few words.
+            self.progress.setVisible(True)
+            self.percent.setText("下載未完成")
         elif progress is None:
             self.progress.setVisible(True)
             self.percent.setText(detail or "等待核心回報")
@@ -1420,7 +1768,9 @@ class QueueRow(Card):
         resumable = status == "已暫停"
         self.retry_button.setText("繼續下載" if resumable else "重試")
         self.retry_button.setVisible(status in ("失敗", "已取消", "待重試", "已暫停"))
-        self.open_button.setVisible(status == "已完成" and bool(self.output_dir))
+        self.detail_button.setVisible(status == "失敗")
+        self._status = status
+        self._update_open_button()
         if self._has_file_progress:
             # The summary text is its own tooltip; see ``_refresh_summary``.
             if detail:
@@ -1431,8 +1781,33 @@ class QueueRow(Card):
             self.percent.setToolTip(detail)
 
 
+def _next_step(message: Any) -> str:
+    """The backend's「what to try next」sentence for an error, if any."""
+
+    for name in ("desktop.backend", "backend"):
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            continue
+        suggest = getattr(module, "suggest_next_step", None)
+        if callable(suggest):
+            try:
+                return _safe_str(suggest(message))
+            except Exception:
+                return ""
+    return ""
+
+
 class ErrorDialog(QDialog):
-    def __init__(self, title: str, message: str, details: str = "", parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        title: str,
+        message: str,
+        details: str = "",
+        parent: Optional[QWidget] = None,
+        *,
+        suggestion: Optional[str] = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
@@ -1442,8 +1817,16 @@ class ErrorDialog(QDialog):
         title_label.setObjectName("DialogTitle")
         text_label = QLabel(message)
         text_label.setWordWrap(True)
+        text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(title_label)
         layout.addWidget(text_label)
+        # Tell the user what to do, not only what went wrong.
+        step = _next_step(message) if suggestion is None else suggestion
+        self.suggestion_label = QLabel(f"建議：{step}" if step else "")
+        self.suggestion_label.setObjectName("SuggestionText")
+        self.suggestion_label.setWordWrap(True)
+        self.suggestion_label.setVisible(bool(step))
+        layout.addWidget(self.suggestion_label)
         self.details = QTextEdit()
         self.details.setReadOnly(True)
         self.details.setPlainText(details)
@@ -1456,12 +1839,20 @@ class ErrorDialog(QDialog):
             show.setCheckable(True)
             show.toggled.connect(self.details.setVisible)
             layout.addWidget(show)
+        self._report = "\n\n".join(part for part in (title, message, f"建議：{step}" if step else "", details) if part)
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        self.copy_button = buttons.addButton("複製錯誤內容", QDialogButtonBox.ActionRole)
+        self.copy_button.setToolTip("複製標題、原因與診斷細節，方便回報問題")
+        self.copy_button.clicked.connect(self._copy_report)
         close_button = buttons.button(QDialogButtonBox.Close)
         if close_button is not None:
             close_button.setText("關閉")
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _copy_report(self) -> None:
+        QGuiApplication.clipboard().setText(self._report)
+        self.copy_button.setText("已複製")
 
 
 def show_error(parent: QWidget, title: str, message: str, details: str = "") -> None:
@@ -1485,7 +1876,7 @@ def ask_remove_account(parent: QWidget, label: str) -> bool:
     box = QMessageBox(parent)
     box.setIcon(QMessageBox.Warning)
     box.setWindowTitle("移除帳號")
-    box.setText(f"確定要移除「{label}」的本機登入工作階段嗎？")
+    box.setText(f"確定要移除「{label}」在這台電腦的登入資料嗎？")
     box.setInformativeText("這不會刪除 Telegram 雲端資料。")
     box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
     yes = box.button(QMessageBox.Yes)
@@ -1555,7 +1946,7 @@ class LoginDialog(QDialog):
         form = QVBoxLayout(self.form_page)
         form.setSpacing(14)
         self.label_edit = QLineEdit()
-        self.label_edit.setPlaceholderText("例如：工作帳號")
+        self.label_edit.setPlaceholderText("選填，例如：工作帳號；留白會使用 Telegram 上的名稱")
         self.phone_edit = QLineEdit()
         self.phone_edit.setPlaceholderText("例如：+886912345678")
         form_layout = QFormLayout()
@@ -1630,10 +2021,10 @@ class LoginDialog(QDialog):
         root.addWidget(self.cancel_button, 0, Qt.AlignRight)
 
     def _start_login(self) -> None:
+        # Left empty, the backend names the account after its Telegram
+        # profile once login succeeds.
         label = self.label_edit.text().strip()
         phone = self.phone_edit.text().strip() if self.code_radio.isChecked() else ""
-        if not label:
-            label = phone or "Telegram 帳號"
         if self.code_radio.isChecked() and not phone:
             show_error(self, "需要手機號碼", "請輸入 Telegram 帳號的手機號碼。")
             self.phone_edit.setFocus()
@@ -1726,7 +2117,7 @@ class LoginDialog(QDialog):
             return
         try:
             if not self.bridge.respond_login(value):
-                self.step_label.setText("登入工作階段已結束，請重新開始登入。")
+                self.step_label.setText("這次登入流程已結束，請重新開始登入。")
                 return
             if self.code_edit.isVisible():
                 self.code_edit.clear()
@@ -1793,8 +2184,66 @@ class LoginDialog(QDialog):
             self.step_label.setText("正在安全取消登入，請稍候…")
 
 
+_MESSAGE_LINK_RE = re.compile(r"(?:https?://)?(?:www\.)?(?:t|telegram)\.me/[^\s<>\"'，、]+", re.IGNORECASE)
+
+
+def extract_message_links(text: Any) -> list[str]:
+    """Find Telegram message links in free text such as the clipboard.
+
+    Channel home pages and invite links are left out: only a link that names
+    a message can be downloaded from the download center.
+    """
+
+    found: list[str] = []
+    for match in _MESSAGE_LINK_RE.findall(_safe_str(text)):
+        link = _normalise_message_url(match.rstrip(".,;:!?)）」』"))
+        if not link or link in found:
+            continue
+        path = [part for part in QUrl(link).path().split("/") if part]
+        if path and path[0].lower() == "s":
+            path = path[1:]
+        # A message link ends in a numeric message id.
+        if len(path) >= 2 and path[-1].isdigit() and not path[0].startswith("+"):
+            found.append(link)
+    return found
+
+
+class _LinkEdit(QTextEdit):
+    """Link box that turns dropped JSON exports into a file request."""
+
+    files_dropped = Signal(list)
+
+    def canInsertFromMimeData(self, source: Any) -> bool:  # type: ignore[override]
+        if source.hasUrls() and self._json_files(source):
+            return True
+        return super().canInsertFromMimeData(source)
+
+    def insertFromMimeData(self, source: Any) -> None:  # type: ignore[override]
+        files = self._json_files(source)
+        if files:
+            self.files_dropped.emit(files)
+            return
+        # Plain text only: a rich paste from a browser would otherwise drag
+        # its formatting into a box that is read as plain lines.
+        if source.hasText():
+            self.insertPlainText(source.text())
+            return
+        super().insertFromMimeData(source)
+
+    @staticmethod
+    def _json_files(source: Any) -> list[str]:
+        if not source.hasUrls():
+            return []
+        return [
+            url.toLocalFile()
+            for url in source.urls()
+            if url.isLocalFile() and url.toLocalFile().lower().endswith(".json")
+        ]
+
+
 class DownloadPage(QWidget):
     download_requested = Signal(list, dict)
+    files_dropped = Signal(list)
     channel_requested = Signal()
     queue_summary_changed = Signal(str)
     account_requested = Signal()
@@ -1805,6 +2254,7 @@ class DownloadPage(QWidget):
     open_requested = Signal(str)
     account_changed = Signal(str)
     clear_requested = Signal()
+    detail_requested = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -1823,139 +2273,21 @@ class DownloadPage(QWidget):
         outer.setContentsMargins(30, 24, 30, 30)
         outer.setSpacing(18)
 
-        hero = Card()
-        hero_layout = QHBoxLayout(hero)
-        hero_layout.setContentsMargins(26, 24, 26, 24)
-        hero_layout.setSpacing(18)
-        text = QVBoxLayout()
-        kicker = QLabel("tdl 繁中下載器")
-        kicker.setObjectName("Kicker")
-        title = QLabel("把 Telegram 檔案，安心收進電腦。")
-        title.setObjectName("HeroTitle")
-        title.setWordWrap(True)
-        desc = QLabel("貼上訊息連結，選好資料夾，剩下的交給下載核心。")
-        desc.setObjectName("HeroDescription")
+        header = QHBoxLayout()
+        header_text = QVBoxLayout()
+        header_text.setSpacing(2)
+        title = QLabel("下載中心")
+        title.setObjectName("PageTitle")
+        desc = QLabel("所有下載都在這裡排隊。關閉程式會先暫停，下次開啟自動接續。")
+        desc.setObjectName("MutedText")
         desc.setWordWrap(True)
-        text.addWidget(kicker)
-        text.addWidget(title)
-        text.addWidget(desc)
-        hero_layout.addLayout(text, 1)
-        badge = QFrame()
-        badge.setObjectName("HeroBadge")
-        badge_layout = QVBoxLayout(badge)
-        badge_layout.setContentsMargins(18, 14, 18, 14)
-        badge_title = QLabel("簡單三步")
-        badge_title.setObjectName("CardTitle")
-        badge_body = QLabel("貼連結  ·  選資料夾  ·  開始下載")
-        badge_body.setObjectName("MutedText")
-        badge_body.setWordWrap(True)
-        badge_layout.addWidget(badge_title)
-        badge_layout.addWidget(badge_body)
-        hero_layout.addWidget(badge, 0, Qt.AlignVCenter)
-        outer.addWidget(hero)
+        header_text.addWidget(title)
+        header_text.addWidget(desc)
+        header.addLayout(header_text, 1)
+        outer.addLayout(header)
 
-        account_card = Card()
-        account_layout = QHBoxLayout(account_card)
-        account_layout.setContentsMargins(20, 16, 20, 16)
-        account_layout.setSpacing(14)
-        self.account_icon = QLabel("●")
-        self.account_icon.setObjectName("AccountDot")
-        account_layout.addWidget(self.account_icon)
-        account_text = QVBoxLayout()
-        account_title = QLabel("使用帳號")
-        account_title.setObjectName("CardTitle")
-        self.account_state = QLabel("尚未選擇帳號")
-        self.account_state.setObjectName("MutedText")
-        account_text.addWidget(account_title)
-        account_text.addWidget(self.account_state)
-        account_layout.addLayout(account_text, 1)
-        self.account_combo = QComboBox()
-        self.account_combo.setMinimumWidth(210)
-        self.account_combo.setObjectName("AccountCombo")
-        self.account_combo.currentIndexChanged.connect(self._account_changed)
-        account_layout.addWidget(self.account_combo)
-        manage_button = QPushButton("管理帳號")
-        manage_button.clicked.connect(self.account_requested.emit)
-        account_layout.addWidget(manage_button)
-        outer.addWidget(account_card)
-
-        input_card = Card()
-        input_layout = QVBoxLayout(input_card)
-        input_layout.setContentsMargins(20, 20, 20, 20)
-        input_layout.setSpacing(12)
-        input_title = QLabel("貼上 Telegram 訊息連結")
-        input_title.setObjectName("CardTitle")
-        input_hint = QLabel("可貼上多行連結，每行一個；支援公開頻道、群組或你有權限的私有訊息。")
-        input_hint.setObjectName("MutedText")
-        self.url_edit = QTextEdit()
-        self.url_edit.setObjectName("UrlEdit")
-        self.url_edit.setPlaceholderText("https://t.me/channel/123\nhttps://t.me/channel/124")
-        self.url_edit.setMinimumHeight(108)
-        folder_line = QHBoxLayout()
-        folder_label = QLabel("下載到")
-        folder_label.setObjectName("FieldLabel")
-        self.folder_edit = QLineEdit()
-        self.folder_edit.setReadOnly(True)
-        self.folder_edit.setObjectName("FolderEdit")
-        folder_button = QPushButton("選擇資料夾")
-        folder_button.clicked.connect(self.choose_folder)
-        folder_line.addWidget(folder_label)
-        folder_line.addWidget(self.folder_edit, 1)
-        folder_line.addWidget(folder_button)
-        action_line = QHBoxLayout()
-        self.input_count = QLabel("尚未加入連結")
-        self.input_count.setObjectName("MutedText")
-        self.url_edit.textChanged.connect(self._update_count)
-        action_line.addWidget(self.input_count)
-        action_line.addStretch(1)
-        self.export_button = QPushButton("匯出 JSON")
-        self.export_button.setToolTip("把目前輸入的連結與選項儲存成 JSON")
-        self.export_button.clicked.connect(self.export_requested.emit)
-        self.import_button = QPushButton("匯入 JSON")
-        self.import_button.setToolTip("從 JSON 清單加入 Telegram 連結")
-        self.import_button.clicked.connect(self.import_requested.emit)
-        action_line.addWidget(self.import_button)
-        action_line.addWidget(self.export_button)
-        self.download_button = QPushButton("開始下載")
-        self.download_button.setObjectName("PrimaryButton")
-        self.download_button.setMinimumSize(140, 42)
-        self.download_button.clicked.connect(self._request_download)
-        action_line.addWidget(self.download_button)
-        input_layout.addWidget(input_title)
-        input_layout.addWidget(input_hint)
-        input_layout.addWidget(self.url_edit)
-        input_layout.addLayout(folder_line)
-        folder_hint = QLabel("新下載會自動放入「群組／頻道名稱」子資料夾。")
-        folder_hint.setObjectName("MutedText")
-        folder_hint.setWordWrap(True)
-        input_layout.addWidget(folder_hint)
-        input_layout.addLayout(action_line)
-        outer.addWidget(input_card)
-
-        advanced = Card()
-        adv_layout = QGridLayout(advanced)
-        adv_layout.setContentsMargins(20, 16, 20, 16)
-        adv_layout.setHorizontalSpacing(24)
-        adv_layout.setVerticalSpacing(8)
-        adv_title = QLabel("進階選項")
-        adv_title.setObjectName("CardTitle")
-        adv_layout.addWidget(adv_title, 0, 0, 1, 2)
-        self.group_check = QCheckBox("下載群組相簿的全部檔案")
-        self.group_check.setChecked(True)
-        self.skip_check = QCheckBox("略過已存在的同名檔案")
-        self.skip_check.setChecked(True)
-        adv_layout.addWidget(self.group_check, 1, 0)
-        adv_layout.addWidget(self.skip_check, 1, 1)
-        concurrency_label = QLabel("同時下載數")
-        concurrency_label.setObjectName("FieldLabel")
-        self.concurrency_spin = QSpinBox()
-        self.concurrency_spin.setRange(1, 16)
-        self.concurrency_spin.setValue(3)
-        self.concurrency_spin.setSuffix(" 個")
-        adv_layout.addWidget(concurrency_label, 2, 0)
-        adv_layout.addWidget(self.concurrency_spin, 2, 1, Qt.AlignLeft)
-        outer.addWidget(advanced)
-
+        # The queue comes first: once something is downloading, watching it
+        # is what this page is for, so it must not sit below the fold.
         queue_card = Card()
         queue_layout = QVBoxLayout(queue_card)
         queue_layout.setContentsMargins(20, 18, 20, 18)
@@ -1998,7 +2330,10 @@ class DownloadPage(QWidget):
         self.queue_list = QVBoxLayout(queue_host)
         self.queue_list.setContentsMargins(0, 0, 0, 0)
         self.queue_list.setSpacing(9)
-        self.empty_queue = QLabel("從頻道掃描加入下載，或貼上訊息連結後，工作會顯示在這裡。")
+        # Make the host's minimum follow its rows, so the scroll area scrolls
+        # a long queue instead of squeezing rows to fit its fixed height.
+        self.queue_list.setSizeConstraint(QLayout.SetMinimumSize)
+        self.empty_queue = QLabel("從「頻道下載」掃描後加入，或在下方貼上訊息連結，工作就會顯示在這裡。")
         self.empty_queue.setWordWrap(True)
         self.empty_queue.setObjectName("EmptyText")
         self.empty_queue.setAlignment(Qt.AlignCenter)
@@ -2009,7 +2344,85 @@ class DownloadPage(QWidget):
         self.queue_scroll.setWidget(queue_host)
         queue_layout.addWidget(self.queue_scroll)
         outer.addWidget(queue_card)
+
+        input_card = Card()
+        input_layout = QVBoxLayout(input_card)
+        input_layout.setContentsMargins(20, 18, 20, 18)
+        input_layout.setSpacing(10)
+        input_title = QLabel("用訊息連結新增下載")
+        input_title.setObjectName("CardTitle")
+        input_hint = QLabel(
+            "在 Telegram 對訊息按「複製訊息連結」後貼到這裡，每行一個。"
+            "也可以把 Telegram Desktop 匯出的 JSON 檔拖進來。"
+        )
+        input_hint.setObjectName("MutedText")
+        input_hint.setWordWrap(True)
+        self.url_edit = _LinkEdit()
+        self.url_edit.setObjectName("UrlEdit")
+        self.url_edit.setPlaceholderText("https://t.me/channel/123\nhttps://t.me/channel/124")
+        self.url_edit.setMinimumHeight(96)
+        self.url_edit.files_dropped.connect(self.files_dropped.emit)
+        folder_line = QHBoxLayout()
+        folder_label = QLabel("下載到")
+        folder_label.setObjectName("FieldLabel")
+        self.folder_edit = QLineEdit()
+        self.folder_edit.setReadOnly(True)
+        self.folder_edit.setObjectName("FolderEdit")
+        folder_button = QPushButton("選擇資料夾")
+        folder_button.clicked.connect(self.choose_folder)
+        folder_line.addWidget(folder_label)
+        folder_line.addWidget(self.folder_edit, 1)
+        folder_line.addWidget(folder_button)
+        action_line = QHBoxLayout()
+        self.input_count = QLabel("尚未加入連結")
+        self.input_count.setObjectName("MutedText")
+        self.url_edit.textChanged.connect(self._update_count)
+        action_line.addWidget(self.input_count)
+        action_line.addStretch(1)
+        self.import_button = QPushButton("從檔案加入…")
+        self.import_button.setToolTip("加入 Telegram Desktop 匯出的 JSON，或先前用「儲存連結清單」存下的檔案")
+        self.import_button.clicked.connect(self.import_requested.emit)
+        self.export_button = QPushButton("儲存連結清單…")
+        self.export_button.setToolTip("把目前貼上的連結存成檔案，之後可以再加入")
+        self.export_button.clicked.connect(self.export_requested.emit)
+        action_line.addWidget(self.import_button)
+        action_line.addWidget(self.export_button)
+        self.download_button = QPushButton("開始下載")
+        self.download_button.setObjectName("PrimaryButton")
+        self.download_button.setMinimumSize(140, 42)
+        self.download_button.clicked.connect(self._request_download)
+        action_line.addWidget(self.download_button)
+        input_layout.addWidget(input_title)
+        input_layout.addWidget(input_hint)
+        input_layout.addWidget(self.url_edit)
+        input_layout.addLayout(folder_line)
+        folder_hint = QLabel("新下載會自動放入「群組／頻道名稱」子資料夾。相簿、同名檔案與同時下載數在「設定與說明」調整。")
+        folder_hint.setObjectName("MutedText")
+        folder_hint.setWordWrap(True)
+        input_layout.addWidget(folder_hint)
+        input_layout.addLayout(action_line)
+        outer.addWidget(input_card)
         outer.addStretch(1)
+
+        # The account now lives in the window's top bar and the download
+        # options on the settings page.  These widgets stay as hidden state so
+        # the existing download flow keeps one place to read them from.
+        self.account_icon = QLabel("●", self)
+        self.account_state = QLabel("", self)
+        self.account_combo = QComboBox(self)
+        self.account_combo.currentIndexChanged.connect(self._account_changed)
+        self.group_check = QCheckBox("下載群組相簿的全部檔案", self)
+        self.group_check.setChecked(True)
+        self.skip_check = QCheckBox("略過已存在的同名檔案", self)
+        self.skip_check.setChecked(True)
+        self.concurrency_spin = QSpinBox(self)
+        self.concurrency_spin.setRange(1, 16)
+        self.concurrency_spin.setValue(3)
+        for hidden in (
+            self.account_icon, self.account_state, self.account_combo,
+            self.group_check, self.skip_check, self.concurrency_spin,
+        ):
+            hidden.hide()
 
     def _update_count(self) -> None:
         count = len(self.parse_urls())
@@ -2017,9 +2430,27 @@ class DownloadPage(QWidget):
         if count == 0 and file_count == 0:
             self.input_count.setText("尚未加入連結")
         elif file_count:
-            self.input_count.setText(f"已辨識 {count} 個連結、{file_count} 個 JSON 檔案")
+            self.input_count.setText(f"已辨識 {count} 個連結、{file_count} 個匯出檔")
         else:
             self.input_count.setText(f"已辨識 {count} 個連結")
+
+    def add_files(self, paths: Sequence[str]) -> None:
+        """Queue Telegram export files dropped on (or imported into) the page."""
+
+        for value in paths:
+            if value and value not in self.pending_files:
+                self.pending_files.append(value)
+        self._update_count()
+
+    def add_links(self, links: Sequence[str]) -> int:
+        """Append links that are not in the editor yet; return how many."""
+
+        present = set(self.parse_urls())
+        fresh = [link for link in links if link not in present]
+        if fresh:
+            text = self.url_edit.toPlainText().rstrip()
+            self.url_edit.setPlainText("\n".join(([text] if text else []) + fresh))
+        return len(fresh)
 
     def _account_changed(self, _index: int = -1) -> None:
         account_id = self.account_combo.currentData() or ""
@@ -2123,6 +2554,7 @@ class DownloadPage(QWidget):
             row.cancel_requested.connect(self.cancel_requested.emit)
             row.retry_requested.connect(self.retry_requested.emit)
             row.open_requested.connect(self.open_requested.emit)
+            row.detail_requested.connect(self.detail_requested.emit)
             self.rows[job.id] = row
             self.queue_list.insertWidget(self.queue_list.count() - 1, row)
         self._update_queue_summary()
@@ -2196,7 +2628,7 @@ class AccountPage(QWidget):
         text = QVBoxLayout()
         title = QLabel("帳號管理")
         title.setObjectName("PageTitle")
-        desc = QLabel("每個 Telegram 帳號各自保存本機登入工作階段，方便切換下載。")
+        desc = QLabel("每個 Telegram 帳號各自保存登入資料，可從視窗上方的帳號選單切換。")
         desc.setObjectName("MutedText")
         text.addWidget(title)
         text.addWidget(desc)
@@ -2241,7 +2673,7 @@ class AccountPage(QWidget):
             layout.setContentsMargins(24, 28, 24, 28)
             label = QLabel("尚未加入帳號")
             label.setObjectName("SectionTitle")
-            body = QLabel("新增帳號後，就可以從下載中心直接選擇要使用的 Telegram 工作階段。")
+            body = QLabel("新增帳號後，各頁面都會使用視窗上方選取的帳號。")
             body.setObjectName("MutedText")
             body.setWordWrap(True)
             body.setAlignment(Qt.AlignCenter)
@@ -2264,7 +2696,18 @@ class AccountPage(QWidget):
         text = QVBoxLayout()
         name = QLabel(account.label)
         name.setObjectName("CardTitle")
-        extra = account.display_name or account.username or account.phone or "本機工作階段"
+        # The name may itself be the Telegram name; show the other identity.
+        extra = next(
+            (
+                value
+                for value in (
+                    account.display_name,
+                    f"@{account.username}" if account.username else "",
+                )
+                if value and value != account.label
+            ),
+            "已保存本機登入資料" if account.authenticated else "需要重新登入",
+        )
         sub = QLabel(extra)
         sub.setObjectName("MutedText")
         text.addWidget(name)
@@ -2274,7 +2717,7 @@ class AccountPage(QWidget):
         layout.addWidget(state)
         if not account.authenticated:
             relogin = QPushButton("重新登入")
-            relogin.setToolTip("保留這個帳號的下載紀錄，重新建立 Telegram 工作階段")
+            relogin.setToolTip("保留這個帳號的下載紀錄，重新登入 Telegram")
             relogin.clicked.connect(lambda: self.account_relogin_requested.emit(account.id))
             layout.addWidget(relogin)
         else:
@@ -2284,13 +2727,18 @@ class AccountPage(QWidget):
             layout.addWidget(backup)
         delete = QPushButton("移除")
         delete.setProperty("dangerButton", True)
-        delete.setToolTip("移除本機保存的登入工作階段")
+        delete.setToolTip("移除這台電腦保存的登入資料；不會刪除 Telegram 帳號或已下載的檔案")
         delete.clicked.connect(lambda: self.account_deleted.emit(account.id))
         layout.addWidget(delete)
         return card
 
 
 class HistoryPage(QWidget):
+    open_requested = Signal(str)
+    remove_requested = Signal(list)
+
+    _ENDED = ("已完成", "失敗", "已取消")
+
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         outer = QVBoxLayout(self)
@@ -2300,17 +2748,22 @@ class HistoryPage(QWidget):
         text = QVBoxLayout()
         title = QLabel("下載紀錄")
         title.setObjectName("PageTitle")
-        desc = QLabel("查找過去的下載項目與儲存位置。")
+        desc = QLabel("雙擊一筆紀錄開啟它的資料夾；按右鍵可複製連結或刪除紀錄（不會刪除已下載的檔案）。")
         desc.setObjectName("MutedText")
+        desc.setWordWrap(True)
         text.addWidget(title)
         text.addWidget(desc)
         header.addLayout(text, 1)
         self.search = QLineEdit()
-        self.search.setPlaceholderText("搜尋檔名、連結或狀態")
+        self.search.setPlaceholderText("搜尋名稱、連結或狀態")
         self.search.setClearButtonEnabled(True)
-        self.search.setMinimumWidth(260)
+        self.search.setMinimumWidth(240)
         self.search.textChanged.connect(self._filter)
         header.addWidget(self.search, 0, Qt.AlignTop)
+        self.clear_button = QPushButton("清除已結束的紀錄")
+        self.clear_button.setToolTip("刪除已完成、失敗與已取消的紀錄；可以繼續的工作會保留")
+        self.clear_button.clicked.connect(self._clear_ended)
+        header.addWidget(self.clear_button, 0, Qt.AlignTop)
         outer.addLayout(header)
         card = Card()
         layout = QVBoxLayout(card)
@@ -2326,13 +2779,23 @@ class HistoryPage(QWidget):
         self.table.setColumnWidth(0, 150)
         self.table.setColumnWidth(1, 310)
         self.table.setColumnWidth(2, 100)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._context_menu)
+        self.table.cellDoubleClicked.connect(lambda row, _column: self._open_row(row))
         layout.addWidget(self.table)
+        self.empty_label = QLabel()
+        self.empty_label.setObjectName("EmptyText")
+        self.empty_label.setAlignment(Qt.AlignCenter)
+        self.empty_label.setWordWrap(True)
+        layout.addWidget(self.empty_label)
         outer.addWidget(card, 1)
         self._items: list[HistoryInfo] = []
+        self._shown: list[HistoryInfo] = []
+        self._render([])
 
     def set_history(self, items: Sequence[HistoryInfo]) -> None:
         self._items = list(items)
-        self._render(self._items)
+        self._filter(self.search.text())
 
     def _filter(self, text: str) -> None:
         self._render([
@@ -2342,6 +2805,7 @@ class HistoryPage(QWidget):
         ])
 
     def _render(self, items: Sequence[HistoryInfo]) -> None:
+        self._shown = list(items)
         self.table.setRowCount(0)
         for item in items:
             row = self.table.rowCount()
@@ -2354,8 +2818,55 @@ class HistoryPage(QWidget):
             title_item.setToolTip("\n".join(part for part in (item.url, item.summary, item.detail) if part))
             self.table.setItem(row, 1, title_item)
             self.table.setItem(row, 2, QTableWidgetItem(item.status))
-            self.table.setItem(row, 3, QTableWidgetItem(item.path or "—"))
+            location = QTableWidgetItem(item.open_path or "—")
+            location.setToolTip(item.open_path)
+            self.table.setItem(row, 3, location)
             self.table.setRowHeight(row, 44)
+        has_rows = bool(items)
+        self.table.setVisible(has_rows)
+        self.empty_label.setVisible(not has_rows)
+        if self._items:
+            self.empty_label.setText(f"找不到符合「{self.search.text().strip()}」的紀錄。")
+        else:
+            self.empty_label.setText("還沒有下載紀錄。\n完成、失敗或取消的下載都會記在這裡，之後可以雙擊開啟資料夾。")
+        self.clear_button.setEnabled(any(item.status in self._ENDED for item in self._items))
+
+    def _item_at(self, row: int) -> Optional[HistoryInfo]:
+        return self._shown[row] if 0 <= row < len(self._shown) else None
+
+    def _open_row(self, row: int) -> None:
+        item = self._item_at(row)
+        if item is not None and item.open_path:
+            self.open_requested.emit(item.open_path)
+
+    def _context_menu(self, position: QPoint) -> None:
+        row = self.table.rowAt(position.y())
+        item = self._item_at(row)
+        if item is None:
+            return
+        self.table.selectRow(row)
+        menu = QMenu(self)
+        open_action = menu.addAction("開啟資料夾")
+        open_action.setEnabled(bool(item.open_path))
+        copy_action = menu.addAction("複製連結")
+        copy_action.setEnabled(bool(item.url))
+        menu.addSeparator()
+        remove_action = menu.addAction("從紀錄刪除")
+        remove_action.setEnabled(item.status in self._ENDED)
+        if item.status not in self._ENDED:
+            remove_action.setToolTip("仍可繼續的工作不能刪除紀錄")
+        chosen = menu.exec(self.table.viewport().mapToGlobal(position))
+        if chosen is open_action:
+            self.open_requested.emit(item.open_path)
+        elif chosen is copy_action:
+            QGuiApplication.clipboard().setText(item.url)
+        elif chosen is remove_action:
+            self.remove_requested.emit([item.id])
+
+    def _clear_ended(self) -> None:
+        ended = [item.id for item in self._items if item.status in self._ENDED]
+        if ended:
+            self.remove_requested.emit(ended)
 
 
 class SettingsPage(QWidget):
@@ -2373,22 +2884,40 @@ class SettingsPage(QWidget):
             self._preferences = {}
         self._build_ui()
 
+    @staticmethod
+    def _form_card(title: str, hint: str = "") -> tuple[Card, QVBoxLayout, QFormLayout]:
+        card = Card()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+        heading = QLabel(title)
+        heading.setObjectName("SectionTitle")
+        layout.addWidget(heading)
+        if hint:
+            note = QLabel(hint)
+            note.setObjectName("MutedText")
+            note.setWordWrap(True)
+            layout.addWidget(note)
+        form = QFormLayout()
+        form.setHorizontalSpacing(20)
+        form.setVerticalSpacing(12)
+        layout.addLayout(form)
+        return card, layout, form
+
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
         outer.setContentsMargins(30, 24, 30, 30)
         outer.setSpacing(18)
         title = QLabel("設定與說明")
         title.setObjectName("PageTitle")
-        desc = QLabel("調整下載偏好；變更會自動保存到本機。")
+        desc = QLabel("所有變更都會自動儲存；新的設定用在之後加入的下載，已在佇列中的工作維持原本的設定。")
         desc.setObjectName("MutedText")
+        desc.setWordWrap(True)
         outer.addWidget(title)
         outer.addWidget(desc)
 
-        card = Card()
-        form = QFormLayout(card)
-        form.setContentsMargins(20, 20, 20, 20)
-        form.setHorizontalSpacing(20)
-        form.setVerticalSpacing(14)
+        # -- 一般 ------------------------------------------------------------
+        general, general_layout, form = self._form_card("一般")
         self.folder_edit = QLineEdit(_safe_str(self._preferences.get("download_folder", "")))
         self.folder_edit.setReadOnly(True)
         folder_wrap = QWidget()
@@ -2399,69 +2928,61 @@ class SettingsPage(QWidget):
         folder_layout.addWidget(self.folder_edit, 1)
         folder_layout.addWidget(choose)
         form.addRow("預設下載資料夾", folder_wrap)
-        self.proxy_edit = QLineEdit(_safe_str(self._preferences.get("proxy", "")))
-        self.proxy_edit.setPlaceholderText("留白代表直接連線，例如 http://127.0.0.1:7890")
-        form.addRow("代理伺服器（選填）", self.proxy_edit)
+        self._saved_proxy = _safe_str(self._preferences.get("proxy", ""))
+        self.proxy_edit = QLineEdit(self._saved_proxy)
+        self.proxy_edit.setPlaceholderText("留白代表直接連線，例如 socks5://127.0.0.1:1080")
+        self.proxy_edit.editingFinished.connect(self._proxy_edited)
+        proxy_wrap = QWidget()
+        proxy_layout = QVBoxLayout(proxy_wrap)
+        proxy_layout.setContentsMargins(0, 0, 0, 0)
+        proxy_layout.setSpacing(4)
+        proxy_layout.addWidget(self.proxy_edit)
+        self.proxy_status = QLabel("支援 http、https、socks5；需要帳密時寫成 socks5://帳號:密碼@主機:連接埠。")
+        self.proxy_status.setObjectName("MutedText")
+        self.proxy_status.setWordWrap(True)
+        proxy_layout.addWidget(self.proxy_status)
+        form.addRow("代理伺服器（選填）", proxy_wrap)
+        outer.addWidget(general)
+
+        # -- 下載方式 --------------------------------------------------------
+        method, method_layout, form = self._form_card("下載方式")
         self.concurrency = QSpinBox()
         self.concurrency.setRange(1, 16)
         self.concurrency.setValue(int(self._preferences.get("concurrency", 3)))
         self.concurrency.setSuffix(" 個")
+        self.concurrency.setToolTip("同時處理的檔案數。網路快可以調高，常被 Telegram 限速時請調低。")
         form.addRow("同時下載數", self.concurrency)
-        for widget in (self.proxy_edit, self.concurrency):
-            if isinstance(widget, QLineEdit):
-                widget.editingFinished.connect(self.save)
-            else:
-                widget.valueChanged.connect(lambda _value: self.save())
-        outer.addWidget(card)
-        outer.addWidget(self._build_advanced_card())
+        self.threads_spin = QSpinBox()
+        self.threads_spin.setRange(1, 16)
+        self.threads_spin.setValue(int(self._preferences.get("threads", 4) or 4))
+        self.threads_spin.setSuffix(" 條")
+        self.threads_spin.setToolTip("每個檔案同時使用的連線數。大檔案可調高，遇到限速時請調低。")
+        form.addRow("每個檔案的連線數", self.threads_spin)
+        self.delay_spin = QSpinBox()
+        self.delay_spin.setRange(0, 60000)
+        self.delay_spin.setSingleStep(100)
+        self.delay_spin.setValue(int(self._preferences.get("delay_ms", 0) or 0))
+        self.delay_spin.setSuffix(" 毫秒")
+        self.delay_spin.setToolTip("每個檔案開始前的等待時間。Telegram 經常要求稍後再試時可設為 500 以上。")
+        form.addRow("檔案之間的間隔", self.delay_spin)
+        self.order_combo = QComboBox()
+        self.order_combo.addItem("由舊到新（預設）", False)
+        self.order_combo.addItem("由新到舊", True)
+        self.order_combo.setCurrentIndex(1 if self._preferences.get("desc") else 0)
+        form.addRow("下載順序", self.order_combo)
+        self.album_check = QCheckBox("訊息屬於相簿時，一併下載同組的其他檔案")
+        self.album_check.setChecked(bool(self._preferences.get("group", True)))
+        method_layout.addWidget(self.album_check)
+        self.skip_check = QCheckBox("下載資料夾已有同名、同大小的檔案時略過")
+        self.skip_check.setChecked(bool(self._preferences.get("skip_same", True)))
+        method_layout.addWidget(self.skip_check)
+        self.takeout_check = QCheckBox("使用 Takeout 模式（大量下載較不易被限速；剛登入的帳號可能需等待 24 小時）")
+        self.takeout_check.setChecked(bool(self._preferences.get("takeout")))
+        method_layout.addWidget(self.takeout_check)
+        outer.addWidget(method)
 
-        info = Card()
-        info_layout = QVBoxLayout(info)
-        info_layout.setContentsMargins(20, 18, 20, 18)
-        info_title = QLabel("使用方式")
-        info_title.setObjectName("SectionTitle")
-        body = QLabel(
-            "1. 在「帳號管理」完成一次 Telegram 登入；換電腦前可先備份，之後用「從備份還原」加入。\n"
-            "2. 整個頻道或群組：到「頻道下載」選對話、日期與類型，掃描後開始下載。\n"
-            "3. 單則或多則訊息：到「下載中心」貼上訊息連結並選擇資料夾。\n"
-            "4. 「上傳與轉傳」可把本機檔案送到 Telegram，或把訊息轉到另一個對話。\n"
-            "5. 下載完成後可從下載佇列開啟資料夾，或在「下載紀錄」搜尋。"
-        )
-        body.setObjectName("BodyText")
-        body.setWordWrap(True)
-        info_layout.addWidget(info_title)
-        info_layout.addWidget(body)
-        outer.addWidget(info)
-
-        data = Card()
-        data_layout = QVBoxLayout(data)
-        data_layout.setContentsMargins(20, 18, 20, 18)
-        data_title = QLabel("本機資料與隱私")
-        data_title.setObjectName("SectionTitle")
-        data_body = QLabel(f"帳號工作階段與下載紀錄由本機後端保存於：\n{self.bridge.data_root}\n\n密碼只在登入當下送給 Telegram 核心，不會保存。移除帳號會刪除該帳號的本機登入工作階段。")
-        data_body.setObjectName("BodyText")
-        data_body.setWordWrap(True)
-        data_layout.addWidget(data_title)
-        data_layout.addWidget(data_body)
-        outer.addWidget(data)
-        outer.addStretch(1)
-
-    def _build_advanced_card(self) -> Card:
-        card = Card()
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(12)
-        title = QLabel("進階下載設定")
-        title.setObjectName("SectionTitle")
-        hint = QLabel("套用後，之後新增的下載會使用這些設定；已在佇列中的工作維持建立時的設定。")
-        hint.setObjectName("MutedText")
-        hint.setWordWrap(True)
-        layout.addWidget(title)
-        layout.addWidget(hint)
-
-        form = QFormLayout()
-        form.setHorizontalSpacing(20)
-        form.setVerticalSpacing(12)
+        # -- 檔名與篩選 ------------------------------------------------------
+        naming, naming_layout, form = self._form_card("檔名與篩選")
         saved_template = _safe_str(self._preferences.get("template", ""))
         self.template_combo = QComboBox()
         for label, template in TEMPLATE_PRESETS:
@@ -2479,7 +3000,6 @@ class SettingsPage(QWidget):
             preset_index = self.template_combo.count() - 1
             self.template_edit.setText(saved_template)
         self.template_combo.setCurrentIndex(preset_index)
-        self.template_combo.currentIndexChanged.connect(self._template_preset_changed)
         template_wrap = QWidget()
         template_layout = QVBoxLayout(template_wrap)
         template_layout.setContentsMargins(0, 0, 0, 0)
@@ -2487,62 +3007,90 @@ class SettingsPage(QWidget):
         template_layout.addWidget(self.template_combo)
         template_layout.addWidget(self.template_edit)
         form.addRow("檔名格式", template_wrap)
-
         self.include_edit = QLineEdit(_safe_str(self._preferences.get("include_ext", "")))
         self.include_edit.setPlaceholderText("例如 mp4, mkv（留白代表全部）")
         form.addRow("只下載這些副檔名", self.include_edit)
         self.exclude_edit = QLineEdit(_safe_str(self._preferences.get("exclude_ext", "")))
         self.exclude_edit.setPlaceholderText("例如 jpg, png（與上一欄擇一填寫）")
         form.addRow("排除這些副檔名", self.exclude_edit)
-
-        self.order_combo = QComboBox()
-        self.order_combo.addItem("由舊到新（預設）", False)
-        self.order_combo.addItem("由新到舊", True)
-        self.order_combo.setCurrentIndex(1 if self._preferences.get("desc") else 0)
-        form.addRow("下載順序", self.order_combo)
-
-        self.threads_spin = QSpinBox()
-        self.threads_spin.setRange(1, 16)
-        self.threads_spin.setValue(int(self._preferences.get("threads", 4) or 4))
-        self.threads_spin.setSuffix(" 條")
-        self.threads_spin.setToolTip("每個檔案同時使用的連線數。大檔案可調高，遇到限速時請調低。")
-        form.addRow("每個檔案的連線數", self.threads_spin)
-
-        self.delay_spin = QSpinBox()
-        self.delay_spin.setRange(0, 60000)
-        self.delay_spin.setSingleStep(100)
-        self.delay_spin.setValue(int(self._preferences.get("delay_ms", 0) or 0))
-        self.delay_spin.setSuffix(" 毫秒")
-        self.delay_spin.setToolTip("每個檔案開始前的等待時間。Telegram 經常要求稍後再試時可設為 500 以上。")
-        form.addRow("檔案之間的間隔", self.delay_spin)
-        layout.addLayout(form)
-
         self.rewrite_check = QCheckBox("依檔案內容修正副檔名（例如沒有副檔名的影片補上 .mp4）")
         self.rewrite_check.setChecked(bool(self._preferences.get("rewrite_ext")))
-        layout.addWidget(self.rewrite_check)
-        self.takeout_check = QCheckBox("使用 Takeout 模式（大量下載較不易被限速；剛登入的帳號可能需等待 24 小時）")
-        self.takeout_check.setChecked(bool(self._preferences.get("takeout")))
-        layout.addWidget(self.takeout_check)
-
+        naming_layout.addWidget(self.rewrite_check)
         action = QHBoxLayout()
         self.advanced_status = QLabel("")
         self.advanced_status.setObjectName("MutedText")
         self.advanced_status.setWordWrap(True)
         action.addWidget(self.advanced_status, 1)
-        reset = QPushButton("恢復預設")
+        reset = QPushButton("全部恢復預設")
+        reset.setToolTip("把「下載方式」與「檔名與篩選」的選項恢復成預設值")
         reset.clicked.connect(self._reset_advanced)
         action.addWidget(reset)
-        apply_button = QPushButton("套用")
-        apply_button.setObjectName("PrimaryButton")
-        apply_button.clicked.connect(self._apply_advanced)
-        action.addWidget(apply_button)
-        layout.addLayout(action)
+        naming_layout.addLayout(action)
+        outer.addWidget(naming)
         self._template_preset_changed()
-        return card
 
-    def _template_preset_changed(self, _index: int = -1) -> None:
+        info = Card()
+        info_layout = QVBoxLayout(info)
+        info_layout.setContentsMargins(20, 18, 20, 18)
+        info_title = QLabel("使用方式")
+        info_title.setObjectName("SectionTitle")
+        body = QLabel(
+            "1. 第一次使用時登入 Telegram；之後可以從視窗右上角的帳號選單切換或新增帳號。"
+            "換電腦前可在「帳號管理」備份，之後用「從備份還原」加入。\n"
+            "2. 整個頻道或群組：到「頻道下載」選對話、日期與類型，先查看符合的檔案再加入下載。\n"
+            "3. 單則或多則訊息：在 Telegram 複製訊息連結，程式會在右上方提示你貼到「下載中心」。\n"
+            "4. 「上傳與轉傳」可把本機檔案（也能直接拖進來）送到 Telegram，或把訊息轉到另一個對話。\n"
+            "5. 下載完成、失敗時視窗上方會提示，縮小視窗時改在右下角通知；也可在「下載紀錄」雙擊開啟資料夾。"
+        )
+        body.setObjectName("BodyText")
+        body.setWordWrap(True)
+        info_layout.addWidget(info_title)
+        info_layout.addWidget(body)
+        outer.addWidget(info)
+
+        data = Card()
+        data_layout = QVBoxLayout(data)
+        data_layout.setContentsMargins(20, 18, 20, 18)
+        data_title = QLabel("本機資料與隱私")
+        data_title.setObjectName("SectionTitle")
+        data_body = QLabel(
+            f"帳號登入資料與下載紀錄保存在這台電腦：\n{self.bridge.data_root}\n\n"
+            "密碼只在登入當下送給 Telegram 核心，不會保存。移除帳號會刪除該帳號在這台電腦的登入資料。"
+        )
+        data_body.setObjectName("BodyText")
+        data_body.setWordWrap(True)
+        data_body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        data_layout.addWidget(data_title)
+        data_layout.addWidget(data_body)
+        outer.addWidget(data)
+        outer.addStretch(1)
+
+        # Connect only after every widget holds its saved value, so building
+        # the page does not write the settings straight back.
+        self.concurrency.valueChanged.connect(lambda _value: self.save())
+        self.album_check.toggled.connect(lambda _checked: self.save())
+        self.skip_check.toggled.connect(lambda _checked: self.save())
+        self.template_combo.currentIndexChanged.connect(self._template_preset_changed)
+        for spin in (self.threads_spin, self.delay_spin):
+            spin.valueChanged.connect(lambda _value: self._apply_advanced())
+        self.order_combo.currentIndexChanged.connect(lambda _index: self._apply_advanced())
+        for check in (self.takeout_check, self.rewrite_check):
+            check.toggled.connect(lambda _checked: self._apply_advanced())
+        for edit in (self.template_edit, self.include_edit, self.exclude_edit):
+            edit.editingFinished.connect(self._apply_advanced)
+
+    def _template_preset_changed(self, index: int = -1) -> None:
         custom = self.template_combo.currentData() is None
         self.template_edit.setVisible(custom)
+        if index < 0:
+            return
+        if custom:
+            # Nothing to save until the custom format has been typed.
+            self.template_edit.setFocus()
+            if not self.template_edit.text().strip():
+                self.set_advanced_status("請輸入自訂檔名格式，完成後按 Enter 或點其他欄位儲存。")
+                return
+        self._apply_advanced()
 
     def advanced_values(self) -> dict[str, Any]:
         preset = self.template_combo.currentData()
@@ -2558,18 +3106,36 @@ class SettingsPage(QWidget):
         }
 
     def _reset_advanced(self) -> None:
-        self.template_combo.setCurrentIndex(0)
-        self.template_edit.clear()
-        self.include_edit.clear()
-        self.exclude_edit.clear()
-        self.order_combo.setCurrentIndex(0)
-        self.threads_spin.setValue(4)
-        self.delay_spin.setValue(0)
-        self.rewrite_check.setChecked(False)
-        self.takeout_check.setChecked(False)
+        widgets = (
+            self.template_combo, self.template_edit, self.include_edit, self.exclude_edit,
+            self.order_combo, self.threads_spin, self.delay_spin, self.rewrite_check, self.takeout_check,
+            self.concurrency, self.album_check, self.skip_check,
+        )
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            self.template_combo.setCurrentIndex(0)
+            self.template_edit.clear()
+            self.include_edit.clear()
+            self.exclude_edit.clear()
+            self.order_combo.setCurrentIndex(0)
+            self.threads_spin.setValue(4)
+            self.delay_spin.setValue(0)
+            self.rewrite_check.setChecked(False)
+            self.takeout_check.setChecked(False)
+            self.concurrency.setValue(2)
+            self.album_check.setChecked(True)
+            self.skip_check.setChecked(True)
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+        self._template_preset_changed()
+        self.save()
         self._apply_advanced()
 
     def _apply_advanced(self) -> None:
+        """Validate and save the download options; keep the last good value."""
+
         values = self.advanced_values()
         if self.template_combo.currentData() is None and not values["template"]:
             self.set_advanced_status("請填寫自訂檔名格式，或改選其他格式。", error=True)
@@ -2587,7 +3153,7 @@ class SettingsPage(QWidget):
                     }
                 )
             except ValueError as exc:
-                self.set_advanced_status(_safe_str(exc), error=True)
+                self.set_advanced_status(f"{_safe_str(exc)}（這一項尚未儲存）", error=True)
                 return
         self._preferences.update(values)
         self.set_advanced_status("正在儲存…")
@@ -2597,6 +3163,26 @@ class SettingsPage(QWidget):
         self.advanced_status.setText(text)
         self.advanced_status.setStyleSheet(f"color: {DANGER};" if error else "")
 
+    def _proxy_edited(self) -> None:
+        value = self.proxy_edit.text().strip()
+        if value == self._saved_proxy.strip():
+            self.set_proxy_status("已儲存。" if value else "目前為直接連線。")
+            return
+        validate = getattr(self.bridge.module, "validate_proxy", None)
+        if callable(validate):
+            try:
+                validate(value)
+            except ValueError as exc:
+                self.set_proxy_status(f"{_safe_str(exc)}。尚未儲存，請修正後再試。", error=True)
+                return
+        self._saved_proxy = value
+        self.set_proxy_status("已儲存。" if value else "已改為直接連線。")
+        self.save()
+
+    def set_proxy_status(self, text: str, *, error: bool = False) -> None:
+        self.proxy_status.setText(text)
+        self.proxy_status.setStyleSheet(f"color: {DANGER};" if error else "")
+
     def _choose_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "選擇預設下載資料夾", self.folder_edit.text() or str(Path.home() / "Downloads"))
         if path:
@@ -2604,19 +3190,19 @@ class SettingsPage(QWidget):
             self.save()
 
     def save(self) -> None:
-        payload = {
-            "download_folder": self.folder_edit.text().strip(),
-            "proxy": self.proxy_edit.text().strip(),
-            "concurrency": self.concurrency.value(),
-        }
+        payload = self.values()
         self._preferences.update(payload)
         self.settings_changed.emit(payload)
 
     def values(self) -> dict[str, Any]:
         return {
             "download_folder": self.folder_edit.text().strip(),
-            "proxy": self.proxy_edit.text().strip(),
+            # Only the last value that passed validation; a half-typed proxy
+            # must not ride along with an unrelated change.
+            "proxy": self._saved_proxy,
             "concurrency": self.concurrency.value(),
+            "group": self.album_check.isChecked(),
+            "skip_same": self.skip_check.isChecked(),
         }
 
 
@@ -2641,14 +3227,35 @@ class MainWindow(QMainWindow):
         self._cancelled_before_start: set[str] = set()
         self._closing = False
         self._allow_close = False
+        # Set by ``main`` for a real launch: open the login dialog when there
+        # is no account yet.  Tests and probes construct windows without it.
+        self.prompt_login_when_empty = False
+        self._first_run_checked = False
+        # When each running job last reported progress; see _tick_activity.
+        self._last_activity: dict[str, float] = {}
+        self._stalled: set[str] = set()
+        self._failure_count = 0
+        # A failure the user has not seen yet keeps the taskbar button red.
+        self._unseen_failure = False
+        self._clipboard_offered = ""
+        self._preference_queue: list[tuple[dict[str, Any], Any, Any]] = []
+        self._preference_saving = False
+        self.tray: Optional[QSystemTrayIcon] = None
+        self.taskbar: Optional[_TaskbarProgress] = None
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(960, 680)
         self.resize(1180, 800)
         self._build_ui()
+        self._restore_ui_state()
         self._load_preferences()
         self.refresh_accounts()
         self.refresh_history()
         self.refresh_queue()
+        self._setup_desktop_integration()
+        self._activity_timer = QTimer(self)
+        self._activity_timer.setInterval(1000)
+        self._activity_timer.timeout.connect(self._tick_activity)
+        self._activity_timer.start()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -2683,22 +3290,15 @@ class MainWindow(QMainWindow):
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
         self.nav_buttons: list[SidebarButton] = []
-        nav_icons = (
-            QStyle.SP_DirOpenIcon,
-            QStyle.SP_ArrowDown,
-            QStyle.SP_ArrowUp,
-            QStyle.SP_DirHomeIcon,
-            QStyle.SP_FileDialogDetailedView,
-            QStyle.SP_FileDialogContentsView,
-        )
-        nav_specs = tuple((self.style().standardIcon(icon), text) for icon, text in zip(nav_icons, PAGE_NAMES))
+        nav_kinds = ("channel", "download", "transfer", "account", "history", "settings")
+        nav_specs = tuple((_nav_icon(kind), text) for kind, text in zip(nav_kinds, PAGE_NAMES))
         for index, (icon, text) in enumerate(nav_specs):
             button = SidebarButton(icon, text)
             self.nav_group.addButton(button, index)
             self.nav_buttons.append(button)
             side_layout.addWidget(button)
         side_layout.addStretch(1)
-        tip = QLabel("小提醒\n下載私有訊息前，請確認帳號有權限存取。")
+        tip = QLabel("小提醒\n關閉視窗只會暫停下載，下次開啟會自動接續。")
         tip.setObjectName("SidebarTip")
         tip.setWordWrap(True)
         side_layout.addWidget(tip)
@@ -2715,13 +3315,28 @@ class MainWindow(QMainWindow):
         topbar = QFrame()
         topbar.setObjectName("Topbar")
         top_layout = QHBoxLayout(topbar)
-        top_layout.setContentsMargins(28, 14, 30, 14)
+        top_layout.setContentsMargins(28, 12, 30, 12)
         top_layout.addStretch(1)
-        self.top_account = QLabel("未登入")
+        account_caption = QLabel("目前帳號")
+        account_caption.setObjectName("MutedText")
+        top_layout.addWidget(account_caption)
+        # One account switcher for every page; the per-page selectors are
+        # kept only as hidden state that follows it.
+        self.top_account = QToolButton()
         self.top_account.setObjectName("TopAccount")
+        self.top_account.setText("未登入")
         self.top_account.setProperty("connected", False)
+        self.top_account.setPopupMode(QToolButton.InstantPopup)
+        self.top_account.setCursor(Qt.PointingHandCursor)
+        self.top_account.setToolTip("切換、新增或管理 Telegram 帳號")
+        self.account_menu = QMenu(self.top_account)
+        self.top_account.setMenu(self.account_menu)
         top_layout.addWidget(self.top_account)
         content_layout.addWidget(topbar)
+        self.account_banner = MessageBar(closable=False)
+        content_layout.addWidget(self.account_banner)
+        self.notice_bar = MessageBar()
+        content_layout.addWidget(self.notice_bar)
         self.stack = QStackedWidget()
         self.channel_page = ChannelPage()
         self.home_page = DownloadPage()
@@ -2759,6 +3374,10 @@ class MainWindow(QMainWindow):
         self.home_page.open_requested.connect(self.open_output)
         self.home_page.account_changed.connect(self._set_active_account)
         self.home_page.clear_requested.connect(self._clear_finished_jobs)
+        self.home_page.files_dropped.connect(self._import_dropped_files)
+        self.home_page.detail_requested.connect(self._show_job_error)
+        self.history_page.open_requested.connect(self.open_output)
+        self.history_page.remove_requested.connect(self._remove_history)
         self.account_page.add_requested.connect(self._add_account)
         self.account_page.account_deleted.connect(self._remove_account)
         self.account_page.backup_requested.connect(self._backup_account)
@@ -2770,6 +3389,7 @@ class MainWindow(QMainWindow):
         self.channel_page.download_requested.connect(self._enqueue_channel_downloads)
         self.channel_page.view_queue_requested.connect(self._show_download_queue)
         self.transfer_page.account_changed.connect(self._set_active_account)
+        self._rebuild_account_menu()
 
     def _show_page(self, index: int) -> None:
         self.stack.setCurrentIndex(index)
@@ -2801,6 +3421,8 @@ class MainWindow(QMainWindow):
         self.home_page.proxy_value = _safe_str(values.get("proxy", ""))
         concurrency = int(values.get("concurrency", 2) or 2)
         self.home_page.concurrency_spin.setValue(max(1, min(16, concurrency)))
+        self.home_page.group_check.setChecked(bool(values.get("group", True)))
+        self.home_page.skip_check.setChecked(bool(values.get("skip_same", True)))
         self.channel_page.set_download_folder(_safe_str(values.get("download_folder", "")))
         self.channel_page.set_download_preferences(
             concurrency=concurrency,
@@ -2822,6 +3444,10 @@ class MainWindow(QMainWindow):
             self.home_page.concurrency_spin.setValue(int(values["concurrency"]))
         if values.get("proxy") is not None:
             self.home_page.proxy_value = _safe_str(values["proxy"])
+        if values.get("group") is not None:
+            self.home_page.group_check.setChecked(bool(values["group"]))
+        if values.get("skip_same") is not None:
+            self.home_page.skip_check.setChecked(bool(values["skip_same"]))
         self.channel_page.set_download_folder(_safe_str(values.get("download_folder", self.channel_page.folder_edit.text())))
         self.channel_page.set_download_preferences(
             concurrency=int(values.get("concurrency", self.home_page.concurrency_spin.value()) or 2),
@@ -2829,23 +3455,73 @@ class MainWindow(QMainWindow):
             skip_existing=self.home_page.skip_check.isChecked(),
         )
         self.transfer_page.set_proxy(self.home_page.proxy_value)
-        self._start_store_action(
-            lambda: self.bridge.update_preferences(
-                download_dir=_safe_str(values.get("download_folder", "")),
-                proxy=_safe_str(values.get("proxy", "")),
-                concurrency=int(values.get("concurrency", 2) or 2),
-            )
-        )
-
-    def _advanced_changed(self, values: Mapping[str, Any]) -> None:
-        payload = dict(values)
-        self._start_store_action(
-            lambda: self.bridge.update_preferences(**payload),
-            lambda _result: self.settings_page.set_advanced_status("已套用，之後新增的下載會使用這些設定。"),
-            lambda detail: self.settings_page.set_advanced_status(
+        self._save_preferences(
+            {
+                "download_dir": _safe_str(values.get("download_folder", "")),
+                "proxy": _safe_str(values.get("proxy", "")),
+                "concurrency": int(values.get("concurrency", 2) or 2),
+                "group": bool(values.get("group", self.home_page.group_check.isChecked())),
+                "skip_same": bool(values.get("skip_same", self.home_page.skip_check.isChecked())),
+            },
+            on_failure=lambda detail: self.settings_page.set_proxy_status(
                 _last_error_line(detail) or "設定沒有儲存，請檢查欄位內容。", error=True
             ),
         )
+
+    def _advanced_changed(self, values: Mapping[str, Any]) -> None:
+        self._save_preferences(
+            dict(values),
+            on_success=lambda _result: self.settings_page.set_advanced_status("已儲存。之後新增的下載會使用這些設定。"),
+            on_failure=lambda detail: self.settings_page.set_advanced_status(
+                _last_error_line(detail) or "設定沒有儲存，請檢查欄位內容。", error=True
+            ),
+        )
+
+    def _save_preferences(
+        self,
+        values: Mapping[str, Any],
+        *,
+        on_success: Optional[Callable[[Any], None]] = None,
+        on_failure: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """Write settings one save at a time, newest values last.
+
+        The settings page saves on every change.  Parallel Store writes
+        finished in any order, so an older value could land last; queued
+        changes are merged into the next single write instead.
+        """
+
+        self._preference_queue.append((dict(values), on_success, on_failure))
+        if not self._preference_saving:
+            self._run_preference_save()
+
+    def _run_preference_save(self) -> None:
+        if not self._preference_queue:
+            self._preference_saving = False
+            return
+        merged: dict[str, Any] = {}
+        successes: list[Callable[[Any], None]] = []
+        failures: list[Callable[[str], None]] = []
+        while self._preference_queue:
+            values, on_success, on_failure = self._preference_queue.pop(0)
+            merged.update(values)
+            if on_success is not None:
+                successes.append(on_success)
+            if on_failure is not None:
+                failures.append(on_failure)
+        self._preference_saving = True
+
+        def saved(result: Any) -> None:
+            for callback in successes:
+                callback(result)
+            self._run_preference_save()
+
+        def failed(detail: str) -> None:
+            for callback in failures:
+                callback(detail)
+            self._run_preference_save()
+
+        self._start_store_action(lambda: self.bridge.update_preferences(**merged), saved, failed)
 
     def refresh_accounts(self) -> None:
         self._set_top_account("正在讀取帳號…")
@@ -2896,6 +3572,14 @@ class MainWindow(QMainWindow):
             else:
                 self._set_top_account("未登入")
             self._accounts_loaded = True
+            self._rebuild_account_menu()
+            self._update_account_banner()
+            if self.prompt_login_when_empty and not self._first_run_checked:
+                self._first_run_checked = True
+                if not self.accounts:
+                    # First launch: go straight to logging in instead of
+                    # leaving the user to find the account page.
+                    QTimer.singleShot(250, self._add_account)
         elif kind == "history":
             self.history_page.set_history(list(values or []))
         else:
@@ -2964,11 +3648,65 @@ class MainWindow(QMainWindow):
         if not self.transfer_page.is_busy():
             self.transfer_page.set_accounts(self.accounts, account_id)
 
+        self._rebuild_account_menu()
+        self._update_account_banner()
+
         def done(result: Any) -> None:
             if on_success is not None:
                 on_success(result)
 
         self._start_store_action(lambda: self.bridge.set_active_account(account_id), on_success=done)
+
+    def _active_account(self) -> Optional[AccountInfo]:
+        active_id = self.home_page.account_combo.currentData() or ""
+        return next((item for item in self.accounts if item.id == active_id), None)
+
+    def _rebuild_account_menu(self) -> None:
+        menu = self.account_menu
+        menu.clear()
+        active = self._active_account()
+        for account in self.accounts:
+            state = "已連線" if account.authenticated else "需要重新登入"
+            action = menu.addAction(f"{account.label}（{state}）")
+            action.setCheckable(True)
+            action.setChecked(active is not None and account.id == active.id)
+            action.triggered.connect(lambda _checked=False, account_id=account.id: self._switch_account(account_id))
+        if self.accounts:
+            menu.addSeparator()
+        menu.addAction("＋ 新增帳號…", self._add_account)
+        menu.addAction("管理帳號…", lambda: self._show_widget(self.account_page))
+
+    def _switch_account(self, account_id: str) -> None:
+        account = next((item for item in self.accounts if item.id == account_id), None)
+        active = self._active_account()
+        if account is None:
+            return
+        if active is not None and active.id == account_id:
+            if not account.authenticated:
+                self._relogin_account(account_id)
+            self._rebuild_account_menu()
+            return
+        self._set_active_account(account_id)
+
+    def _update_account_banner(self) -> None:
+        if not self._accounts_loaded:
+            self.account_banner.dismiss()
+            return
+        if not self.accounts:
+            self.account_banner.show_message(
+                "還沒有登入 Telegram 帳號。登入後才能下載、上傳或轉傳。",
+                tone="warning", action_text="立即登入", action=self._add_account,
+            )
+            return
+        active = self._active_account()
+        if active is not None and not active.authenticated:
+            self.account_banner.show_message(
+                f"「{active.label}」需要重新登入才能使用；其他帳號可從右上角切換。",
+                tone="warning", action_text="重新登入",
+                action=lambda account_id=active.id: self._relogin_account(account_id),
+            )
+            return
+        self.account_banner.dismiss()
 
     @staticmethod
     def _restore_job(value: Any, index: int) -> DownloadJob:
@@ -3130,7 +3868,7 @@ class MainWindow(QMainWindow):
         self._start_store_action(
             lambda: self.bridge.delete_account(account_id),
             lambda _result: self.refresh_accounts(),
-            lambda detail: show_error(self, "無法移除帳號", "帳號工作階段沒有被移除，請稍後再試。", detail),
+            lambda detail: show_error(self, "無法移除帳號", "帳號的登入資料沒有被移除，請稍後再試。", detail),
         )
 
     def _backup_account(self, account_id: str) -> None:
@@ -3306,6 +4044,8 @@ class MainWindow(QMainWindow):
 
     def _launch_download(self, job: DownloadJob, options: Mapping[str, Any]) -> None:
         job.status = "下載中"
+        self._last_activity[job.id] = time.monotonic()
+        self._clear_stall(job.id)
         self.home_page.update_job(job)
         thread = QThread(self)
         worker = DownloadWorker(self.bridge, job, options)
@@ -3334,6 +4074,9 @@ class MainWindow(QMainWindow):
         job = self.jobs.get(job_id)
         if job is None:
             return
+        self._last_activity[job_id] = time.monotonic()
+        if job_id in self._stalled:
+            self._clear_stall(job_id)
         if isinstance(value, Mapping):
             event_name = value.get("event", "progress")
             if event_name not in {"progress", "error"}:
@@ -3399,8 +4142,18 @@ class MainWindow(QMainWindow):
         if isinstance(result, Mapping):
             job.result_path = _safe_str(result.get("path", result.get("file_path", "")))
             job.title = _safe_str(result.get("title", result.get("filename", job.title)))
+        self._finish_activity(job_id)
         self.home_page.update_job(job)
         self.refresh_history()
+        if not self._closing:
+            row = self.home_page.rows.get(job_id)
+            target = row.open_target() if row is not None else job.output_dir
+            self.notice_bar.show_message(
+                f"「{job.title}」下載完成。",
+                tone="success", action_text="開啟資料夾",
+                action=lambda path=target: self.open_output(path), timeout_ms=12000,
+            )
+            self._desktop_notify("下載完成", job.title)
 
     @Slot(str, str, str)
     def _job_failed(self, job_id: str, message: str, detail: str) -> None:
@@ -3409,12 +4162,245 @@ class MainWindow(QMainWindow):
             return
         job.status = "失敗"
         job.error = message
+        job.error_detail = detail
         job.speed = ""
+        self._finish_activity(job_id)
         self.home_page.update_job(job)
+        row = self.home_page.rows.get(job_id)
+        if row is not None:
+            step = _next_step(message)
+            row.set_note(f"原因：{message}" + (f"　建議：{step}" if step else ""), tone="danger")
         self.refresh_history()
         self.refresh_accounts()
-        if not self._closing:
-            show_error(self, "下載失敗", f"{job.title}：{message}", detail)
+        if self._closing:
+            return
+        # A network outage fails several jobs at once.  One message that
+        # counts them replaces the stack of modal dialogs this used to open.
+        if self.notice_bar.isVisible() and self.notice_bar.property("tone") == "error":
+            self._failure_count += 1
+        else:
+            self._failure_count = 1
+        if self._failure_count == 1:
+            text = f"「{job.title}」下載失敗：{message}"
+        else:
+            text = f"{self._failure_count} 個下載失敗。最近一個：「{job.title}」：{message}"
+        self.notice_bar.show_message(
+            text, tone="error", action_text="查看原因",
+            action=lambda failed_id=job_id: self._show_job_error(failed_id),
+        )
+        self._desktop_notify("下載失敗", f"{job.title}：{message}")
+        if not self._user_is_looking():
+            self._unseen_failure = True
+            self._tick_activity()
+
+    def _show_job_error(self, job_id: str) -> None:
+        job = self.jobs.get(job_id)
+        if job is None:
+            return
+        ErrorDialog("下載失敗", f"{job.title}：{job.error or '下載沒有完成。'}", job.error_detail, self).exec()
+
+    def _clear_stall(self, job_id: str) -> None:
+        self._stalled.discard(job_id)
+        row = self.home_page.rows.get(job_id)
+        if row is not None:
+            row.set_note("")
+
+    def _finish_activity(self, job_id: str) -> None:
+        self._last_activity.pop(job_id, None)
+        self._clear_stall(job_id)
+
+    def _tick_activity(self) -> None:
+        """Once a second: spot stalled jobs and mirror progress outside.
+
+        A job that has reported nothing for a while gets a plain explanation
+        in its row; the overall progress goes to the window title and the
+        taskbar button so a minimised window still shows it.
+        """
+
+        now = time.monotonic()
+        done = total = running = 0
+        for job_id, job in self.jobs.items():
+            if job.status != "下載中":
+                continue
+            running += 1
+            row = self.home_page.rows.get(job_id)
+            if row is None:
+                continue
+            known = max(row._expected_bytes, row._bytes_known)
+            if known > 0:
+                done += min(row._bytes_done, known)
+                total += known
+            last = self._last_activity.get(job_id)
+            if last is not None and now - last >= STALL_SECONDS:
+                self._stalled.add(job_id)
+                row.set_note(
+                    f"已 {_format_duration(now - last)}沒有新進度：可能是網路中斷或 Telegram 暫時限速，程式會自動重試，也可以先取消。"
+                )
+        if running:
+            if total:
+                percent = int(done * 100 / total)
+                title = f"（{percent}%）{APP_NAME}"
+            else:
+                title = f"（下載中）{APP_NAME}"
+        else:
+            title = APP_NAME
+        if self.windowTitle() != title:
+            self.setWindowTitle(title)
+        if self.taskbar is not None and self.taskbar.available:
+            hwnd = int(self.winId()) if self.isVisible() else 0
+            if self._unseen_failure:
+                # Red until the user comes back; keep showing how far the
+                # remaining downloads are, or a full bar when none are left.
+                self.taskbar.update(hwnd, _TaskbarProgress.ERROR, done if total else 1, total or 1)
+            elif running and total:
+                self.taskbar.update(hwnd, _TaskbarProgress.NORMAL, done, total)
+            elif running:
+                self.taskbar.update(hwnd, _TaskbarProgress.INDETERMINATE)
+            else:
+                self.taskbar.update(hwnd, _TaskbarProgress.NOPROGRESS)
+
+    # ------------------------------------------------------------------
+    # Desktop integration: tray notifications, clipboard, window state
+    # ------------------------------------------------------------------
+    def _setup_desktop_integration(self) -> None:
+        application = QGuiApplication.instance()
+        if application is None or QGuiApplication.platformName() in {"offscreen", "minimal"}:
+            return
+        application.applicationStateChanged.connect(self._application_state_changed)
+        if os.name == "nt" and QGuiApplication.platformName() == "windows":
+            self.taskbar = _TaskbarProgress()
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            icon = self.windowIcon()
+            if icon.isNull():
+                icon = QIcon(str(_resource_path("assets", "app.ico")))
+            tray = QSystemTrayIcon(icon, self)
+            tray.setToolTip(APP_NAME)
+            menu = QMenu(self)
+            menu.addAction("顯示主視窗", self._bring_to_front)
+            menu.addAction("結束", self.close)
+            tray.setContextMenu(menu)
+            tray.activated.connect(
+                lambda reason: self._bring_to_front() if reason == QSystemTrayIcon.Trigger else None
+            )
+            tray.messageClicked.connect(lambda: (self._bring_to_front(), self._show_download_queue()))
+            tray.show()
+            self.tray = tray
+
+    def _bring_to_front(self) -> None:
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _desktop_notify(self, title: str, text: str) -> None:
+        """Windows notification, only when the user is not looking."""
+
+        if self.tray is None or self._user_is_looking():
+            return
+        self.tray.showMessage(title, text, QSystemTrayIcon.Information, 8000)
+
+    def _user_is_looking(self) -> bool:
+        return self.isActiveWindow() and not self.isMinimized()
+
+    def _application_state_changed(self, state: Any) -> None:
+        if state == Qt.ApplicationActive:
+            if self._unseen_failure:
+                self._unseen_failure = False
+                self._tick_activity()
+            self._offer_clipboard_links()
+
+    def _offer_clipboard_links(self) -> None:
+        """Offer message links the user copied in Telegram, once per copy."""
+
+        if self._closing:
+            return
+        clipboard = QGuiApplication.clipboard()
+        text = _safe_str(clipboard.text() if clipboard is not None else "")
+        if not text or text == self._clipboard_offered:
+            return
+        self._clipboard_offered = text
+        links = [link for link in extract_message_links(text) if link not in self.home_page.parse_urls()]
+        if not links:
+            return
+        count = len(links)
+        self.notice_bar.show_message(
+            f"剪貼簿裡有 {count} 個 Telegram 訊息連結，要加到下載中心嗎？",
+            tone="info", action_text="貼到下載中心",
+            action=lambda values=links: self._paste_links(values), timeout_ms=20000,
+        )
+
+    def _paste_links(self, links: Sequence[str]) -> None:
+        self.home_page.add_links(links)
+        self._show_widget(self.home_page)
+        container = self.stack.currentWidget()
+        if isinstance(container, QScrollArea):
+            QTimer.singleShot(0, lambda: container.ensureWidgetVisible(self.home_page.url_edit, 0, 24))
+        self.home_page.url_edit.setFocus()
+
+    def _ui_state_path(self) -> Optional[Path]:
+        if not self.bridge.available:
+            return None
+        return Path(self.bridge.data_root) / UI_STATE_FILE
+
+    def _restore_ui_state(self) -> None:
+        path = self._ui_state_path()
+        if path is None or not path.is_file():
+            return
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            geometry = base64.b64decode(str(state.get("geometry", "")), validate=True)
+        except (OSError, ValueError, TypeError, binascii.Error, AttributeError):
+            return
+        if geometry:
+            self.restoreGeometry(geometry)
+        page = state.get("page")
+        if isinstance(page, int) and 0 <= page < self.stack.count():
+            self._show_page(page)
+
+    def _save_ui_state(self) -> None:
+        path = self._ui_state_path()
+        if path is None:
+            return
+        state = {
+            "geometry": base64.b64encode(bytes(self.saveGeometry())).decode("ascii"),
+            "page": int(self.stack.currentIndex()),
+        }
+        try:
+            temporary = path.with_name(path.name + ".tmp")
+            temporary.write_text(json.dumps(state), encoding="utf-8")
+            os.replace(temporary, path)
+        except OSError:
+            # Window placement is a convenience; never block closing.
+            pass
+
+    def _remove_history(self, job_ids: Sequence[str]) -> None:
+        ids = list(job_ids)
+        if not ids:
+            return
+        many = len(ids) > 1
+        if not ask_confirm(
+            self,
+            "刪除下載紀錄",
+            f"要刪除 {len(ids)} 筆下載紀錄嗎？" if many else "要刪除這筆下載紀錄嗎？",
+            "只會刪除紀錄，已下載的檔案會留在原本的資料夾。可以繼續的工作不會被刪除。",
+            "刪除紀錄",
+        ):
+            return
+
+        def removed(result: Any) -> None:
+            gone = set(result or [])
+            for job_id, job in list(self.jobs.items()):
+                if (job.backend_job_id or job_id) in gone:
+                    self.jobs.pop(job_id, None)
+                    self.home_page.remove_jobs([job_id])
+            self.refresh_history()
+
+        self._start_store_action(
+            lambda: self.bridge.remove_history(ids),
+            removed,
+            lambda detail: show_error(self, "無法刪除紀錄", "下載紀錄沒有變更，請稍後再試。", detail),
+        )
 
     @Slot(str)
     def _job_canceled(self, job_id: str) -> None:
@@ -3460,9 +4446,14 @@ class MainWindow(QMainWindow):
         self._start_job(job, options)
 
     def open_output(self, path: str) -> None:
-        output = Path(path)
-        if output.exists():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(output)))
+        output = Path(path) if path else None
+        # A per-chat folder may not exist yet (nothing finished) or may have
+        # been moved; fall back to the nearest folder that does exist.
+        target = output
+        while target is not None and not target.exists() and target.parent != target:
+            target = target.parent
+        if target is not None and target.exists() and output is not None and output.anchor and target != Path(output.anchor):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
         else:
             show_error(self, "找不到資料夾", "下載資料夾目前不存在，請確認路徑是否仍然有效。")
 
@@ -3531,8 +4522,13 @@ class MainWindow(QMainWindow):
             lambda detail: show_error(self, "匯出失敗", "下載清單沒有被保存。", detail),
         )
 
-    def _import_json(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "匯入下載清單", "", "JSON 檔案 (*.json)")
+    def _import_dropped_files(self, paths: Sequence[str]) -> None:
+        for path in paths:
+            self._import_json(path)
+
+    def _import_json(self, path: str = "") -> None:
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, "從檔案加入下載", "", "JSON 檔案 (*.json)")
         if not path:
             return
 
@@ -3651,8 +4647,21 @@ class MainWindow(QMainWindow):
                 self.home_page.pending_files.append(value)
         self.home_page._update_count()
 
+    def _release_desktop_integration(self) -> None:
+        self._save_ui_state()
+        self._activity_timer.stop()
+        if self.taskbar is not None:
+            self.taskbar.update(int(self.winId()), _TaskbarProgress.NOPROGRESS)
+            self.taskbar.close()
+            self.taskbar = None
+        if self.tray is not None:
+            self.tray.hide()
+            self.tray.deleteLater()
+            self.tray = None
+
     def closeEvent(self, event: QEvent) -> None:  # type: ignore[override]
         if self._allow_close:
+            self._release_desktop_integration()
             self._allow_close = False
             # The polling path only reaches here after every thread has
             # finished.  This final bounded call is defensive and does not
@@ -3685,6 +4694,7 @@ class MainWindow(QMainWindow):
             # tests while still refusing to destroy a live QThread.
             self.shutdown_workers()
             if not self._background_work_running():
+                self._release_desktop_integration()
                 event.accept()
                 return
 
@@ -3765,6 +4775,8 @@ QFrame#HeroBadge {{ background: {PRIMARY_LIGHT}; border: 1px solid #dfe3ff; bord
 #DialogTitle {{ font-size: 21px; font-weight: 800; }}
 #MutedText, #QueueUrl, #QueueProgressText {{ color: {MUTED}; }}
 #QueueStats {{ color: {PRIMARY_DARK}; font-size: 12px; font-weight: 600; }}
+#QueueStats[tone="warning"], #QueueUrl[tone="warning"] {{ color: {WARNING}; font-weight: 600; }}
+#QueueStats[tone="danger"], #QueueUrl[tone="danger"] {{ color: {DANGER}; font-weight: 600; }}
 QPushButton[segment="true"] {{ padding: 8px 16px; }}
 QPushButton[segment="true"]:checked {{ background: {PRIMARY_LIGHT}; border-color: #c7d2fe; color: {PRIMARY_DARK}; font-weight: 700; }}
 #TransferProgress, #UploadList {{ background: #ffffff; border: 1px solid #d8e0ed; border-radius: 8px; padding: 4px; }}
@@ -3773,6 +4785,23 @@ QPushButton[segment="true"]:checked {{ background: {PRIMARY_LIGHT}; border-color
 #FieldLabel {{ color: {MUTED}; font-weight: 700; }}
 #TopAccount {{ background: #eef1f6; color: {MUTED}; border-radius: 16px; padding: 7px 14px; font-weight: 700; }}
 #TopAccount[connected="true"] {{ background: {SUCCESS_LIGHT}; color: {SUCCESS}; }}
+QToolButton#TopAccount {{ padding: 7px 32px 7px 14px; }}
+QToolButton#TopAccount:hover {{ background: #e3e8f0; }}
+QToolButton#TopAccount[connected="true"]:hover {{ background: #d4f1e2; }}
+QToolButton#TopAccount::menu-indicator {{ image: url("{_ARROW_DOWN}"); subcontrol-origin: padding; subcontrol-position: center right; right: 12px; width: 10px; height: 6px; }}
+#MessageBar {{ border-bottom: 1px solid {BORDER}; }}
+#MessageBar[tone="info"] {{ background: {PRIMARY_LIGHT}; }}
+#MessageBar[tone="success"] {{ background: {SUCCESS_LIGHT}; }}
+#MessageBar[tone="warning"] {{ background: {WARNING_LIGHT}; }}
+#MessageBar[tone="error"] {{ background: {DANGER_LIGHT}; }}
+#MessageText {{ font-weight: 600; color: {TEXT}; }}
+#MessageBar[tone="info"] #MessageText {{ color: {PRIMARY_DARK}; }}
+#MessageBar[tone="success"] #MessageText {{ color: {SUCCESS}; }}
+#MessageBar[tone="warning"] #MessageText {{ color: {WARNING}; }}
+#MessageBar[tone="error"] #MessageText {{ color: {DANGER}; }}
+#MessageAction {{ padding: 5px 12px; }}
+QToolButton#MessageClose {{ color: {MUTED}; padding: 4px 8px; }}
+#SuggestionText {{ color: {PRIMARY_DARK}; background: {PRIMARY_LIGHT}; border-radius: 8px; padding: 8px 10px; }}
 #AccountDot {{ color: {SUBTLE}; font-size: 17px; }}
 #AccountDot[connected="true"] {{ color: {SUCCESS}; }}
 #Avatar {{ background: {PRIMARY_LIGHT}; color: {PRIMARY}; border-radius: 21px; font-size: 18px; font-weight: 800; }}
@@ -3899,6 +4928,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     window = MainWindow()
+    # A real launch with no account goes straight to the login dialog; the
+    # unattended smoke and screenshot runs must never wait on a dialog.
+    window.prompt_login_when_empty = not (args.smoke_test or args.screenshot)
     window.show()
     smoke_exit_code = 0
 

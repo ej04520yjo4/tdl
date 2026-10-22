@@ -64,6 +64,10 @@ FORWARD_MODES = frozenset({"direct", "clone"})
 # manifest must decide how a resumed job lays out files, while old manifests
 # (which have no such field) must retain their original flat output behavior.
 _DEFAULT_GROUP_BY_CHAT = True
+DEFAULT_ACCOUNT_NAME = "Telegram 帳號"
+# A whole account name that is only a phone number (see
+# ``Store.rename_phone_named_accounts``).
+_ACCOUNT_PHONE_NAME_RE = re.compile(r"\+?[0-9][0-9 ()-]{5,}[0-9]")
 
 # Operations are tracked at module scope rather than on ``Runner`` instances.
 # The window normally owns one Runner, but keeping the registry shared also
@@ -143,8 +147,30 @@ def _normalize_job_title(value: Any) -> str:
 
 
 _FILE_PROGRESS_FIELDS = frozenset(
-    {"file_id", "state", "current", "total", "percent", "filename"}
+    {"file_id", "state", "current", "total", "percent", "filename", "path"}
 )
+
+
+def _clean_folder(value: Any) -> str:
+    """Keep a local folder reported by the core displayable and bounded.
+
+    Unlike message text this is not passed through ``sanitize_text``: a long
+    digit run in a folder name is part of the path, not a phone number.
+    """
+
+    text = "".join(char for char in str(value or "") if ord(char) >= 0x20).strip()
+    return text[:1024]
+
+
+def _clean_folders(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: list[str] = []
+    for item in value:
+        folder = _clean_folder(item)
+        if folder and folder not in result:
+            result.append(folder)
+    return result[:20]
 
 
 def _normalize_file_progress(value: Any) -> dict[str, dict[str, Any]]:
@@ -167,6 +193,11 @@ def _normalize_file_progress(value: Any) -> dict[str, dict[str, Any]]:
             field_value = raw_item[field_name]
             if field_name in {"state", "filename"}:
                 item[field_name] = sanitize_text(field_value)
+                continue
+            if field_name == "path":
+                folder = _clean_folder(field_value)
+                if folder:
+                    item[field_name] = folder
                 continue
             if field_name in {"current", "total"}:
                 if isinstance(field_value, bool):
@@ -591,6 +622,9 @@ class DownloadJob:
     # values are intentionally false in ``from_dict`` so resuming an old job
     # never moves its files into newly-created chat folders.
     group_by_chat: bool = False
+    # Folders the core actually wrote into (per-chat folders sit below
+    # ``output_dir``).  Kept after completion so 「開啟資料夾」 still works.
+    folders: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -641,6 +675,7 @@ class DownloadJob:
             file_count=_non_negative_int(raw.get("file_count")),
             total_bytes=_non_negative_int(raw.get("total_bytes")),
             group_by_chat=bool(raw.get("group_by_chat", False)),
+            folders=_clean_folders(raw.get("folders")),
         )
 
 
@@ -695,6 +730,7 @@ class Store:
         # protected again.
         self.reseal_plaintext_runtimes()
         self.purge_stale_exports()
+        self.rename_phone_named_accounts()
 
     def _ensure_files(self) -> None:
         with self._lock:
@@ -789,6 +825,37 @@ class Store:
     def rename_account(self, account_id: str, name: str) -> Account:
         return self.update_account(account_id, name=name)
 
+    @staticmethod
+    def friendly_account_name(account: Account) -> str:
+        """The name to show when the user did not choose one."""
+
+        if account.display_name and not _ACCOUNT_PHONE_NAME_RE.fullmatch(account.display_name):
+            return account.display_name[:128]
+        if account.username:
+            return f"@{account.username}"[:128]
+        return DEFAULT_ACCOUNT_NAME
+
+    def rename_phone_named_accounts(self) -> int:
+        """Replace account names that are just a phone number.
+
+        Before 1.5.0 a code login without a chosen name was saved under the
+        phone number, which then sat in accounts.json and on every page.
+        """
+
+        renamed = 0
+        with self._lock:
+            records = self._accounts_raw()
+            for record in records:
+                name = str(record.get("name", ""))
+                if not _ACCOUNT_PHONE_NAME_RE.fullmatch(name.strip()):
+                    continue
+                record["name"] = self.friendly_account_name(Account.from_dict(record))
+                record["updated_at"] = _utc_now()
+                renamed += 1
+            if renamed:
+                self._save_accounts(records)
+        return renamed
+
     def account_root(self, account_id: str, *, create: bool = False) -> Path:
         account_id = str(account_id)
         if not _is_uuid(account_id):
@@ -868,6 +935,8 @@ class Store:
                 values[key] = value
             # ``Preferences.from_dict`` forgives a damaged file by falling back
             # to defaults; a value the user just typed must be rejected instead.
+            if "proxy" in updates:
+                values["proxy"] = validate_proxy(updates["proxy"])
             normalize_download_advanced(
                 {
                     "template": values.get("template"),
@@ -1158,10 +1227,12 @@ class Store:
         )
 
     def update_job_progress(self, job_id: str, **progress: Any) -> DownloadJob:
-        allowed = {"percent", "current", "total", "speed", "filename", "file_progress"}
+        allowed = {"percent", "current", "total", "speed", "filename", "file_progress", "folders"}
         updates = {key: value for key, value in progress.items() if key in allowed}
         if "file_progress" in updates:
             updates["file_progress"] = _normalize_file_progress(updates["file_progress"])
+        if "folders" in updates:
+            updates["folders"] = _clean_folders(updates["folders"])
         return self._update_job(job_id, **updates)
 
     def finish_job(self, job_id: str, status: str, *, error: str | None = None) -> DownloadJob:
@@ -1255,6 +1326,36 @@ class Store:
                         item["file_progress"] = {}
                         item["file_snapshots"] = []
                 self._save_items(self._history_path, history_items)
+        for account_id, job_id in removed:
+            self._remove_job_data(account_id, job_id)
+        return [job_id for _account_id, job_id in removed]
+
+    def remove_history_items(self, job_ids: Sequence[str]) -> list[str]:
+        """Delete ended jobs from the download history (and the queue).
+
+        Downloaded files are untouched.  Jobs that can still run or resume
+        are refused, so a paused download never loses its record.
+        """
+
+        wanted = {str(job_id) for job_id in job_ids}
+        removable = {"completed", "failed", "cancelled"}
+        removed: list[tuple[str, str]] = []
+        with self._lock:
+            history_items = self._read_items(self._history_path)
+            kept_history: list[dict[str, Any]] = []
+            for item in history_items:
+                job_id = str(item.get("id", ""))
+                if job_id in wanted and str(item.get("status")) in removable:
+                    removed.append((str(item.get("account_id", "")), job_id))
+                else:
+                    kept_history.append(item)
+            if removed:
+                gone = {job_id for _account_id, job_id in removed}
+                queue_items = [
+                    item for item in self._read_items(self._queue_path) if str(item.get("id")) not in gone
+                ]
+                self._save_items(self._queue_path, queue_items)
+                self._save_items(self._history_path, kept_history)
         for account_id, job_id in removed:
             self._remove_job_data(account_id, job_id)
         return [job_id for _account_id, job_id in removed]
@@ -1985,13 +2086,33 @@ def sanitize_text(text: Any) -> str:
     return value[:4000]
 
 
+_DISK_FULL = "下載資料夾所在的磁碟空間不足。"
+_NO_WRITE_ACCESS = "沒有寫入這個資料夾的權限。"
+_PATH_TOO_LONG = "檔案路徑太長，Windows 無法建立這個檔案。"
+_FOLDER_MISSING = "找不到下載資料夾，請重新選擇。"
+
 _ERROR_TRANSLATIONS: tuple[tuple[str, str], ...] = (
+    # Local file system failures come first: they arrive wrapped in core
+    # errors that can also mention a network word.  Go reports them in the
+    # Windows display language, so match the Traditional Chinese text too.
+    ("there is not enough space on the disk", _DISK_FULL),
+    ("no space left on device", _DISK_FULL),
+    ("磁碟空間不足", _DISK_FULL),
+    ("access is denied", _NO_WRITE_ACCESS),
+    ("permission denied", _NO_WRITE_ACCESS),
+    ("存取被拒", _NO_WRITE_ACCESS),
+    ("拒絕存取", _NO_WRITE_ACCESS),
+    ("filename or extension is too long", _PATH_TOO_LONG),
+    ("file name too long", _PATH_TOO_LONG),
+    ("檔名或副檔名太長", _PATH_TOO_LONG),
+    ("the system cannot find the path specified", _FOLDER_MISSING),
+    ("系統找不到指定的路徑", _FOLDER_MISSING),
     ("session_password_needed", "需要輸入 Telegram 兩步驟驗證密碼。"),
     ("phone_code_invalid", "Telegram 驗證碼錯誤，請重新輸入。"),
     ("phone_number_invalid", "手機號碼格式無效，請確認國碼。"),
     ("phone_number_banned", "此手機號碼無法登入 Telegram。"),
-    ("auth_key_unregistered", "Telegram 工作階段已失效，請重新登入。"),
-    ("session_revoked", "Telegram 工作階段已被撤銷，請重新登入。"),
+    ("auth_key_unregistered", "Telegram 登入已失效，請重新登入。"),
+    ("session_revoked", "Telegram 登入已被撤銷，請重新登入。"),
     ("user_deactivated", "此 Telegram 帳號已被停用。"),
     ("channel_private", "這個頻道是私人頻道，請確認登入帳號有權限。"),
     ("code_expired", "Telegram 驗證碼已過期，請重新取得驗證碼。"),
@@ -2031,19 +2152,63 @@ _AUTH_INVALID_MARKERS = (
     "unauthorized",
     "not authorized",
     "工作階段已失效",
+    "登入已失效",
+    "登入已被撤銷",
     "帳號已被停用",
     "帳號已停用",
     "尚未登入 telegram",
 )
 
 
+_FLOOD_WAIT_RE = re.compile(r"flood_wait[_ ]*\(?(\d+)", re.IGNORECASE)
+
+
+def _wait_text(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds} 秒"
+    minutes = (seconds + 59) // 60
+    return f"{minutes} 分鐘" if minutes < 60 else f"{(minutes + 59) // 60} 小時"
+
+
 def translate_error(message: Any) -> str:
     clean = sanitize_text(message)
     lowered = clean.lower()
+    flood = _FLOOD_WAIT_RE.search(lowered)
+    if flood:
+        return f"Telegram 限制了操作頻率，約 {_wait_text(int(flood.group(1)))}後可再試。"
     for needle, translation in _ERROR_TRANSLATIONS:
         if needle in lowered:
             return translation
     return clean or "核心程式執行失敗。"
+
+
+# What the user can do next, keyed by words in an already translated error.
+# Checked in order; the first match wins.
+_NEXT_STEPS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("磁碟空間不足",), "請清出空間，或到「設定與說明」改選其他磁碟的下載資料夾。"),
+    (("寫入這個資料夾的權限",), "請改選有寫入權限的資料夾，例如「下載」或 D:\\Telegram。"),
+    (("路徑太長",), "請選擇較短的下載資料夾路徑，例如 D:\\Telegram，或在設定改用較短的檔名格式。"),
+    (("找不到下載資料夾",), "請重新選擇下載資料夾後按「重試」。"),
+    (("登入已失效", "登入已被撤銷", "尚未登入", "重新登入"), "請按視窗上方的「重新登入」（或到「帳號管理」），完成後再按「重試」。"),
+    (("代理",), "請到「設定與說明」檢查代理伺服器，或把它留白改為直接連線。"),
+    (("限制了操作頻率", "稍後再試"), "這是 Telegram 的暫時限制。請等提示的時間後再按「重試」；常遇到時可在設定調高「檔案之間的間隔」。"),
+    (("逾時", "無法連線網路"), "請確認網路連線（以及代理設定）後按「重試」。"),
+    (("私人頻道", "找不到目的地對話"), "請確認目前帳號已加入這個頻道或群組，必要時到「頻道下載」更新清單。"),
+    (("檔名格式",), "請到「設定與說明」把檔名格式改回預設。"),
+    (("禁止轉傳",), "請把轉傳方式改成「複製」。"),
+    (("沒有找到可下載的媒體",), "請調整日期或媒體類型後重新掃描。"),
+    (("有檔案下載失敗", "有檔案上傳失敗", "有訊息轉傳失敗"), "按「重試」只會處理還沒完成的項目，已完成的不會重複下載。"),
+)
+
+
+def suggest_next_step(message: Any) -> str:
+    """Return one sentence telling the user what to try, or ``""``."""
+
+    text = str(message or "")
+    for needles, step in _NEXT_STEPS:
+        if any(needle in text for needle in needles):
+            return step
+    return ""
 
 
 def _is_auth_invalid_error(*values: Any) -> bool:
@@ -2223,6 +2388,9 @@ def normalize_event(raw: Mapping[str, Any]) -> dict[str, Any]:
             if key in raw:
                 value = raw[key]
                 result[key] = sanitize_text(value) if key in {"speed", "filename", "file_id", "state"} else value
+        folder = _clean_folder(raw.get("path"))
+        if folder:
+            result["path"] = folder
         return result
     if name in {"error", "failed", "failure"}:
         diagnostic = sanitize_text(raw.get("message", raw.get("error", "")))
@@ -3279,6 +3447,7 @@ class Runner:
         # Per-file rows live here between durable writes; see
         # ``_PROGRESS_PERSIST_INTERVAL``.
         file_progress: dict[str, dict[str, Any]] = {}
+        job_folders: list[str] = []
         pending_progress: dict[str, Any] = {}
         last_progress_write = 0.0
         transfer_counts = {"total": 0, "completed": 0, "failed": 0}
@@ -3356,6 +3525,7 @@ class Runner:
                     request.group_by_chat = job.group_by_chat
                 self.store.mark_job_running(job.id)
                 file_progress = {key: dict(row) for key, row in job.file_progress.items()}
+                job_folders = list(job.folders)
 
             runtime = self.vault.prepare(request.account_id)
             runtime_prepared = True
@@ -3527,10 +3697,14 @@ class Runner:
                         if event.get("file_id"):
                             file_id = sanitize_text(event.get("file_id"))[:200]
                             row = file_progress.setdefault(file_id, {"file_id": file_id})
-                            for key in ("state", "current", "total", "percent", "filename"):
+                            for key in ("state", "current", "total", "percent", "filename", "path"):
                                 if event.get(key) is not None:
                                     row[key] = event.get(key)
                             pending_progress["file_progress"] = file_progress
+                        folder = event.get("path")
+                        if folder and folder not in job_folders and len(job_folders) < 20:
+                            job_folders.append(folder)
+                            pending_progress["folders"] = list(job_folders)
                         # Completions are not forced to disk either: a channel
                         # of small photos finishes many files per second.  The
                         # core's own checkpoint and --skip-same decide what a
@@ -3721,6 +3895,7 @@ __all__ = [
     "BackendError",
     "BackupRequest",
     "CoreNotFound",
+    "DEFAULT_ACCOUNT_NAME",
     "DEFAULT_TEMPLATE",
     "DataProtectionError",
     "DownloadJob",
@@ -3749,6 +3924,7 @@ __all__ = [
     "normalize_event",
     "normalize_extensions",
     "sanitize_text",
+    "suggest_next_step",
     "translate_error",
     "upload_caption_expression",
     "validate_backup_destination",
