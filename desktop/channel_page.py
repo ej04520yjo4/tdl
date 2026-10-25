@@ -361,6 +361,10 @@ class ChannelPage(QWidget):
 
     account_changed = Signal(str)
     download_requested = Signal(list, dict)
+    # Emitted only for a deliberate picker choice or a completed manual edit.
+    # MainWindow uses this to remember and mirror the user's destination;
+    # set_download_folder() intentionally never echoes it back.
+    download_folder_selected = Signal(str)
     # The main window owns the durable queue.  The page deliberately waits
     # for its acknowledgement before claiming that a scan was accepted.
     view_queue_requested = Signal()
@@ -399,6 +403,9 @@ class ChannelPage(QWidget):
         self._export_request_pending = False
         self._export_consumed = False
         self._download_folder = ""
+        # Standalone tests and embedders keep the existing one-time picker
+        # behaviour.  The real MainWindow passes the persisted preference.
+        self._ask_download_folder = False
         self._proxy = ""
         self._concurrency = 2
         self._skip_existing = True
@@ -597,7 +604,7 @@ class ChannelPage(QWidget):
         media_row.addStretch(1)
         filters_layout.addLayout(media_row)
 
-        folder_label = QLabel("下載資料夾")
+        folder_label = QLabel("儲存位置")
         folder_label.setObjectName("FieldLabel")
         filters_layout.addWidget(folder_label)
         folder_row = QHBoxLayout()
@@ -605,8 +612,12 @@ class ChannelPage(QWidget):
         self.folder_edit.setObjectName("FolderEdit")
         self.folder_edit.setPlaceholderText("請選擇檔案要保存的位置")
         self.folder_edit.textChanged.connect(self._folder_changed)
+        self.folder_edit.editingFinished.connect(self._folder_editing_finished)
         folder_row.addWidget(self.folder_edit, 1)
-        self.folder_button = QPushButton("選擇資料夾")
+        self.folder_button = QPushButton("選擇位置…")
+        self.folder_button.setToolTip(
+            "選擇下載根目錄；檔案會再放入群組／頻道名稱子資料夾。"
+        )
         self.folder_button.clicked.connect(self._choose_folder)
         folder_row.addWidget(self.folder_button)
         filters_layout.addLayout(folder_row)
@@ -809,11 +820,20 @@ class ChannelPage(QWidget):
         self._download_folder = _text(path).strip()
         if not self.folder_edit.hasFocus() or not self.folder_edit.text().strip():
             self.folder_edit.setText(self._download_folder)
+        self._update_folder_tooltip(self.folder_edit.text().strip() or self._download_folder)
 
-    def set_download_preferences(self, *, concurrency: int = 2, proxy: str = "", skip_existing: bool = True) -> None:
+    def set_download_preferences(
+        self,
+        *,
+        concurrency: int = 2,
+        proxy: str = "",
+        skip_existing: bool = True,
+        ask_download_folder: bool = False,
+    ) -> None:
         self._concurrency = max(1, min(64, int(concurrency or 2)))
         self._proxy = _text(proxy).strip()
         self._skip_existing = bool(skip_existing)
+        self._ask_download_folder = bool(ask_download_folder)
 
     def is_busy(self) -> bool:
         return _thread_running(self._thread)
@@ -913,17 +933,41 @@ class ChannelPage(QWidget):
         self.end_date.blockSignals(False)
         self._selection_inputs_changed()
 
-    def _choose_folder(self) -> None:
+    def _choose_folder(self) -> bool:
         selected = QFileDialog.getExistingDirectory(
             self,
-            "選擇頻道下載資料夾",
+            "選擇這次下載的儲存位置",
             self.folder_edit.text().strip() or str(Path.home() / "Downloads"),
         )
-        if selected:
-            self.folder_edit.setText(selected)
+        selected = _text(selected).strip()
+        if not selected:
+            return False
+        self.folder_edit.setText(selected)
+        self._download_folder = selected
+        self._update_folder_tooltip(selected)
+        self.download_folder_selected.emit(selected)
+        return True
 
     def _folder_changed(self, value: str) -> None:
         self._download_folder = value.strip()
+
+    def _folder_editing_finished(self) -> None:
+        """Publish a deliberate non-empty manual destination edit."""
+
+        selected = self.folder_edit.text().strip()
+        if not selected:
+            return
+        self._download_folder = selected
+        self._update_folder_tooltip(selected)
+        self.download_folder_selected.emit(selected)
+
+    def _update_folder_tooltip(self, path: str) -> None:
+        path = _text(path).strip()
+        self.folder_edit.setToolTip(
+            f"目前儲存位置：{path}\n檔案會再放入群組／頻道名稱子資料夾。"
+            if path
+            else "選擇下載根目錄；檔案會再放入群組／頻道名稱子資料夾。"
+        )
 
     def _selection_inputs_changed(self, *_args: Any) -> None:
         """Invalidate a scan when its source/date/media inputs change.
@@ -1498,9 +1542,28 @@ class ChannelPage(QWidget):
             self._update_download_button()
             return
         snapshot = dict(self._export_snapshot or {})
+        picker_opened = bool(self._ask_download_folder or not self.folder_edit.text().strip())
+        if picker_opened and not self._choose_folder():
+            self._set_status("已取消選擇儲存位置，尚未加入下載；掃描結果仍保留。")
+            self._update_download_button()
+            return
+        if picker_opened:
+            # QFileDialog runs a nested Qt event loop.  A queued account/chat
+            # refresh can therefore change the selection while the dialog is
+            # open.  Never pair the old manifest with that new selection.
+            current_snapshot = self._current_export_snapshot()
+            if (
+                not self._manifest_matches_current()
+                or current_snapshot is None
+                or not self._snapshots_match(snapshot, current_snapshot)
+            ):
+                self._set_scan_summary("下載條件已變更或掃描結果已失效，請重新掃描。")
+                self._set_status("下載條件已變更，請先重新掃描。")
+                self._update_download_button()
+                return
         folder = self.folder_edit.text().strip()
         if not folder:
-            self._set_status("請先選擇下載資料夾。")
+            self._set_status("請先選擇儲存位置。")
             return
         chat_title = _text(snapshot.get("chat_title"), _chat_title(self._selected_chat))
         topic_title = _text(snapshot.get("topic_title"))

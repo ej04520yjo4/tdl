@@ -12,7 +12,10 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from version import VERSION
+try:
+    from desktop.version import VERSION
+except ImportError:  # pragma: no cover - direct ``python desktop/package_release.py``
+    from version import VERSION
 
 
 def copy_release_file(source: Path, target: Path) -> None:
@@ -36,6 +39,26 @@ def write_version_info(root: Path) -> Path:
     target = root / ".build" / "version_info.txt"
     target.parent.mkdir(exist_ok=True)
     target.write_text(text, encoding="utf-8")
+    return target
+
+
+def write_release_text(path: Path, text: str) -> None:
+    """Write a published text file with LF line endings on every platform.
+
+    ``Path.write_text`` writes CRLF on Windows. A CRLF ``SHA256SUMS.txt``
+    makes ``sha256sum -c`` look for file names ending in a carriage return
+    and report every asset as missing.
+    """
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def write_checksums(release: Path, names: list[str]) -> Path:
+    """Write ``SHA256SUMS.txt`` for the named assets present in ``release``."""
+    target = release / "SHA256SUMS.txt"
+    write_release_text(
+        target,
+        "".join(hashlib.sha256((release / name).read_bytes()).hexdigest() + "  " + name + "\n" for name in names if (release / name).is_file()),
+    )
     return target
 
 
@@ -128,7 +151,7 @@ def main() -> None:
             if qr.get("ok") and qr.get("sha256") == report["sha256"]:
                 report["qr_display_test"] = "PASS_CANCELLED_BEFORE_AUTHENTICATION"
                 report["qr_verification_receipt"] = qr_receipt.name
-        (release / "build-info.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_release_text(release / "build-info.json", json.dumps(report, ensure_ascii=False, indent=2))
     # GitHub sanitizes non-ASCII asset names (different Chinese ZIP names
     # can both become TDL.zip). Keep friendly local names and publish these
     # unambiguous ASCII aliases, with Chinese descriptions in the release.
@@ -153,10 +176,7 @@ def main() -> None:
             receipt = json.loads(path.read_text(encoding="utf-8"))
             if receipt.get("sha256") == report["sha256"] and (receipt.get("ok") or receipt.get("result") == "PASS"):
                 assets.append(name)
-    (release / "SHA256SUMS.txt").write_text(
-        "".join(hashlib.sha256((release / name).read_bytes()).hexdigest() + "  " + name + "\n" for name in assets if (release / name).is_file()),
-        encoding="utf-8",
-    )
+    write_checksums(release, assets)
     print("Release source and licenses collected.")
 
 

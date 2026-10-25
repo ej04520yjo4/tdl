@@ -1,0 +1,30 @@
+{
+  "ok": true,
+  "version": "1.5.1",
+  "sha256": "7a355091d8c2862949bc7c0aa3cbd7b1549717662f56d168e0b01eab7eb12454",
+  "offline_fixture": true,
+  "separate_exe_processes": 2,
+  "phases": [
+    {
+      "ok": true,
+      "phase": "before-close",
+      "offline_fixture": true,
+      "saved_as_paused": true,
+      "group_by_chat_saved": true,
+      "group_folder_fixture": true
+    },
+    {
+      "ok": true,
+      "phase": "after-reopen",
+      "offline_fixture": true,
+      "resumed_same_job": true,
+      "original_account": true,
+      "completed_file_unchanged": true,
+      "remaining_file_written": true,
+      "continue_flag": true,
+      "group_by_chat_restored": true,
+      "group_folder_fixture": true,
+      "file_rows_restored": true
+    }
+  ]
+}
