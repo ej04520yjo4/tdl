@@ -219,7 +219,9 @@ class MainWindowTests(_QtCase):
             page.threads_spin.setValue(8)
             page.takeout_check.setChecked(True)
             page._apply_advanced()
-            self.pump(lambda: page.advanced_status.text().startswith("已套用"))
+            # Settings save on every change; wait for the last one to land.
+            self.pump(lambda: bridge.store.get_preferences().threads == 8 and not window._preference_saving)
+            self.assertTrue(page.advanced_status.text().startswith("已儲存"))
             saved = bridge.store.get_preferences()
             self.assertEqual(saved.include_ext, "mp4")
             self.assertEqual(saved.template, "{{ .MessageID }}_{{ filenamify .FileName }}")
