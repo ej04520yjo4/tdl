@@ -986,6 +986,7 @@ def _preference_values(value: Any) -> dict[str, Any]:
 
     return {
         "download_folder": _safe_str(_extract(value, "download_dir", "download_folder", default="")),
+        "ask_download_folder": bool(_extract(value, "ask_download_folder", default=True)),
         "proxy": _safe_str(_extract(value, "proxy", default="")),
         "concurrency": int(_extract(value, "concurrency", default=2) or 2),
         "group": bool(_extract(value, "group", default=True)),
@@ -2243,6 +2244,7 @@ class _LinkEdit(QTextEdit):
 
 class DownloadPage(QWidget):
     download_requested = Signal(list, dict)
+    download_folder_selected = Signal(str)
     files_dropped = Signal(list)
     channel_requested = Signal()
     queue_summary_changed = Signal(str)
@@ -2261,6 +2263,7 @@ class DownloadPage(QWidget):
         self.jobs: dict[str, DownloadJob] = {}
         self.rows: dict[str, QueueRow] = {}
         self.proxy_value = ""
+        self.ask_download_folder = False
         self._accounts: list[AccountInfo] = []
         # Official Telegram export JSON files are sent to the backend as
         # ``files``.  Keeping them separate from the URL editor prevents a
@@ -2363,12 +2366,12 @@ class DownloadPage(QWidget):
         self.url_edit.setMinimumHeight(96)
         self.url_edit.files_dropped.connect(self.files_dropped.emit)
         folder_line = QHBoxLayout()
-        folder_label = QLabel("下載到")
+        folder_label = QLabel("儲存位置")
         folder_label.setObjectName("FieldLabel")
         self.folder_edit = QLineEdit()
         self.folder_edit.setReadOnly(True)
         self.folder_edit.setObjectName("FolderEdit")
-        folder_button = QPushButton("選擇資料夾")
+        folder_button = QPushButton("選擇位置…")
         folder_button.clicked.connect(self.choose_folder)
         folder_line.addWidget(folder_label)
         folder_line.addWidget(self.folder_edit, 1)
@@ -2396,7 +2399,7 @@ class DownloadPage(QWidget):
         input_layout.addWidget(input_hint)
         input_layout.addWidget(self.url_edit)
         input_layout.addLayout(folder_line)
-        folder_hint = QLabel("新下載會自動放入「群組／頻道名稱」子資料夾。相簿、同名檔案與同時下載數在「設定與說明」調整。")
+        folder_hint = QLabel("檔案會放入所選位置下的「群組／頻道名稱」子資料夾。預設在開始下載時再次確認位置，可到「設定與說明」關閉。")
         folder_hint.setObjectName("MutedText")
         folder_hint.setWordWrap(True)
         input_layout.addWidget(folder_hint)
@@ -2482,11 +2485,15 @@ class DownloadPage(QWidget):
                 urls.append(normalised)
         return urls
 
-    def choose_folder(self) -> None:
+    def choose_folder(self) -> bool:
         start = self.folder_edit.text().strip() or str(Path.home() / "Downloads")
-        path = QFileDialog.getExistingDirectory(self, "選擇下載資料夾", start)
-        if path:
-            self.folder_edit.setText(path)
+        path = QFileDialog.getExistingDirectory(self, "選擇這次下載的儲存位置", start)
+        if not path:
+            return False
+        self.folder_edit.setText(path)
+        self.folder_edit.setToolTip(path)
+        self.download_folder_selected.emit(path)
+        return True
 
     def _request_download(self) -> None:
         urls = self.parse_urls()
@@ -2495,8 +2502,24 @@ class DownloadPage(QWidget):
             show_error(self, "還沒有下載項目", "請先貼上 Telegram 訊息連結，或匯入官方 Telegram JSON 檔案。")
             self.url_edit.setFocus()
             return
-        if not self.folder_edit.text().strip():
-            self.choose_folder()
+        account_id = self.account_combo.currentData() or ""
+        account = next((item for item in self._accounts if item.id == account_id), None)
+        if account is None or not account.authenticated:
+            show_error(self, "請先登入 Telegram", "請先在帳號管理完成登入，再選擇儲存位置並開始下載。")
+            self.account_requested.emit()
+            return
+        if self.ask_download_folder or not self.folder_edit.text().strip():
+            if not self.choose_folder():
+                self.input_count.setText("已取消選擇儲存位置，尚未加入下載。")
+                return
+        current_account = next((item for item in self._accounts if item.id == account_id), None)
+        if (
+            account_id != (self.account_combo.currentData() or "")
+            or current_account is None
+            or not current_account.authenticated
+        ):
+            self.input_count.setText("使用中的帳號已變更，請確認後重新開始下載。")
+            return
         folder = self.folder_edit.text().strip()
         if not folder:
             return
@@ -2504,7 +2527,7 @@ class DownloadPage(QWidget):
             "group_album": self.group_check.isChecked(),
             "skip_existing": self.skip_check.isChecked(),
             "concurrency": self.concurrency_spin.value(),
-            "account_id": self.account_combo.currentData() or "",
+            "account_id": account_id,
             "proxy": self.proxy_value,
             "files": files,
         }
@@ -2928,6 +2951,12 @@ class SettingsPage(QWidget):
         folder_layout.addWidget(self.folder_edit, 1)
         folder_layout.addWidget(choose)
         form.addRow("預設下載資料夾", folder_wrap)
+        self.folder_edit.setToolTip(self.folder_edit.text())
+        self.ask_folder_check = QCheckBox("每次新增下載時選擇儲存位置")
+        self.ask_folder_check.setChecked(bool(self._preferences.get("ask_download_folder", True)))
+        self.ask_folder_check.setToolTip("關閉後使用上次的儲存位置；已在佇列中的工作及重新開啟後的接續下載維持原本位置。")
+        self.ask_folder_check.toggled.connect(self.save)
+        form.addRow("", self.ask_folder_check)
         self._saved_proxy = _safe_str(self._preferences.get("proxy", ""))
         self.proxy_edit = QLineEdit(self._saved_proxy)
         self.proxy_edit.setPlaceholderText("留白代表直接連線，例如 socks5://127.0.0.1:1080")
@@ -3187,6 +3216,7 @@ class SettingsPage(QWidget):
         path = QFileDialog.getExistingDirectory(self, "選擇預設下載資料夾", self.folder_edit.text() or str(Path.home() / "Downloads"))
         if path:
             self.folder_edit.setText(path)
+            self.folder_edit.setToolTip(path)
             self.save()
 
     def save(self) -> None:
@@ -3197,6 +3227,7 @@ class SettingsPage(QWidget):
     def values(self) -> dict[str, Any]:
         return {
             "download_folder": self.folder_edit.text().strip(),
+            "ask_download_folder": self.ask_folder_check.isChecked(),
             # Only the last value that passed validation; a half-typed proxy
             # must not ride along with an unrelated change.
             "proxy": self._saved_proxy,
@@ -3367,6 +3398,7 @@ class MainWindow(QMainWindow):
         self.home_page.channel_requested.connect(lambda: self._show_widget(self.channel_page))
         self.home_page.queue_summary_changed.connect(self.channel_page.queue_status_label.setText)
         self.home_page.download_requested.connect(self._enqueue_downloads)
+        self.home_page.download_folder_selected.connect(self._download_folder_selected)
         self.home_page.export_requested.connect(self._export_json)
         self.home_page.import_requested.connect(self._import_json)
         self.home_page.cancel_requested.connect(self.cancel_job)
@@ -3387,6 +3419,7 @@ class MainWindow(QMainWindow):
         self.account_page.account_relogin_requested.connect(self._relogin_account)
         self.channel_page.account_changed.connect(self._set_active_account)
         self.channel_page.download_requested.connect(self._enqueue_channel_downloads)
+        self.channel_page.download_folder_selected.connect(self._download_folder_selected)
         self.channel_page.view_queue_requested.connect(self._show_download_queue)
         self.transfer_page.account_changed.connect(self._set_active_account)
         self._rebuild_account_menu()
@@ -3418,6 +3451,8 @@ class MainWindow(QMainWindow):
     def _load_preferences(self) -> None:
         values = self.settings_page.values()
         self.home_page.folder_edit.setText(_safe_str(values.get("download_folder", "")))
+        self.home_page.folder_edit.setToolTip(self.home_page.folder_edit.text())
+        self.home_page.ask_download_folder = bool(values.get("ask_download_folder", True))
         self.home_page.proxy_value = _safe_str(values.get("proxy", ""))
         concurrency = int(values.get("concurrency", 2) or 2)
         self.home_page.concurrency_spin.setValue(max(1, min(16, concurrency)))
@@ -3428,6 +3463,7 @@ class MainWindow(QMainWindow):
             concurrency=concurrency,
             proxy=_safe_str(values.get("proxy", "")),
             skip_existing=self.home_page.skip_check.isChecked(),
+            ask_download_folder=self.home_page.ask_download_folder,
         )
         self.transfer_page.set_proxy(_safe_str(values.get("proxy", "")))
 
@@ -3440,6 +3476,9 @@ class MainWindow(QMainWindow):
     def _settings_changed(self, values: Mapping[str, Any]) -> None:
         if values.get("download_folder") is not None:
             self.home_page.folder_edit.setText(_safe_str(values.get("download_folder")))
+            self.home_page.folder_edit.setToolTip(self.home_page.folder_edit.text())
+        if values.get("ask_download_folder") is not None:
+            self.home_page.ask_download_folder = bool(values["ask_download_folder"])
         if values.get("concurrency") is not None:
             self.home_page.concurrency_spin.setValue(int(values["concurrency"]))
         if values.get("proxy") is not None:
@@ -3453,11 +3492,13 @@ class MainWindow(QMainWindow):
             concurrency=int(values.get("concurrency", self.home_page.concurrency_spin.value()) or 2),
             proxy=_safe_str(values.get("proxy", self.home_page.proxy_value)),
             skip_existing=self.home_page.skip_check.isChecked(),
+            ask_download_folder=self.home_page.ask_download_folder,
         )
         self.transfer_page.set_proxy(self.home_page.proxy_value)
         self._save_preferences(
             {
                 "download_dir": _safe_str(values.get("download_folder", "")),
+                "ask_download_folder": self.home_page.ask_download_folder,
                 "proxy": _safe_str(values.get("proxy", "")),
                 "concurrency": int(values.get("concurrency", 2) or 2),
                 "group": bool(values.get("group", self.home_page.group_check.isChecked())),
@@ -3465,6 +3506,23 @@ class MainWindow(QMainWindow):
             },
             on_failure=lambda detail: self.settings_page.set_proxy_status(
                 _last_error_line(detail) or "設定沒有儲存，請檢查欄位內容。", error=True
+            ),
+        )
+
+    def _download_folder_selected(self, folder: str) -> None:
+        folder = folder.strip()
+        if not folder:
+            return
+        self.home_page.folder_edit.setText(folder)
+        self.home_page.folder_edit.setToolTip(folder)
+        self.channel_page.set_download_folder(folder)
+        self.settings_page.folder_edit.setText(folder)
+        self.settings_page.folder_edit.setToolTip(folder)
+        self.settings_page._preferences["download_folder"] = folder
+        self._save_preferences(
+            {"download_dir": folder},
+            on_failure=lambda detail: show_error(
+                self, "儲存位置未能記住", _last_error_line(detail) or "請確認設定資料夾可以寫入。"
             ),
         )
 

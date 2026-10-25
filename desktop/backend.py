@@ -488,6 +488,10 @@ def normalize_download_advanced(raw: Any) -> dict[str, Any]:
 @dataclass
 class Preferences:
     download_dir: str = ""
+    # New installations ask for a destination when a download is started.
+    # Older preference files do not have this key and therefore keep the
+    # safe, explicit-picker default.
+    ask_download_folder: bool = True
     concurrency: int = 2
     continue_download: bool = True
     skip_same: bool = True
@@ -534,6 +538,12 @@ class Preferences:
     def from_dict(cls, raw: Mapping[str, Any], default_download_dir: str) -> "Preferences":
         data = dict(raw)
         directory = str(data.get("download_dir") or default_download_dir)
+        ask_download_folder = data.get("ask_download_folder", True)
+        if not isinstance(ask_download_folder, bool):
+            # JSON written by older versions is missing this key.  Treat
+            # malformed hand-edited values as the safe default instead of
+            # allowing a truthy string such as "false" to disable the picker.
+            ask_download_folder = True
         try:
             concurrency = int(data.get("concurrency", 2))
         except (ValueError, TypeError):
@@ -557,6 +567,7 @@ class Preferences:
             advanced = normalize_download_advanced({})
         return cls(
             download_dir=directory,
+            ask_download_folder=ask_download_folder,
             concurrency=max(1, min(concurrency, 64)),
             continue_download=bool(data.get("continue_download", True)),
             skip_same=bool(data.get("skip_same", True)),
