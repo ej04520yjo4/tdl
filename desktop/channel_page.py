@@ -59,6 +59,8 @@ _MEDIA_LABELS = {
     "document": "文件",
 }
 
+DOWNLOAD_BUTTON_TEXT = "② 加入下載"
+
 # Telegram opened in August 2013; no message is older than this.
 _TELEGRAM_EPOCH = QDate(2013, 8, 1)
 
@@ -359,6 +361,10 @@ class ChannelPage(QWidget):
 
     account_changed = Signal(str)
     download_requested = Signal(list, dict)
+    # Emitted only for a deliberate picker choice or a completed manual edit.
+    # MainWindow uses this to remember and mirror the user's destination;
+    # set_download_folder() intentionally never echoes it back.
+    download_folder_selected = Signal(str)
     # The main window owns the durable queue.  The page deliberately waits
     # for its acknowledgement before claiming that a scan was accepted.
     view_queue_requested = Signal()
@@ -397,6 +403,9 @@ class ChannelPage(QWidget):
         self._export_request_pending = False
         self._export_consumed = False
         self._download_folder = ""
+        # Standalone tests and embedders keep the existing one-time picker
+        # behaviour.  The real MainWindow passes the persisted preference.
+        self._ask_download_folder = False
         self._proxy = ""
         self._concurrency = 2
         self._skip_existing = True
@@ -415,28 +424,20 @@ class ChannelPage(QWidget):
         title = QLabel("選頻道，先看數量再下載。")
         title.setObjectName("PageTitle")
         outer.addWidget(title)
-        intro = QLabel("選擇帳號、頻道與日期，掃描後再加入下載佇列。")
+        intro = QLabel("從左側清單選一個頻道或群組，設定日期與類型，先查看符合的檔案，再加入下載。")
         intro.setObjectName("HeroDescription")
         intro.setWordWrap(True)
         outer.addWidget(intro)
 
-        account_card = _Card()
-        account_layout = QHBoxLayout(account_card)
-        account_layout.setContentsMargins(14, 10, 14, 10)
-        account_layout.setSpacing(12)
-        account_label = QLabel("下載帳號")
-        account_label.setObjectName("FieldLabel")
-        account_layout.addWidget(account_label)
-        self.account_combo = QComboBox()
-        self.account_combo.setMinimumWidth(280)
-        self.account_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        # The account is chosen in the window's top bar.  This combo is kept
+        # as hidden state that follows it (see ``set_accounts``).
+        self.account_combo = QComboBox(self)
         self.account_combo.currentIndexChanged.connect(self._account_changed)
-        account_layout.addWidget(self.account_combo, 1)
+        self.account_combo.hide()
         self.refresh_button = QPushButton("更新清單")
         self.refresh_button.setObjectName("SecondaryButton")
+        self.refresh_button.setToolTip("重新讀取目前帳號可存取的頻道與群組")
         self.refresh_button.clicked.connect(self.refresh_channels)
-        account_layout.addWidget(self.refresh_button)
-        outer.addWidget(account_card)
 
         channel_card = _Card()
         channel_layout = QVBoxLayout(channel_card)
@@ -449,6 +450,7 @@ class ChannelPage(QWidget):
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.textChanged.connect(self._apply_filter)
         search_row.addWidget(self.search_edit, 1)
+        search_row.addWidget(self.refresh_button)
         channel_layout.addLayout(search_row)
         filter_row = QHBoxLayout()
         filter_row.setSpacing(8)
@@ -476,6 +478,12 @@ class ChannelPage(QWidget):
             "QListWidget::item:selected { background: #4f46e5; color: #ffffff; }"
         )
         self.chat_list.setAlternatingRowColors(True)
+        # Long names end in「…」with the full name as a tooltip; a sideways
+        # scrollbar at the minimum window width was hard to use.
+        for names in (self.chat_list,):
+            names.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            names.setTextElideMode(Qt.ElideRight)
+            names.setWordWrap(False)
         self.chat_list.currentItemChanged.connect(self._chat_selected)
         channel_layout.addWidget(self.chat_list)
         self.chat_hint = QLabel("請按「更新清單」載入目前帳號可存取的頻道與群組。")
@@ -514,6 +522,9 @@ class ChannelPage(QWidget):
             "QListWidget::item { padding: 7px 9px; border-radius: 6px; }"
             "QListWidget::item:selected { background: #4f46e5; color: #ffffff; }"
         )
+        self.topic_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.topic_list.setTextElideMode(Qt.ElideRight)
+        self.topic_list.setWordWrap(False)
         self.topic_list.currentItemChanged.connect(self._topic_selected)
         topic_layout.addWidget(self.topic_list)
         self.topic_hint = QLabel("論壇群組需要先選擇主題，或明確選擇「全部主題」。")
@@ -593,7 +604,7 @@ class ChannelPage(QWidget):
         media_row.addStretch(1)
         filters_layout.addLayout(media_row)
 
-        folder_label = QLabel("下載資料夾")
+        folder_label = QLabel("儲存位置")
         folder_label.setObjectName("FieldLabel")
         filters_layout.addWidget(folder_label)
         folder_row = QHBoxLayout()
@@ -601,8 +612,12 @@ class ChannelPage(QWidget):
         self.folder_edit.setObjectName("FolderEdit")
         self.folder_edit.setPlaceholderText("請選擇檔案要保存的位置")
         self.folder_edit.textChanged.connect(self._folder_changed)
+        self.folder_edit.editingFinished.connect(self._folder_editing_finished)
         folder_row.addWidget(self.folder_edit, 1)
-        self.folder_button = QPushButton("選擇資料夾")
+        self.folder_button = QPushButton("選擇位置…")
+        self.folder_button.setToolTip(
+            "選擇下載根目錄；檔案會再放入群組／頻道名稱子資料夾。"
+        )
         self.folder_button.clicked.connect(self._choose_folder)
         folder_row.addWidget(self.folder_button)
         filters_layout.addLayout(folder_row)
@@ -627,11 +642,13 @@ class ChannelPage(QWidget):
         self.cancel_button.setVisible(False)
         button_row.addWidget(self.cancel_button)
         button_row.addStretch(1)
-        self.scan_button = QPushButton("先掃描符合媒體數")
+        self.scan_button = QPushButton("① 查看符合的檔案")
+        self.scan_button.setToolTip("向 Telegram 查詢符合日期與類型的檔案數量和大小；這一步不會下載")
         self.scan_button.setObjectName("PrimaryButton")
         self.scan_button.clicked.connect(self._scan_clicked)
         button_row.addWidget(self.scan_button)
-        self.download_button = QPushButton("開始下載")
+        self.download_button = QPushButton(DOWNLOAD_BUTTON_TEXT)
+        self.download_button.setToolTip("把查到的檔案加入下載佇列")
         self.download_button.setObjectName("PrimaryButton")
         self.download_button.setEnabled(False)
         self.download_button.clicked.connect(self._download_clicked)
@@ -652,10 +669,13 @@ class ChannelPage(QWidget):
         self.current_source_label.setStyleSheet("font-weight: 600; color: #3157b7;")
         self.current_source_label.setWordWrap(True)
         context_layout.addWidget(self.current_source_label)
-        self.current_source_identity_label = QLabel("識別：尚未選擇")
+        # The internal reference (channel:123) only helps when reporting a
+        # problem, so it lives in the source tooltip instead of on screen.
+        self.current_source_identity_label = QLabel("")
         self.current_source_identity_label.setObjectName("MutedText")
         self.current_source_identity_label.setTextFormat(Qt.TextFormat.PlainText)
         self.current_source_identity_label.setWordWrap(True)
+        self.current_source_identity_label.hide()
         context_layout.addWidget(self.current_source_identity_label)
         self.scan_summary_label = QLabel("尚未掃描；選好來源、日期與媒體類型後開始掃描。")
         self.scan_summary_label.setObjectName("ScanSummary")
@@ -765,9 +785,9 @@ class ChannelPage(QWidget):
         self._update_current_source_label()
         if not self.account_combo.count():
             self.account_combo.addItem("尚未登入 Telegram")
-            self._set_status("尚未有可用帳號。請先到「帳號管理」完成登入。")
+            self._set_status("尚未登入 Telegram：請按視窗上方的「立即登入」。")
         elif not self._current_account_is_authenticated():
-            self._set_status("目前帳號尚未登入，請先完成 Telegram 登入。")
+            self._set_status("目前帳號需要重新登入：請按視窗上方的「重新登入」。")
         elif changed and not self._load_cached_chats():
             self._set_status("請按「更新清單」載入目前帳號可存取的頻道與群組。")
 
@@ -800,11 +820,20 @@ class ChannelPage(QWidget):
         self._download_folder = _text(path).strip()
         if not self.folder_edit.hasFocus() or not self.folder_edit.text().strip():
             self.folder_edit.setText(self._download_folder)
+        self._update_folder_tooltip(self.folder_edit.text().strip() or self._download_folder)
 
-    def set_download_preferences(self, *, concurrency: int = 2, proxy: str = "", skip_existing: bool = True) -> None:
+    def set_download_preferences(
+        self,
+        *,
+        concurrency: int = 2,
+        proxy: str = "",
+        skip_existing: bool = True,
+        ask_download_folder: bool = False,
+    ) -> None:
         self._concurrency = max(1, min(64, int(concurrency or 2)))
         self._proxy = _text(proxy).strip()
         self._skip_existing = bool(skip_existing)
+        self._ask_download_folder = bool(ask_download_folder)
 
     def is_busy(self) -> bool:
         return _thread_running(self._thread)
@@ -822,7 +851,7 @@ class ChannelPage(QWidget):
             self._set_status("請先選擇一個 Telegram 帳號。")
             return
         if not self._current_account_is_authenticated():
-            self._set_status("目前帳號尚未登入，請先完成 Telegram 登入。")
+            self._set_status("目前帳號需要重新登入：請按視窗上方的「重新登入」。")
             return
         if self._runner is None or not callable(getattr(self._runner, "start_list_chats", None)):
             self._set_status("目前後端尚未提供頻道清單功能。")
@@ -881,7 +910,7 @@ class ChannelPage(QWidget):
             if not self._load_cached_chats():
                 self._set_status("帳號已切換，請按「更新清單」。")
         elif account_id:
-            self._set_status("目前帳號尚未登入，請先完成 Telegram 登入。")
+            self._set_status("目前帳號需要重新登入：請按視窗上方的「重新登入」。")
         else:
             self._set_status("請先選擇一個 Telegram 帳號。")
 
@@ -904,17 +933,41 @@ class ChannelPage(QWidget):
         self.end_date.blockSignals(False)
         self._selection_inputs_changed()
 
-    def _choose_folder(self) -> None:
+    def _choose_folder(self) -> bool:
         selected = QFileDialog.getExistingDirectory(
             self,
-            "選擇頻道下載資料夾",
+            "選擇這次下載的儲存位置",
             self.folder_edit.text().strip() or str(Path.home() / "Downloads"),
         )
-        if selected:
-            self.folder_edit.setText(selected)
+        selected = _text(selected).strip()
+        if not selected:
+            return False
+        self.folder_edit.setText(selected)
+        self._download_folder = selected
+        self._update_folder_tooltip(selected)
+        self.download_folder_selected.emit(selected)
+        return True
 
     def _folder_changed(self, value: str) -> None:
         self._download_folder = value.strip()
+
+    def _folder_editing_finished(self) -> None:
+        """Publish a deliberate non-empty manual destination edit."""
+
+        selected = self.folder_edit.text().strip()
+        if not selected:
+            return
+        self._download_folder = selected
+        self._update_folder_tooltip(selected)
+        self.download_folder_selected.emit(selected)
+
+    def _update_folder_tooltip(self, path: str) -> None:
+        path = _text(path).strip()
+        self.folder_edit.setToolTip(
+            f"目前儲存位置：{path}\n檔案會再放入群組／頻道名稱子資料夾。"
+            if path
+            else "選擇下載根目錄；檔案會再放入群組／頻道名稱子資料夾。"
+        )
 
     def _selection_inputs_changed(self, *_args: Any) -> None:
         """Invalidate a scan when its source/date/media inputs change.
@@ -937,7 +990,7 @@ class ChannelPage(QWidget):
         self._update_current_source_label()
         if reason:
             self._set_scan_summary(reason)
-            self._set_status(reason)
+            self._set_status("")
 
     def _clear_source_selection(self) -> None:
         """Reset source/search/topic state while retaining download settings."""
@@ -973,7 +1026,7 @@ class ChannelPage(QWidget):
         self._update_current_source_label()
         self._update_scan_button()
         self._set_scan_summary("已清除來源；日期、媒體類型和資料夾仍保留。")
-        self._set_status("已清除目前來源，請從清單選擇另一個頻道或群組。")
+        self._set_status("請從左側清單選擇另一個頻道或群組。")
         self.search_edit.setFocus()
 
     def _topic_selection_required(self) -> bool:
@@ -1213,11 +1266,8 @@ class ChannelPage(QWidget):
         self._update_current_source_label()
         if not self.is_busy():
             self._update_scan_button()
-        if self._selected_chat is not None:
-            self.chat_hint.setText(
-                f"已選：{_chat_title(self._selected_chat)}（{_kind_label(_chat_kind(self._selected_chat))}）；"
-                "請先掃描符合媒體數。"
-            )
+        if self._selected_chat is not None and not self._topic_selection_required():
+            self._set_status("下一步：按「① 查看符合的檔案」。")
 
     def _current_account(self) -> Any:
         account_id = self.active_account_id()
@@ -1286,9 +1336,10 @@ class ChannelPage(QWidget):
         if not hasattr(self, "current_source_label"):
             return
         if self._selected_chat is None:
-            self.current_source_label.setText("尚未選擇頻道或群組。")
+            self.current_source_label.setText("尚未選擇頻道或群組：請從左側清單點一個。")
+            self.current_source_label.setToolTip("")
             if hasattr(self, "current_source_identity_label"):
-                self.current_source_identity_label.setText("識別：尚未選擇")
+                self.current_source_identity_label.setText("")
             return
         title = _chat_title(self._selected_chat)
         kind = _kind_label(_chat_kind(self._selected_chat))
@@ -1296,18 +1347,20 @@ class ChannelPage(QWidget):
         prominent = f"目前來源：{title}（{kind}）"
         if username:
             prominent += f" · @{username}"
+        identity = _chat_ref(self._selected_chat) or _chat_id(self._selected_chat) or "無識別碼"
+        detail = f"識別：{identity}"
+        if _chat_is_forum(self._selected_chat):
+            topic = self._selected_topic
+            if topic is None:
+                prominent += " · 話題：尚未選擇"
+            elif topic.get("all"):
+                prominent += " · 話題：全部主題"
+            else:
+                prominent += f" · 話題：{_text(topic.get('title'), '未命名主題')}"
+                detail += f" · 話題 ID {_text(topic.get('id'))}"
         self.current_source_label.setText(prominent)
+        self.current_source_label.setToolTip(detail)
         if hasattr(self, "current_source_identity_label"):
-            identity = _chat_ref(self._selected_chat) or _chat_id(self._selected_chat) or "無識別碼"
-            detail = f"識別：{identity}"
-            if _chat_is_forum(self._selected_chat):
-                topic = self._selected_topic
-                if topic is None:
-                    detail += " · 話題：尚未選擇"
-                elif topic.get("all"):
-                    detail += " · 話題：全部主題"
-                else:
-                    detail += f" · 話題：{_text(topic.get('title'), '未命名主題')} · ID {_text(topic.get('id'))}"
             self.current_source_identity_label.setText(detail)
 
     def _set_scan_summary(self, text: str) -> None:
@@ -1396,7 +1449,7 @@ class ChannelPage(QWidget):
         except (TypeError, ValueError):
             safe_count = 0
         self._set_scan_summary(f"已加入下載佇列：{clean_title} · 共 {safe_count} 個媒體。")
-        self._set_status(f"已加入下載佇列：{safe_count} 個媒體。")
+        self._set_status("可以按「換另一個頻道」繼續挑選，或「查看下載佇列」看進度。")
         return True
 
     def download_rejected(self, message: str = "") -> bool:
@@ -1407,7 +1460,7 @@ class ChannelPage(QWidget):
         self._export_request_pending = False
         self._export_consumed = False
         self._set_status(f"加入下載佇列失敗：{_safe_message(message) or '請稍後重試。'}")
-        self.download_button.setText("開始下載")
+        self.download_button.setText(DOWNLOAD_BUTTON_TEXT)
         self._set_scan_summary("掃描結果仍可重試加入下載佇列。")
         self._update_download_button()
         return True
@@ -1418,7 +1471,7 @@ class ChannelPage(QWidget):
             self._set_status("請先選擇一個 Telegram 帳號。")
             return
         if not self._current_account_is_authenticated():
-            self._set_status("目前帳號尚未登入，請先完成 Telegram 登入。")
+            self._set_status("目前帳號需要重新登入：請按視窗上方的「重新登入」。")
             return
         if self._selected_chat is None:
             self._set_status("請先從清單選擇一個頻道或群組。")
@@ -1489,9 +1542,28 @@ class ChannelPage(QWidget):
             self._update_download_button()
             return
         snapshot = dict(self._export_snapshot or {})
+        picker_opened = bool(self._ask_download_folder or not self.folder_edit.text().strip())
+        if picker_opened and not self._choose_folder():
+            self._set_status("已取消選擇儲存位置，尚未加入下載；掃描結果仍保留。")
+            self._update_download_button()
+            return
+        if picker_opened:
+            # QFileDialog runs a nested Qt event loop.  A queued account/chat
+            # refresh can therefore change the selection while the dialog is
+            # open.  Never pair the old manifest with that new selection.
+            current_snapshot = self._current_export_snapshot()
+            if (
+                not self._manifest_matches_current()
+                or current_snapshot is None
+                or not self._snapshots_match(snapshot, current_snapshot)
+            ):
+                self._set_scan_summary("下載條件已變更或掃描結果已失效，請重新掃描。")
+                self._set_status("下載條件已變更，請先重新掃描。")
+                self._update_download_button()
+                return
         folder = self.folder_edit.text().strip()
         if not folder:
-            self._set_status("請先選擇下載資料夾。")
+            self._set_status("請先選擇儲存位置。")
             return
         chat_title = _text(snapshot.get("chat_title"), _chat_title(self._selected_chat))
         topic_title = _text(snapshot.get("topic_title"))
@@ -1713,8 +1785,8 @@ class ChannelPage(QWidget):
                 # manifest for a different source or date range.
                 self._operation_snapshot = None
                 self._clear_scan(keep_status=True)
-                self._set_scan_summary("掃描結果已失效，請依目前條件重新掃描。")
-                self._set_status("掃描結果已失效，請依目前條件重新掃描。")
+                self._set_scan_summary("掃描結果已失效，請依目前條件重新查看符合的檔案。")
+                self._set_status("")
                 return
             path, count = self._normalise_export(data)
             total_bytes = self._export_total_bytes(data)
@@ -1728,7 +1800,7 @@ class ChannelPage(QWidget):
                 self._export_bytes = 0
                 self._update_download_button()
                 self._set_scan_summary(self._format_scan_summary(0, total_bytes))
-                self._set_status("掃描完成：符合條件的媒體為 0 個，請調整日期或類型。")
+                self._set_status("沒有符合的檔案：可以放寬日期（例如「全部時間」）或多勾幾種媒體類型。")
             elif not path:
                 self._export_path = ""
                 self._export_count = 0
@@ -1741,8 +1813,7 @@ class ChannelPage(QWidget):
                 self._export_count = count
                 self._export_bytes = total_bytes
                 self._update_download_button()
-                size = f"，約 {_format_bytes(total_bytes)}" if total_bytes > 0 else ""
-                status = f"掃描完成：共 {count} 個媒體{size}，可以開始下載。"
+                status = "下一步：按「② 加入下載」。"
                 free = _free_bytes(self.folder_edit.text().strip())
                 if total_bytes > 0 and free is not None and free < total_bytes:
                     status += f"\n注意：下載資料夾所在磁碟只剩 {_format_bytes(free)}，空間可能不足。"
@@ -1853,6 +1924,7 @@ class ChannelPage(QWidget):
     def _set_status(self, text: str) -> None:
         if hasattr(self, "status_label"):
             self.status_label.setText(_text(text))
+            self.status_label.setVisible(bool(_text(text)))
 
     def _clear_chat_selection(self) -> None:
         self._chats = []
@@ -1885,7 +1957,7 @@ class ChannelPage(QWidget):
         self._export_consumed = False
         if hasattr(self, "download_button"):
             self.download_button.setEnabled(False)
-            self.download_button.setText("開始下載")
+            self.download_button.setText(DOWNLOAD_BUTTON_TEXT)
         if not keep_status and hasattr(self, "status_label"):
             # Avoid replacing useful account/chats status while the page is
             # being populated; callers can set a more specific message.

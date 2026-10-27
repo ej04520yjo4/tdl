@@ -4,6 +4,8 @@
 
 | 版本 | 交接清冊 | 範圍 |
 | --- | --- | --- |
+| 1.5.1 | [1.5.1](handovers/1.5.1.md) | 下載前選擇儲存位置、跨頁同步與重開記憶、取消保留掃描、原有佇列位置不變、發行校驗檔 LF |
+| 1.5.0 | [1.5.0](handovers/1.5.0.md) | 人性化介面 19 項：右上角單一帳號選單、佇列置頂、失敗改提示列、完成通知與工作列進度、直接開群組資料夾、設定自動儲存與代理檢查、拖放與剪貼簿、下載紀錄整理、停滯提示、錯誤建議、記住視窗 |
 | 1.4.0 | [1.4.0](handovers/1.4.0.md) | 明確顯示頻道／話題與掃描來源、連續選頻道下載、佇列往返入口、過期結果與重複加入保護 |
 | 1.3.2 | [1.3.2](handovers/1.3.2.md) | 繁簡共用搜尋、依群組／頻道名稱存放下載、新舊工作接續相容 |
 | 1.3.1 | [1.3.1](handovers/1.3.1.md) | 備份失敗保留舊檔、副檔名篩選不分大小寫、還原失敗確實清理新帳號 |
@@ -16,18 +18,4 @@
 
 2026-10-22：依使用者指示，以 [PR #2](https://github.com/ej04520yjo4/tdl/pull/2) 將 `codex/channel-workflow` 的 1.4.0 更新合併至 `master`，並同步本機主分支；EXE 沿用原發布版本，詳見 [1.4.0 主分支同步紀錄](handovers/1.4.0.md)。
 
-## 尚未發行的修正
-
-以下修正已在原始碼中，尚未隨版本發布。下一版建立交接清冊時，把它們列入該版清冊並從這裡移除。
-
-### 2026-10-22：發行校驗檔改用 LF 換行
-
-- 需求：使用者核對 desktop-v1.5.0 附件時發現 `SHA256SUMS.txt` 是 CRLF 換行，`sha256sum -c`（GNU coreutils，例如 Git Bash、Linux）把每個檔名讀成結尾多一個 `\r`，每一項都回報「No such file or directory」；去除 `\r` 後雜湊值正確。
-- 原因：`package_release.py` 以 `Path.write_text` 寫檔，Windows 會把 `\n` 轉成 `\r\n`；`build-info.json` 也一樣。
-- 修改：新增 `write_release_text`（一律寫 LF）與 `write_checksums`，`SHA256SUMS.txt` 與 `build-info.json` 都改由它們寫出。`package_release.py` 改用與 `app.py` 相同的匯入方式，讓測試能匯入 `desktop.package_release`；建置仍以指令碼執行。新增 `desktop/tests/test_package_release.py`，檢查輸出沒有 `\r` 且內容格式正確。
-- 自動化 fixture：以 `master`（1.4.0）為基底，Python 完整桌面 suite **147 passed、22 subtests passed**；暫時與 `claude/humane-ui-1.5.0` 合併時沒有衝突，**176 passed、22 subtests passed**。暫時拿掉 LF 設定時，新測試確實失敗。
-- 實際指令碼：在暫存資料夾以真正的 `package_release.py` 產生附件後執行 `sha256sum -c SHA256SUMS.txt`。修正前 7 項全部找不到檔案；修正後 7 項全部 OK，`SHA256SUMS.txt` 與 `build-info.json` 都沒有 `\r`。
-- 未重新建置或驗證 EXE，也未執行真實 Telegram 測試；本修正只改變發行附件的寫出方式。
-- 既有 Release：版本號未變更，既有 Release 未重新發布或修改。依附件大小（每行剛好多 1 byte）判斷，desktop-v1.2.0 至 v1.5.0 的 `SHA256SUMS.txt` 都是 CRLF。驗證這些版本時先去除 `\r`：`tr -d '\r' < SHA256SUMS.txt | sha256sum -c`。
-- 限制：驗證收據（`verification.json` 等）由各 `verify_*.py` 寫出，仍是 CRLF；這不影響 `sha256sum -c`，本次未修改。
-- 維護位置：`desktop/package_release.py` 的 `write_release_text`、`write_checksums`；`desktop/tests/test_package_release.py`。
+2026-10-25：依使用者指示，先合併 [PR #3](https://github.com/ej04520yjo4/tdl/pull/3) 的 1.5.0 介面改善，再以 [PR #5](https://github.com/ej04520yjo4/tdl/pull/5) 將 1.5.1 目的位置功能合併至 `master`，並同步本機主分支。EXE 與 Release 附件沿用已驗證的 1.5.1，詳見 [1.5.1 主分支同步紀錄](handovers/1.5.1.md)。

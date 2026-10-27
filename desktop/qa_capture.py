@@ -84,12 +84,19 @@ def main():
         window._show_page(index)
         settle(200)
         window.grab().save(str(target / f"{name}.png"))
-    # The queue sits below the fold of the download page.
+    # A failed job: one message bar and the reason in its row, no dialog.
+    failed = DownloadJob(
+        id="qa-failed-job", url="https://t.me/example_updates/321", title="Telegram 功能與教學 · 單則訊息",
+        output_dir=str(ROOT / ".build" / "qa-fixtures" / "downloads"), status="下載中",
+        links=["https://t.me/example_updates/321"],
+    )
+    window.jobs[failed.id] = failed
+    window.home_page.add_jobs([failed])
+    window._job_failed(failed.id, "下載資料夾所在的磁碟空間不足。", "write …: There is not enough space on the disk.")
     window._show_page(1)
-    scroll = window.stack.currentWidget()
-    scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum())
     settle(200)
     window.grab().save(str(target / "queue.png"))
+    window.notice_bar.dismiss()
     window._show_page(2)
     window.transfer_page.forward_tab.click()
     settle(200)

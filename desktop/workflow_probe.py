@@ -46,6 +46,21 @@ def _empty_metrics() -> dict[str, Any]:
         "switch_invalidated_scan": False,
         "topic_selection_checked": False,
         "topic_scan_forwarded": False,
+        "ask_download_folder_default": False,
+        "folder_dialog_calls": 0,
+        "folder_dialog_initial_paths": [],
+        "folder_dialog_cancelled": [],
+        "folder_dialog_initial_paths_ok": False,
+        "cancel_preserved_scan": False,
+        "folder_a_selected": False,
+        "folder_a_persisted": False,
+        "folder_cross_page_synced": False,
+        "folder_b_selected": False,
+        "queue_folder_a_preserved": False,
+        "folder_b_persisted": False,
+        "restart_folder_remembered": False,
+        "restart_ask_download_folder": False,
+        "restart_checked": False,
         "callback_events": 0,
         "callback_successes": 0,
         "thread_violations": 0,
@@ -375,6 +390,20 @@ def _chat_ref(value: Any) -> str:
     return str(value.get("ref", value.get("chat_ref", "")) or "").strip()
 
 
+def _path_key(value: Any) -> str:
+    """Normalize fixture paths without exposing any account or chat data."""
+
+    return os.path.normcase(os.path.abspath(str(value or "")))
+
+
+def _store_download_folder(store: Any) -> str:
+    try:
+        preferences = store.get_preferences()
+        return str(getattr(preferences, "download_dir", "") or "")
+    except Exception:
+        return ""
+
+
 def _save_screenshot(window: Any, path: Path) -> tuple[int, int]:
     path.parent.mkdir(parents=True, exist_ok=True)
     pixmap = window.grab()
@@ -526,6 +555,7 @@ def _run_native_ui(state: Path, report: Path, metrics: dict[str, Any]) -> None:
 
     from desktop import app as app_module
     from desktop.app import BackendBridge, MainWindow, STYLE
+    from desktop import channel_page as channel_page_module
 
     app.setStyleSheet(STYLE)
     for font_path in (r"C:\Windows\Fonts\msjh.ttc", r"C:\Windows\Fonts\msjhbd.ttc"):
@@ -543,6 +573,33 @@ def _run_native_ui(state: Path, report: Path, metrics: dict[str, Any]) -> None:
     bridge.runner = fixture
 
     callbacks = {"events": 0, "successes": 0, "download_ack": 0}
+    initial_folder = (state / "downloads").resolve()
+    folder_a = (state / "downloads-a").resolve()
+    folder_b = (state / "downloads-b").resolve()
+    for folder in (initial_folder, folder_a, folder_b):
+        folder.mkdir(parents=True, exist_ok=True)
+    dialog_responses = ["", str(folder_a), str(folder_b)]
+    dialog_calls: list[dict[str, Any]] = []
+    original_get_existing_directory = channel_page_module.QFileDialog.getExistingDirectory
+    dialog_patched = False
+
+    def fixture_get_existing_directory(*args: Any, **kwargs: Any) -> str:
+        # Capture the native picker arguments, then return a deterministic
+        # isolated fixture path.  The first response deliberately cancels.
+        initial = ""
+        if len(args) >= 3:
+            initial = str(args[2] or "")
+        else:
+            initial = str(kwargs.get("dir", kwargs.get("directory", "")) or "")
+        response = dialog_responses.pop(0) if dialog_responses else ""
+        dialog_calls.append(
+            {
+                "initial": initial,
+                "cancelled": not bool(response),
+            }
+        )
+        return response
+
     base_page_type = app_module.ChannelPage
     app_module.ChannelPage = _probe_page_type(base_page_type, app, metrics, callbacks)
     window = None
@@ -556,8 +613,12 @@ def _run_native_ui(state: Path, report: Path, metrics: dict[str, Any]) -> None:
             window = MainWindow(bridge)
         finally:
             app_module.ChannelPage = base_page_type
+        channel_page_module.QFileDialog.getExistingDirectory = staticmethod(
+            fixture_get_existing_directory
+        )
+        dialog_patched = True
         page = window.channel_page
-        page.set_download_folder(str(state / "downloads"))
+        page.set_download_folder(str(initial_folder))
         heartbeat_timer = QTimer(window)
         heartbeat_timer.setInterval(100)
         heartbeat_timer.timeout.connect(lambda: metrics.__setitem__("heartbeat", metrics["heartbeat"] + 1))
@@ -580,6 +641,11 @@ def _run_native_ui(state: Path, report: Path, metrics: dict[str, Any]) -> None:
 
         if not _pump_until(app, startup_ready, _STARTUP_TIMEOUT):
             raise RuntimeError("startup_timeout")
+        metrics["ask_download_folder_default"] = bool(
+            getattr(page, "_ask_download_folder", False)
+        )
+        if not metrics["ask_download_folder_default"]:
+            raise RuntimeError("ask_download_folder_not_enabled")
 
         page.refresh_button.click()
         metrics["refreshes"] += 1
@@ -638,7 +704,57 @@ def _run_native_ui(state: Path, report: Path, metrics: dict[str, Any]) -> None:
         window.resize(1180, 800)
         app.processEvents(QEventLoop.AllEvents, 100)
 
+        scan_path_a = page._export_path
+        scan_count_a = page._export_count
+        scan_snapshot_a = dict(page._export_snapshot or {})
+        # The first native picker response is cancel.  The scan must remain
+        # usable and no queue record may be created.
         page.download_button.click()
+        if not _pump_until(
+            app,
+            lambda: (
+                len(dialog_calls) >= 1
+                and bool(dialog_calls[0].get("cancelled"))
+                and not window.jobs
+                and page._export_path == scan_path_a
+                and page._export_count == scan_count_a
+                and dict(page._export_snapshot or {}) == scan_snapshot_a
+                and page.download_button.isEnabled()
+            ),
+            5.0,
+        ):
+            raise RuntimeError("folder_picker_cancel_failed")
+        metrics["cancel_preserved_scan"] = True
+
+        # Accept folder A through the same native picker path and verify both
+        # pages plus the durable Store receive the deliberate choice.
+        page.download_button.click()
+        if not _pump_until(
+            app,
+            lambda: (
+                len(dialog_calls) >= 2
+                and not bool(dialog_calls[1].get("cancelled"))
+                and _path_key(page.folder_edit.text()) == _path_key(folder_a)
+                and _path_key(window.home_page.folder_edit.text()) == _path_key(folder_a)
+            ),
+            5.0,
+        ):
+            raise RuntimeError("folder_a_cross_page_sync_failed")
+        metrics["folder_a_selected"] = True
+        metrics["folder_cross_page_synced"] = True
+        if not (
+            _path_key(dialog_calls[0].get("initial", "")) == _path_key(initial_folder)
+            and _path_key(dialog_calls[1].get("initial", "")) == _path_key(initial_folder)
+        ):
+            raise RuntimeError("folder_picker_initial_path_failed")
+        metrics["folder_dialog_initial_paths_ok"] = True
+        if not _pump_until(
+            app,
+            lambda: _path_key(_store_download_folder(bridge.store)) == _path_key(folder_a),
+            5.0,
+        ):
+            raise RuntimeError("folder_a_persistence_failed")
+        metrics["folder_a_persisted"] = True
 
         def queued() -> bool:
             current = window.stack.currentWidget()
@@ -654,6 +770,10 @@ def _run_native_ui(state: Path, report: Path, metrics: dict[str, Any]) -> None:
         if not _pump_until(app, queued, _OPERATION_TIMEOUT):
             raise RuntimeError("queue_ack_failed")
         metrics["queued_on_channel_page"] = True
+        first_job = next(iter(window.jobs.values()), None)
+        if first_job is None or _path_key(getattr(first_job, "output_dir", "")) != _path_key(folder_a):
+            raise RuntimeError("folder_a_queue_path_failed")
+        metrics["queue_folder_a_preserved"] = True
         queue_image = report.with_name(f"{report.stem}-channel-a-queued.png")
         _save_screenshot(window, queue_image)
         screenshot_names.append(queue_image.name)
@@ -765,6 +885,47 @@ def _run_native_ui(state: Path, report: Path, metrics: dict[str, Any]) -> None:
         window.resize(1180, 800)
         app.processEvents(QEventLoop.AllEvents, 100)
 
+        # Select a different destination for the forum topic.  The existing
+        # channel A queue row must retain folder A while the new row uses B.
+        page.download_button.click()
+        if not _pump_until(
+            app,
+            lambda: (
+                len(dialog_calls) >= 3
+                and not bool(dialog_calls[2].get("cancelled"))
+                and _path_key(page.folder_edit.text()) == _path_key(folder_b)
+                and _path_key(window.home_page.folder_edit.text()) == _path_key(folder_b)
+                and callbacks["download_ack"] >= 2
+                and not page._export_request_pending
+                and page._export_consumed
+                and len(window.jobs) == 2
+            ),
+            _OPERATION_TIMEOUT,
+        ):
+            raise RuntimeError("folder_b_queue_failed")
+        if _path_key(dialog_calls[2].get("initial", "")) != _path_key(folder_a):
+            raise RuntimeError("folder_b_picker_initial_path_failed")
+        metrics["folder_b_selected"] = True
+        metrics["folder_cross_page_synced"] = True
+        if not _pump_until(
+            app,
+            lambda: _path_key(_store_download_folder(bridge.store)) == _path_key(folder_b),
+            5.0,
+        ):
+            raise RuntimeError("folder_b_persistence_failed")
+        metrics["folder_b_persisted"] = True
+        queued_paths = [
+            _path_key(getattr(job, "output_dir", "")) for job in window.jobs.values()
+        ]
+        metrics["queue_folder_a_preserved"] = bool(
+            _path_key(folder_a) in queued_paths and _path_key(folder_b) in queued_paths
+        )
+        if not metrics["queue_folder_a_preserved"]:
+            raise RuntimeError("queue_folder_a_overwritten")
+        latest_image = report.with_name(f"{report.stem}-folder-b-queued.png")
+        _save_screenshot(window, latest_image)
+        screenshot_names.append(latest_image.name)
+
         workflow_ok = bool(
             metrics["refreshes"] == 1
             and metrics["chat_count"] == 2
@@ -775,6 +936,15 @@ def _run_native_ui(state: Path, report: Path, metrics: dict[str, Any]) -> None:
             and metrics["switch_invalidated_scan"]
             and metrics["topic_selection_checked"]
             and metrics["topic_scan_forwarded"]
+            and metrics["ask_download_folder_default"]
+            and metrics["cancel_preserved_scan"]
+            and metrics["folder_a_selected"]
+            and metrics["folder_a_persisted"]
+            and metrics["folder_dialog_initial_paths_ok"]
+            and metrics["folder_cross_page_synced"]
+            and metrics["folder_b_selected"]
+            and metrics["folder_b_persisted"]
+            and metrics["queue_folder_a_preserved"]
             and metrics["geometry_ok"]
             and metrics["screenshot_960x680"]
             and callbacks["events"] > 0
@@ -786,6 +956,17 @@ def _run_native_ui(state: Path, report: Path, metrics: dict[str, Any]) -> None:
     finally:
         metrics["callback_events"] = callbacks["events"]
         metrics["callback_successes"] = callbacks["successes"]
+        metrics["folder_dialog_calls"] = len(dialog_calls)
+        metrics["folder_dialog_initial_paths"] = [
+            str(item.get("initial", "")) for item in dialog_calls
+        ]
+        metrics["folder_dialog_cancelled"] = [
+            bool(item.get("cancelled", False)) for item in dialog_calls
+        ]
+        if dialog_patched:
+            channel_page_module.QFileDialog.getExistingDirectory = staticmethod(
+                original_get_existing_directory
+            )
         if heartbeat_timer is not None:
             heartbeat_timer.stop()
         if window is not None:
@@ -838,6 +1019,105 @@ def _run_native_ui(state: Path, report: Path, metrics: dict[str, Any]) -> None:
     metrics["ok"] = bool(workflow_ok and close_verified)
 
 
+def _verify_folder_restart(state: Path, metrics: dict[str, Any]) -> None:
+    """Open a fresh Store/MainWindow and verify the last destination remains."""
+
+    from PySide6.QtCore import QEventLoop
+    from PySide6.QtWidgets import QApplication
+
+    from desktop.app import BackendBridge, MainWindow
+
+    app = QApplication.instance()
+    if app is None:
+        raise RuntimeError("restart_application_missing")
+    bridge = BackendBridge()
+    if not bridge.available:
+        raise RuntimeError("restart_backend_unavailable")
+    expected_folder = (state / "downloads-b").resolve()
+    preferences = bridge.store.get_preferences()
+    stored_folder = _store_download_folder(bridge.store)
+    stored_ask = bool(getattr(preferences, "ask_download_folder", False))
+    if _path_key(stored_folder) != _path_key(expected_folder):
+        raise RuntimeError("restart_folder_store_mismatch")
+    if not stored_ask:
+        raise RuntimeError("restart_ask_download_folder_missing")
+
+    window = None
+    close_verified = False
+    startup_ready = False
+    try:
+        # Do not auto-resume the fixture queue.  The purpose of this second
+        # process is Store/UI preference recovery; resuming would invoke the
+        # real Runner instead of the in-memory fixture.
+        window = MainWindow(bridge, resume_downloads=False)
+        page = window.channel_page
+        window.show()
+        window.move(-window.width() - 50, -window.height() - 50)
+        window.repaint()
+        app.processEvents(QEventLoop.AllEvents, 100)
+
+        def ready() -> bool:
+            return bool(
+                window._accounts_loaded
+                and window._queue_loaded
+                and not window._background_work_running()
+            )
+
+        startup_ready = _pump_until(app, ready, _STARTUP_TIMEOUT)
+        if not startup_ready:
+            raise RuntimeError("restart_startup_timeout")
+        remembered = bool(
+            _path_key(page.folder_edit.text()) == _path_key(expected_folder)
+            and _path_key(window.home_page.folder_edit.text()) == _path_key(expected_folder)
+            and _path_key(getattr(page, "_download_folder", "")) == _path_key(expected_folder)
+        )
+        asks = bool(getattr(page, "_ask_download_folder", False))
+        metrics["restart_folder_remembered"] = remembered
+        metrics["restart_ask_download_folder"] = asks
+        if not remembered or not asks:
+            raise RuntimeError("restart_folder_ui_mismatch")
+    finally:
+        if window is not None:
+            try:
+                window.shutdown_workers(timeout_ms=10000)
+                if startup_ready:
+                    window.close()
+
+                    def closed_cleanly() -> bool:
+                        collections_empty = all(
+                            not getattr(window, name, ())
+                            for name in (
+                                "_threads",
+                                "_workers",
+                                "_store_threads",
+                                "_store_workers",
+                                "_action_threads",
+                                "_action_workers",
+                                "_action_relays",
+                            )
+                        )
+                        return bool(
+                            not window.isVisible()
+                            and not window._background_work_running()
+                            and not getattr(window.channel_page, "_thread_workers", {})
+                            and collections_empty
+                        )
+
+                    close_verified = _pump_until(app, closed_cleanly, _CLOSE_TIMEOUT)
+                else:
+                    window._allow_close = True
+                    window.close()
+                    app.processEvents(QEventLoop.AllEvents, 100)
+                    if window.isVisible():
+                        window.hide()
+            finally:
+                window.deleteLater()
+                app.processEvents(QEventLoop.AllEvents, 100)
+    if not startup_ready or not close_verified:
+        raise RuntimeError("restart_cleanup_failed")
+    metrics["restart_checked"] = True
+
+
 def run_probe(report_path: str | os.PathLike[str] | None = None) -> int:
     report = Path(report_path or "workflow-verification.json").resolve()
     report.parent.mkdir(parents=True, exist_ok=True)
@@ -850,6 +1130,8 @@ def run_probe(report_path: str | os.PathLike[str] | None = None) -> int:
             os.environ["TDL_DESKTOP_DATA_DIR"] = str(state)
             try:
                 _run_native_ui(state, report, metrics)
+                if metrics.get("ok"):
+                    _verify_folder_restart(state, metrics)
             except Exception as exc:
                 if not metrics.get("_failure_code"):
                     metrics["_failure_code"] = type(exc).__name__.lower()
