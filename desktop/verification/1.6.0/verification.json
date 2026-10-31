@@ -1,0 +1,14 @@
+{
+  "result": "PASS",
+  "version": "1.6.0",
+  "sha256": "65d0c5a71132156a0b423db0db528b87ba3874a1430f97d06eeb71aeb78ed993",
+  "architecture": "Windows x64 GUI",
+  "copied_executable_to_independent_directory": true,
+  "python_and_go_removed_from_path": true,
+  "bundled_backend_and_core": true,
+  "window_rendered": true,
+  "native_windows_window_started": true,
+  "traditional_simplified_search": true,
+  "screenshot": "D:\\Codex\\Tools\\tdl\\desktop\\qa\\frozen-home.png",
+  "telegram_live_account_test": "NOT_RUN_BY_OFFLINE_CHECK_SEE_CHANNEL_RECEIPT"
+}

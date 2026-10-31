@@ -19,6 +19,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Optional
 
+try:
+    from desktop.batch_forward_page import BatchForwardPage
+except ImportError:  # pragma: no cover - direct script execution
+    from batch_forward_page import BatchForwardPage
+
 from PySide6.QtCore import QThread, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -288,7 +293,7 @@ class TransferPage(QWidget):
         title = QLabel("把檔案送上 Telegram，或把訊息轉到別處。")
         title.setObjectName("PageTitle")
         outer.addWidget(title)
-        intro = QLabel("這兩項功能會用目前帳號實際送出訊息。不確定時，先送到「儲存的訊息」或使用轉傳的試跑。")
+        intro = QLabel("選群組與日期批次轉傳，也可上傳本機檔案或貼訊息連結。先預覽、確認目的地，再送出。")
         intro.setObjectName("HeroDescription")
         intro.setWordWrap(True)
         outer.addWidget(intro)
@@ -309,13 +314,14 @@ class TransferPage(QWidget):
         self.mode_group.setExclusive(True)
         self.upload_tab = QPushButton("上傳檔案")
         self.forward_tab = QPushButton("轉傳訊息")
-        for index, button in enumerate((self.upload_tab, self.forward_tab)):
+        self.batch_tab = QPushButton("群組批次轉傳")
+        for index, button in ((2, self.batch_tab), (0, self.upload_tab), (1, self.forward_tab)):
             button.setCheckable(True)
             button.setProperty("segment", True)
             self.mode_group.addButton(button, index)
             account_layout.addWidget(button)
         account_layout.addStretch(1)
-        self.upload_tab.setChecked(True)
+        self.batch_tab.setChecked(True)
         outer.addWidget(account_card)
 
         self.destination_hint = QLabel("")
@@ -326,10 +332,21 @@ class TransferPage(QWidget):
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_upload())
         self.stack.addWidget(self._build_forward())
+        self.batch_page = BatchForwardPage()
+        self.stack.addWidget(self.batch_page)
+        self.stack.setCurrentIndex(2)
+        self.destination_hint.hide()
+        self.stack.currentChanged.connect(self._mode_changed)
+        self.batch_page.account_changed.connect(self.account_changed.emit)
+        self.batch_page.busy_changed.connect(self._batch_busy_changed)
         self.mode_group.idClicked.connect(self.stack.setCurrentIndex)
         outer.addWidget(self.stack)
         outer.addStretch(1)
         self._set_controls_enabled(True)
+
+    @Slot(int)
+    def _mode_changed(self, index: int) -> None:
+        self.destination_hint.setVisible(index != 2)
 
     def _build_upload(self) -> QWidget:
         page = QWidget()
@@ -524,11 +541,15 @@ class TransferPage(QWidget):
     # ------------------------------------------------------------------
     def set_runner(self, runner: Any) -> None:
         self._runner = runner
+        self.batch_page.set_runner(runner)
 
     def set_proxy(self, proxy: str) -> None:
         self._proxy = _text(proxy)
+        self.batch_page.set_proxy(self._proxy)
 
     def set_accounts(self, accounts: Sequence[Any], active_id: str = "") -> None:
+        if self.is_busy() and active_id and active_id != self.active_account_id():
+            return
         self._accounts = list(accounts)
         current = active_id or self.active_account_id()
         self.account_combo.blockSignals(True)
@@ -542,6 +563,7 @@ class TransferPage(QWidget):
             index = self.account_combo.findData(current)
             self.account_combo.setCurrentIndex(index if index >= 0 else 0)
         self.account_combo.blockSignals(False)
+        self.batch_page.set_accounts(self._accounts, self.active_account_id())
         self.reload_destinations()
         if not self.is_busy():
             self._set_controls_enabled(True)
@@ -550,15 +572,24 @@ class TransferPage(QWidget):
         return _text(self.account_combo.currentData())
 
     def is_busy(self) -> bool:
+        return self._legacy_busy() or self.batch_page.is_busy()
+
+    def _legacy_busy(self) -> bool:
         return _thread_running(self._thread) or any(_thread_running(thread) for thread in self._thread_workers)
 
+    @Slot(bool)
+    def _batch_busy_changed(self, _busy: bool) -> None:
+        self._set_controls_enabled(not self.is_busy())
+
     def cancel_operations(self) -> None:
+        self.batch_page.cancel_operations()
         worker = self._worker
         if worker is not None:
             worker.cancel()
 
     def shutdown(self, timeout_ms: int = 7000) -> None:
         self.cancel_operations()
+        self.batch_page.shutdown(timeout_ms=timeout_ms)
         for thread in list(self._thread_workers):
             if _thread_running(thread):
                 thread.quit()
@@ -854,6 +885,9 @@ class TransferPage(QWidget):
             widget.setEnabled(enabled)
         self.upload_cancel.setVisible(busy and self._operation_kind == "upload")
         self.forward_cancel.setVisible(busy and self._operation_kind in {"forward", "dry-run"})
+        self.batch_page.setEnabled(not self._legacy_busy())
+        for button in (self.upload_tab, self.forward_tab, self.batch_tab):
+            button.setEnabled(enabled)
 
 
 __all__ = ["TransferPage"]

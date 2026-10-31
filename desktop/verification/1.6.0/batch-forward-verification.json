@@ -1,0 +1,51 @@
+{
+  "ok": true,
+  "offline_fixture": true,
+  "screenshot_files": [
+    "batch-forward-preview-1180x800.png",
+    "batch-forward-actions-1180x800.png",
+    "batch-forward-preview-960x680.png",
+    "batch-forward-actions-960x680.png",
+    "batch-forward-completed.png",
+    "batch-forward-cancelled.png",
+    "batch-forward-partial-failure.png"
+  ],
+  "batch_entry_default": true,
+  "source_topic_date_media": true,
+  "preview_does_not_send": true,
+  "geometry": [
+    {
+      "size": [
+        1180,
+        800
+      ],
+      "no_horizontal_scroll": true,
+      "action_visible": true
+    },
+    {
+      "size": [
+        960,
+        680
+      ],
+      "no_horizontal_scroll": true,
+      "action_visible": true
+    }
+  ],
+  "dry_run_preserves_preview": true,
+  "confirmation_cancel_no_send": true,
+  "legacy_locked_during_batch": true,
+  "destination_topic_forwarded": true,
+  "actual_after_confirmation": true,
+  "duplicate_submit_blocked": true,
+  "changed_conditions_invalidate": true,
+  "cancel_blocks_resubmit": true,
+  "progress_rows": 2,
+  "partial_failure_blocks_resubmit": true,
+  "partial_failure_visible": true,
+  "clean_shutdown": true,
+  "elapsed": 3.438,
+  "result": "PASS",
+  "version": "1.6.0",
+  "sha256": "65d0c5a71132156a0b423db0db528b87ba3874a1430f97d06eeb71aeb78ed993",
+  "telegram_live_account_test": "NOT_RUN_BY_OFFLINE_BATCH_FORWARD_CHECK"
+}

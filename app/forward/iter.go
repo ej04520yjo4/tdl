@@ -24,6 +24,7 @@ type iterOptions struct {
 	manager *peers.Manager
 	pool    dcpool.Pool
 	to      *vm.Program
+	topic   int
 	edit    *vm.Program
 	dialogs []*tmessage.Dialog
 	mode    forwarder.Mode
@@ -88,6 +89,16 @@ func (i *iter) Next(ctx context.Context) bool {
 		i.err = ctx.Err()
 		return false
 	default:
+	}
+
+	// Empty manifests and dialogs are valid parse results (for example a
+	// filtered export with no matching media). Skip them before indexing the
+	// first message so a batch forward reports completion/error instead of
+	// panicking on Messages[0].
+	for i.err == nil && i.i < len(i.opts.dialogs) &&
+		(i.opts.dialogs[i.i] == nil || i.j >= len(i.opts.dialogs[i.i].Messages)) {
+		i.i++
+		i.j = 0
 	}
 
 	// end of iteration or error occurred
@@ -185,6 +196,9 @@ func (i *iter) Next(ctx context.Context) bool {
 	if err != nil {
 		i.err = errors.Wrapf(err, "resolve dest: %v", result)
 		return false
+	}
+	if i.opts.topic > 0 {
+		thread = i.opts.topic
 	}
 
 	i.elem = &iterElem{
