@@ -1,0 +1,158 @@
+{
+  "ok": true,
+  "offline_fixture": true,
+  "chat_count": 2,
+  "scan_count": 2,
+  "refreshes": 1,
+  "queued_on_channel_page": true,
+  "queue_view_checked": true,
+  "returned_to_channel": true,
+  "switch_invalidated_scan": true,
+  "topic_selection_checked": true,
+  "topic_scan_forwarded": true,
+  "ask_download_folder_default": true,
+  "folder_dialog_calls": 3,
+  "folder_dialog_initial_paths": [
+    "D:\\Codex\\Tools\\tdl\\dist\\workflow-fixture-3sh1lhzg\\downloads",
+    "D:\\Codex\\Tools\\tdl\\dist\\workflow-fixture-3sh1lhzg\\downloads",
+    "D:\\Codex\\Tools\\tdl\\dist\\workflow-fixture-3sh1lhzg\\downloads-a"
+  ],
+  "folder_dialog_cancelled": [
+    true,
+    false,
+    false
+  ],
+  "folder_dialog_initial_paths_ok": true,
+  "cancel_preserved_scan": true,
+  "folder_a_selected": true,
+  "folder_a_persisted": true,
+  "folder_cross_page_synced": true,
+  "folder_b_selected": true,
+  "queue_folder_a_preserved": true,
+  "folder_b_persisted": true,
+  "restart_folder_remembered": true,
+  "restart_ask_download_folder": true,
+  "restart_checked": true,
+  "callback_events": 8,
+  "callback_successes": 4,
+  "thread_violations": 0,
+  "heartbeat": 11,
+  "geometry_checks": 4,
+  "button_scroll_checks": 8,
+  "geometry_ok": true,
+  "geometry_states": {
+    "channel_a": {
+      "1180x800": {
+        "window_size": [
+          1180,
+          800
+        ],
+        "viewport_size": [
+          956,
+          741
+        ],
+        "page_size": [
+          956,
+          741
+        ],
+        "page_left": 0,
+        "page_right": 955,
+        "viewport_right": 955,
+        "horizontal_bar_visible": false,
+        "horizontal_ok": true,
+        "buttons_visible_after_scroll": {
+          "scan": true,
+          "download": true
+        }
+      },
+      "960x680": {
+        "window_size": [
+          960,
+          680
+        ],
+        "viewport_size": [
+          726,
+          621
+        ],
+        "page_size": [
+          726,
+          644
+        ],
+        "page_left": 0,
+        "page_right": 725,
+        "viewport_right": 725,
+        "horizontal_bar_visible": false,
+        "horizontal_ok": true,
+        "buttons_visible_after_scroll": {
+          "scan": true,
+          "download": true
+        }
+      }
+    },
+    "forum_topic": {
+      "1180x800": {
+        "window_size": [
+          1180,
+          800
+        ],
+        "viewport_size": [
+          946,
+          693
+        ],
+        "page_size": [
+          946,
+          717
+        ],
+        "page_left": 0,
+        "page_right": 945,
+        "viewport_right": 945,
+        "horizontal_bar_visible": false,
+        "horizontal_ok": true,
+        "buttons_visible_after_scroll": {
+          "scan": true,
+          "download": true
+        }
+      },
+      "960x680": {
+        "window_size": [
+          960,
+          680
+        ],
+        "viewport_size": [
+          726,
+          573
+        ],
+        "page_size": [
+          726,
+          717
+        ],
+        "page_left": 0,
+        "page_right": 725,
+        "viewport_right": 725,
+        "horizontal_bar_visible": false,
+        "horizontal_ok": true,
+        "buttons_visible_after_scroll": {
+          "scan": true,
+          "download": true
+        }
+      }
+    }
+  },
+  "screenshot_960x680": true,
+  "screenshot_files": [
+    "workflow-verification-channel-a-scan.png",
+    "workflow-verification-channel-a-queued.png",
+    "workflow-verification-queue.png",
+    "workflow-verification-topic-selected.png",
+    "workflow-verification-topic-selected-960x680.png",
+    "workflow-verification-folder-b-queued.png"
+  ],
+  "cleanup_clean": true,
+  "elapsed": 2.89,
+  "result": "PASS",
+  "version": "1.6.0",
+  "sha256": "65d0c5a71132156a0b423db0db528b87ba3874a1430f97d06eeb71aeb78ed993",
+  "executable": "D:\\Codex\\Tools\\tdl\\dist\\TDL下載助手.exe",
+  "screenshots_present": true,
+  "telegram_live_account_test": "NOT_RUN_BY_OFFLINE_WORKFLOW_CHECK"
+}

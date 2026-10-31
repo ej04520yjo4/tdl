@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import ctypes.wintypes
+import hashlib
 import io
 import json
 import math
@@ -59,6 +60,8 @@ _PROGRESS_PERSIST_INTERVAL = 2.0
 _EXPORT_RETENTION_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_TEMPLATE = "{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}"
 FORWARD_MODES = frozenset({"direct", "clone"})
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_FORWARD_SNAPSHOT_DIR = "forward-snapshots"
 # New GUI download jobs keep media under a per-chat folder.  This option is
 # deliberately a job option rather than a global preference: the durable
 # manifest must decide how a resumed job lays out files, while old manifests
@@ -339,6 +342,16 @@ def _atomic_write_json(path: Path, value: Any) -> None:
     except (TypeError, ValueError) as exc:
         raise StoreError(f"資料格式無法儲存：{path.name}") from exc
     _atomic_write_bytes(path, payload)
+
+
+def _sha256_file(path: Path) -> str:
+    """Hash a file in bounded chunks without loading a manifest into memory."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -1937,6 +1950,53 @@ def validate_destination(value: Any) -> str:
     raise ValidationError("目的地必須是清單中的對話、數字 ID 或 @username")
 
 
+def _validate_typed_peer_ref(value: Any, *, label: str) -> str:
+    """Require the typed peer identity used by ``chat ls`` for batch work."""
+
+    text = str(value or "").strip()
+    match = _CHAT_REF_RE.fullmatch(text)
+    if match is None:
+        raise ValidationError(f"{label}必須使用清單提供的 typed 對話識別碼")
+    # Numeric IDs are identities, not strings: reject aliasing such as
+    # ``channel:00123`` versus ``channel:123`` when comparing source/target.
+    kind = match.group(1).lower()
+    # Telegram's group dialogs are represented as ``chat`` peers by the
+    # core.  Canonicalize the legacy ``group`` spelling before comparing
+    # source and destination so the same peer cannot bypass the guard.
+    if kind == "group":
+        kind = "chat"
+    return f"{kind}:{int(text.split(':', 1)[1])}"
+
+
+def _validate_batch_target(value: Any) -> str:
+    target = _validate_typed_peer_ref(value, label="轉傳目的地")
+    kind = target.split(":", 1)[0]
+    if kind not in {"channel", "chat", "group"}:
+        raise ValidationError("轉傳目的地必須是明確的群組或頻道")
+    return target
+
+
+def _validate_manifest_hash(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if not _SHA256_RE.fullmatch(text):
+        raise ValidationError("掃描清單 SHA-256 格式無效")
+    return text
+
+
+def _validate_manifest_count(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValidationError("掃描清單筆數格式無效")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValidationError("掃描清單筆數格式無效")
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValidationError("掃描清單筆數格式無效") from exc
+    if count <= 0:
+        raise ValidationError("掃描清單沒有可轉傳的媒體")
+    return count
+
+
 def validate_upload_paths(paths: Sequence[str | os.PathLike[str]]) -> list[str]:
     """Validate the local files or folders handed to ``tdl up --path``."""
 
@@ -2516,6 +2576,17 @@ class ForwardRequest:
     single: bool = False
     desc: bool = False
     proxy: Optional[str] = None
+    # Optional forum topic for the destination group.  These fields are
+    # appended so existing positional callers keep their old meaning.
+    topic_id: Optional[int] = None
+    # Batch-forward requests are created only by ``start_batch_forward``.
+    # Keeping the provenance and snapshot fields on the request lets the
+    # lower-level ``start`` service reject an unsafe direct bypass too.
+    batch_manifest: bool = False
+    source_chat: Optional[str] = None
+    manifest_sha256: Optional[str] = None
+    expected_count: Optional[int] = None
+    snapshot_path: Optional[str] = None
 
 
 @dataclass
@@ -2742,6 +2813,253 @@ class Runner:
         _restrict_permissions(exports)
         return exports.resolve()
 
+    def _forward_snapshot_root(self, account_id: str) -> Path:
+        """Return the private, short-lived directory for batch manifests."""
+
+        account_root = self.store.account_root(account_id, create=True).resolve()
+        snapshots = account_root / _FORWARD_SNAPSHOT_DIR
+        if snapshots.is_symlink():
+            raise ValidationError("轉傳工作快照目錄不安全")
+        snapshots.mkdir(parents=True, exist_ok=True)
+        try:
+            snapshots.resolve().relative_to(account_root)
+        except ValueError as exc:
+            raise ValidationError("轉傳工作快照目錄不安全") from exc
+        _restrict_permissions(snapshots)
+        return snapshots.resolve()
+
+    def _validate_account_export_manifest(
+        self,
+        account_id: str,
+        manifest_path: str | os.PathLike[str],
+    ) -> Path:
+        """Confine a batch source to the selected account's exports folder."""
+
+        exports = self._exports_root(account_id)
+        raw = Path(manifest_path).expanduser()
+        if raw.is_symlink():
+            raise ValidationError("掃描清單不可是符號連結")
+        candidate = (raw if raw.is_absolute() else exports / raw).resolve()
+        try:
+            candidate.relative_to(exports)
+        except ValueError as exc:
+            raise ValidationError("掃描清單必須位於目前帳號的匯出目錄") from exc
+        if candidate.is_symlink() or candidate.suffix.lower() != ".json" or not candidate.is_file():
+            raise ValidationError("找不到帳號匯出目錄中的掃描清單")
+        return candidate
+
+    @staticmethod
+    def _validate_manifest_peer_identity(
+        payload: Mapping[str, Any],
+        source_chat: str,
+        *,
+        required: bool,
+    ) -> None:
+        """Bind an export's real ``id``/``peer_type`` to its typed source."""
+
+        if not _CHAT_REF_RE.fullmatch(source_chat):
+            if required:
+                raise ValidationError("掃描來源必須使用 typed 對話識別碼")
+            return
+        source_kind, source_id = source_chat.split(":", 1)
+        expected_peer_type = {"group": "chat", "private": "user"}.get(source_kind, source_kind)
+        raw_peer_type = str(payload.get("peer_type", "") or "").strip().lower()
+        raw_peer_id = payload.get("id")
+        if not raw_peer_type and raw_peer_id in (None, ""):
+            if required:
+                raise ValidationError("掃描清單缺少來源對話 id 或類型")
+            return
+        if raw_peer_type != expected_peer_type:
+            raise ValidationError("掃描清單來源類型與目前選取的對話不一致")
+        if isinstance(raw_peer_id, bool) or not isinstance(raw_peer_id, (int, float)):
+            raise ValidationError("掃描清單缺少有效的來源對話 id")
+        if isinstance(raw_peer_id, float) and not raw_peer_id.is_integer():
+            raise ValidationError("掃描清單來源對話 id 必須是整數")
+        if int(raw_peer_id) != int(source_id):
+            raise ValidationError("掃描清單來源對話 id 與目前選取的對話不一致")
+
+    @staticmethod
+    def _read_batch_manifest_file(
+        path: Path,
+        *,
+        source_chat: str,
+        manifest_sha256: str,
+        expected_count: int,
+    ) -> tuple[int, str]:
+        """Validate one immutable manifest and return count plus its digest."""
+
+        if path.is_symlink() or not path.is_file():
+            raise ValidationError("掃描清單不存在或不是一般檔案")
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise ValidationError("掃描清單無法讀取") from exc
+        actual_hash = hashlib.sha256(raw).hexdigest()
+        if actual_hash != manifest_sha256:
+            raise ValidationError("掃描清單內容已變更，請重新掃描")
+        # Check the digest before parsing the file so even an invalid edit is
+        # reported as tampering, then reuse the normal export schema checks
+        # (numeric chat/message IDs and a messages array).
+        validate_export_file(path)
+        try:
+            payload = json.loads(raw.decode("utf-8"), parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)))
+        except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ValidationError("掃描清單不是有效的 UTF-8 JSON") from exc
+        if not isinstance(payload, Mapping):
+            raise ValidationError("掃描清單格式無效")
+        messages = payload.get("messages")
+        if not isinstance(messages, list):
+            raise ValidationError("掃描清單缺少 messages 訊息清單")
+        # The human-readable ``source_chat`` field is useful for display, but
+        # it is not authoritative: a caller could rewrite just that field.
+        # Official exports also carry the numeric peer id and peer kind, so
+        # bind those fields to the typed reference before forwarding.
+        Runner._validate_manifest_peer_identity(payload, source_chat, required=True)
+        count = len(messages)
+        if count != expected_count:
+            raise ValidationError("掃描清單筆數已變更，請重新掃描")
+        if count <= 0:
+            raise ValidationError("掃描清單沒有可轉傳的媒體")
+        declared_count = payload.get("count")
+        if declared_count not in (None, ""):
+            if isinstance(declared_count, bool):
+                raise ValidationError("掃描清單宣告筆數無效")
+            try:
+                if int(declared_count) != count:
+                    raise ValidationError("掃描清單宣告筆數與內容不一致")
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValidationError("掃描清單宣告筆數無效") from exc
+        raw_source = payload.get("source_chat", payload.get("chat_ref", payload.get("source_ref")))
+        if raw_source in (None, ""):
+            raise ValidationError("掃描清單缺少來源對話識別碼")
+        try:
+            actual_source = _validate_typed_peer_ref(raw_source, label="掃描來源")
+        except ValidationError:
+            raise
+        if actual_source != source_chat:
+            raise ValidationError("掃描清單來源與目前選取的對話不一致")
+        return count, actual_hash
+
+    def _prepare_batch_manifest(self, request: ForwardRequest, manifest_path: str | os.PathLike[str]) -> str:
+        """Validate and copy a scan before the request can wait in the queue."""
+
+        source = self._validate_account_export_manifest(request.account_id, manifest_path)
+        self._read_batch_manifest_file(
+            source,
+            source_chat=str(request.source_chat),
+            manifest_sha256=str(request.manifest_sha256),
+            expected_count=int(request.expected_count or 0),
+        )
+        snapshots = self._forward_snapshot_root(request.account_id)
+        snapshot = snapshots / f"{uuid.uuid4()}.json"
+        temporary = snapshots / f".{snapshot.name}.tmp"
+        try:
+            shutil.copyfile(source, temporary)
+            _restrict_permissions(temporary)
+            os.replace(temporary, snapshot)
+            # The source may have been replaced while it was copied.  The
+            # snapshot, not the user-controlled original, is authoritative.
+            self._read_batch_manifest_file(
+                snapshot,
+                source_chat=str(request.source_chat),
+                manifest_sha256=str(request.manifest_sha256),
+                expected_count=int(request.expected_count or 0),
+            )
+            _restrict_permissions(snapshot)
+            return str(snapshot)
+        except Exception:
+            for path in (temporary, snapshot):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+
+    def _validate_batch_forward_request(self, request: ForwardRequest) -> None:
+        """Validate the request again at the service boundary."""
+
+        if not request.batch_manifest:
+            if any(
+                value not in (None, "", False)
+                for value in (
+                    request.source_chat,
+                    request.manifest_sha256,
+                    request.expected_count,
+                    request.snapshot_path,
+                )
+            ):
+                raise ValidationError("批次轉傳欄位只能由安全批次介面設定")
+            return
+        # This flag is not caller-selectable for a manifest.  Batch forwarding
+        # must pass exact message IDs from the scan and must never expand a
+        # message into an album or re-query a source link.
+        request.single = True
+        source_chat = _validate_typed_peer_ref(request.source_chat, label="掃描來源")
+        target = _validate_batch_target(request.to)
+        if target == source_chat:
+            raise ValidationError("轉傳目的地不可與來源對話相同")
+        request.source_chat = source_chat
+        request.to = target
+        request.topic_id = validate_topic_id(request.topic_id)
+        request.manifest_sha256 = _validate_manifest_hash(request.manifest_sha256)
+        request.expected_count = _validate_manifest_count(request.expected_count)
+        if not request.snapshot_path or len(request.sources) != 1:
+            raise ValidationError("批次轉傳缺少安全工作快照")
+        raw_snapshot = Path(request.snapshot_path).expanduser()
+        if raw_snapshot.is_symlink():
+            raise ValidationError("轉傳工作快照不可是符號連結")
+        snapshots = self._forward_snapshot_root(request.account_id)
+        snapshot = raw_snapshot.resolve()
+        try:
+            snapshot.relative_to(snapshots)
+        except ValueError as exc:
+            raise ValidationError("轉傳工作快照路徑不安全") from exc
+        if snapshot.is_symlink() or str(snapshot) != str(Path(request.sources[0]).expanduser().resolve()):
+            raise ValidationError("批次轉傳來源不是受控工作快照")
+        self._read_batch_manifest_file(
+            snapshot,
+            source_chat=source_chat,
+            manifest_sha256=request.manifest_sha256,
+            expected_count=request.expected_count,
+        )
+
+    def _annotate_export_manifest(
+        self,
+        request: ExportRequest,
+        path: Path,
+        count: int,
+        total_bytes: int,
+    ) -> str:
+        """Bind a completed export to its typed source for later forwarding."""
+
+        validated = Path(validate_export_file(path))
+        try:
+            with validated.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ValidationError("匯出檔案格式無效，無法建立轉傳綁定") from exc
+        if not isinstance(payload, Mapping):
+            raise ValidationError("匯出檔案格式無效，無法建立轉傳綁定")
+        source_chat = validate_chat_id(request.chat_id)
+        Runner._validate_manifest_peer_identity(
+            payload,
+            source_chat,
+            required=False,
+        )
+        existing_source = payload.get("source_chat", payload.get("chat_ref", payload.get("source_ref")))
+        if existing_source not in (None, ""):
+            existing_ref = _validate_typed_peer_ref(existing_source, label="匯出來源")
+            if existing_ref != source_chat:
+                raise ValidationError("匯出檔案來源與查詢對話不一致")
+        payload = dict(payload)
+        payload["source_chat"] = source_chat
+        payload["count"] = int(count)
+        payload["total_bytes"] = int(total_bytes)
+        if request.topic_id is not None:
+            payload["topic_id"] = int(validate_topic_id(request.topic_id))
+        _atomic_write_json(validated, payload)
+        return _sha256_file(validated)
+
     def _validate_export_output_path(self, account_id: str, output_path: str | os.PathLike[str] | None) -> None:
         if output_path in (None, ""):
             return
@@ -2775,8 +3093,7 @@ class Runner:
         _restrict_permissions(candidate.parent)
         return str(candidate)
 
-    @staticmethod
-    def _validate_transfer(request: Any) -> None:
+    def _validate_transfer(self, request: Any) -> None:
         """Normalize an upload/forward/backup request before a worker starts."""
 
         request.proxy = validate_proxy(request.proxy) if request.proxy is not None else None
@@ -2797,11 +3114,20 @@ class Runner:
                 if value is not None and not 1 <= int(value) <= 16:
                     raise ValidationError("同時數量必須介於 1 到 16")
         elif isinstance(request, ForwardRequest):
-            request.sources = validate_forward_sources(request.sources)
             request.to = validate_destination(request.to)
             request.mode = str(request.mode or "direct").strip().lower()
             if request.mode not in FORWARD_MODES:
                 raise ValidationError("轉傳方式只能是直接轉傳或複製")
+            request.topic_id = validate_topic_id(request.topic_id)
+            if request.topic_id is not None and not request.to:
+                raise ValidationError("指定論壇主題時必須同時選擇轉傳目的地")
+            if request.batch_manifest:
+                # The batch path performs its own source/schema validation and
+                # is intentionally stricter than the legacy link/file API.
+                self._validate_batch_forward_request(request)
+            else:
+                request.sources = validate_forward_sources(request.sources)
+                self._validate_batch_forward_request(request)
         elif isinstance(request, BackupRequest):
             request.destination = validate_backup_destination(request.destination)
         elif isinstance(request, RecoverRequest):
@@ -3153,6 +3479,7 @@ class Runner:
         dry_run: bool = False,
         single: bool = False,
         desc: bool = False,
+        topic_id: str | int | None = None,
         proxy: str | None = None,
         on_event: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> RunHandle:
@@ -3168,10 +3495,77 @@ class Runner:
                 dry_run=bool(dry_run),
                 single=bool(single),
                 desc=bool(desc),
+                topic_id=validate_topic_id(topic_id),
                 proxy=proxy,
             ),
             on_event=on_event,
         )
+
+    def start_batch_forward(
+        self,
+        account_id: str,
+        manifest_path: str | os.PathLike[str],
+        *,
+        source_chat: str,
+        to: str,
+        manifest_sha256: str,
+        expected_count: int,
+        topic_id: str | int | None = None,
+        mode: str = "direct",
+        silent: bool = False,
+        dry_run: bool = False,
+        proxy: str | None = None,
+        on_event: Optional[Callable[[dict[str, Any]], None]] = None,
+    ) -> RunHandle:
+        """Forward one previously scanned manifest without rescanning it.
+
+        The source is validated and copied before the request enters the
+        per-account queue.  The worker then uses only that private snapshot;
+        changing or deleting the original scan cannot alter a queued job.
+        """
+
+        clean_account = str(account_id)
+        clean_source = _validate_typed_peer_ref(source_chat, label="掃描來源")
+        clean_target = _validate_batch_target(to)
+        if clean_source == clean_target:
+            raise ValidationError("轉傳目的地不可與來源對話相同")
+        clean_mode = str(mode or "direct").strip().lower()
+        if clean_mode not in FORWARD_MODES:
+            raise ValidationError("轉傳方式只能是直接轉傳或複製")
+        clean_hash = _validate_manifest_hash(manifest_sha256)
+        clean_count = _validate_manifest_count(expected_count)
+        clean_topic = validate_topic_id(topic_id)
+        clean_proxy = validate_proxy(proxy) if proxy is not None else None
+        # ``start`` performs the authoritative account lookup and activity
+        # reservation.  The lookup here only makes a missing account fail
+        # before an otherwise confusing filesystem error.
+        self.store.get_account(clean_account)
+        request = ForwardRequest(
+            account_id=clean_account,
+            sources=(),
+            to=clean_target,
+            mode=clean_mode,
+            silent=bool(silent),
+            dry_run=bool(dry_run),
+            single=True,
+            proxy=clean_proxy,
+            topic_id=clean_topic,
+            batch_manifest=True,
+            source_chat=clean_source,
+            manifest_sha256=clean_hash,
+            expected_count=clean_count,
+        )
+        snapshot_path = self._prepare_batch_manifest(request, manifest_path)
+        request.sources = (snapshot_path,)
+        request.snapshot_path = snapshot_path
+        try:
+            return self.start(request, on_event=on_event)
+        except BaseException:
+            try:
+                Path(snapshot_path).unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     def start_backup(
         self,
@@ -3357,6 +3751,8 @@ class Runner:
             if destination:
                 args.extend(["--to", destination])
             args.extend(["--mode", request.mode])
+            if request.topic_id is not None:
+                args.extend(["--topic", str(validate_topic_id(request.topic_id))])
             for enabled, flag in (
                 (request.silent, "--silent"),
                 (request.dry_run, "--dry-run"),
@@ -3537,6 +3933,13 @@ class Runner:
                 self.store.mark_job_running(job.id)
                 file_progress = {key: dict(row) for key, row in job.file_progress.items()}
                 job_folders = list(job.folders)
+
+            # A queued batch may wait behind another core process.  Recheck
+            # the private snapshot immediately before preparing the child so
+            # external tampering or cleanup during that wait cannot change
+            # which messages are forwarded.
+            if isinstance(request, ForwardRequest) and request.batch_manifest:
+                self._validate_batch_forward_request(request)
 
             runtime = self.vault.prepare(request.account_id)
             runtime_prepared = True
@@ -3760,6 +4163,12 @@ class Runner:
                             ):
                                 raise ValidationError("匯出檔案大小與 JSON 檔案內容不一致")
                             operation_data["count"] = actual_count
+                            operation_data["sha256"] = self._annotate_export_manifest(
+                                request,
+                                export_path,
+                                actual_count,
+                                actual_total_bytes,
+                            )
                         except ValidationError:
                             last_error = "匯出檔案格式無效，無法交給下載核心。"
                             self._emit(handle, {"event": "error", "message": last_error})
@@ -3812,6 +4221,13 @@ class Runner:
                 try:
                     Path(request.output_path).unlink(missing_ok=True)
                 except OSError:
+                    pass
+            if isinstance(request, ForwardRequest) and request.snapshot_path:
+                try:
+                    Path(request.snapshot_path).unlink(missing_ok=True)
+                except OSError:
+                    # Snapshot cleanup is best-effort; the account-scoped
+                    # directory is private and a later startup can prune it.
                     pass
             if auth_invalid_seen:
                 try:
@@ -3871,6 +4287,15 @@ class Runner:
             success = not stopped and not last_error and returncode == 0
             if isinstance(request, (UploadRequest, ForwardRequest)):
                 operation_data = dict(transfer_counts)
+                if isinstance(request, ForwardRequest) and request.batch_manifest:
+                    operation_data.update(
+                        {
+                            "manifest_sha256": request.manifest_sha256,
+                            "expected_count": request.expected_count,
+                            "source_chat": request.source_chat,
+                            "target_chat": request.to,
+                        }
+                    )
             elif isinstance(request, ListChatsRequest) and success and operation_data is not None:
                 try:
                     self.store.save_chat_cache(request.account_id, operation_data.get("chats", []))

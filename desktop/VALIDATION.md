@@ -1,40 +1,43 @@
 # 桌面版交付驗證
 
-日期：2026-10-25。版本：1.5.1。基底：1.5.0 `2fa8c1e`。
+日期：2026-10-31。版本：1.6.0。基底：`master` 的 `27aa077`。
 
 ## 本次範圍
 
-下載前選擇電腦儲存位置、記住上次位置、頻道下載／下載中心／設定頁同步、自動詢問開關。取消時保留掃描結果；原有工作、重試及重開接續保留原路徑。加入選擇器返回後的來源檢查與未登入帳號先行檢查。
+新增群組批次轉傳：來源群組／話題、日期、媒體類型、目的群組／話題、預覽、試跑、確認送出、進度及取消。不必逐則貼連結；保留原有下載、上傳與連結轉傳功能。
 
 ## 原始碼測試
 
-- 最終建置內完整 Python suite：**188 passed、22 subtests passed**，44.49 秒。
-- Go 相關套件通過：`pkg/desktopio`、`app/chat`、`app/dl`、`app/up`、`app/migrate`、`cmd`、`core/downloader`、`core/uploader`、`core/util/tutil`；`pkg/key`、`pkg/tmessage` 無測試。最終建置使用有效快取。
-- 首次測試為 183 passed、2 setup errors（系統 pytest 暫存目錄無法建立）；改用專案內 `.build/pytest-destination-final-1.5.1` 後全部通過。兩個錯誤都發生於校驗檔測試執行前。
-- 原始碼 Qt 設定頁截圖已檢視：儲存位置開關及預設資料夾在一般設定中可見，未裁切。
+- 最終建置內完整 Python suite：**207 passed、30 subtests passed**，47.71 秒。
+- Go 相關套件通過：`pkg/desktopio`、`app/chat`、`app/dl`、`app/up`、`app/forward`、`app/migrate`、`cmd`、`core/downloader`、`core/uploader`、`core/util/tutil`；`pkg/key`、`pkg/tmessage`、`core/forwarder` 無測試。
+- 批次後端涵蓋來源帳號、清單目錄、SHA-256、筆數、實際 peer identity、排隊後再次校驗、強制 single、目的話題、快照清理及 group/chat 別名同來源拒絕。
+- 批次介面涵蓋目的地不可自動選擇、確認返回後再次核對、條件改動失效、論壇必選話題、帳號切換清除目的地、權威空清單清除舊資料與舊版 numeric ref 拒絕。
+- 整合測試涵蓋批次預設入口、上傳／轉傳互鎖、取消傳遞與忙碌期間禁止切換帳號。
 
 ## 最終 EXE 離線驗證
 
-- `verification.json`：複製到獨立資料夾、移除 Python／Go PATH 後，核心、繁簡搜尋、畫面繪製與原生 Windows 視窗啟閉通過。
-- `workflow-verification.json`：取消不建工作且保留掃描；選 A 同步三頁並保存；選 B 後舊工作維持 A、新工作使用 B；重新建立 MainWindow 與 Store 恢復 B 及詢問開關。原生資料夾選擇器的**回傳值以隔離 fixture 提供**，不是人工點選 Windows 選擇器。
-- 原有頻道／話題流程通過；GUI 執行緒違規 **0**，兩個尺寸共 **4** 組版面與 **8** 項按鈕捲動檢查通過。
-- `restart-verification.json`：兩個 EXE 程序驗證關閉保存、原帳號同一筆工作恢復、已完成附件不重寫及群組資料夾設定恢復。
-- 最終 EXE 畫面與收據保存於 `desktop/verification/1.5.1/`。`settings.png` 為原始碼 fixture，其餘截圖來自 EXE。
+- `verification.json`：複製到獨立目錄、移除 Python／Go PATH，核心、繁簡搜尋、畫面繪製與原生 Windows 視窗啟閉通過。
+- `restart-verification.json`：兩個 EXE 程序驗證關閉保存、原帳號同一筆下載恢復、已完成附件不重寫及群組資料夾恢復。
+- `workflow-verification.json`：既有頻道／話題下載、取消選擇資料夾保留掃描、不同工作維持原路徑、跨頁同步與重開位置記憶通過；GUI 執行緒違規 0，4 組版面與 8 項按鈕捲動檢查通過。原生資料夾選擇器回傳值由隔離 fixture 提供。
+- `batch-forward-verification.json`：來源話題／日期／影片條件、目的話題傳遞、預覽不發送、試跑保留預覽、取消確認不發送、正式確認後送出模擬、防止連按、修改條件失效、取消及部分失敗後禁止直接重送、乾淨關閉全部通過。
+- 批次頁面 1180×800、960×680 無水平裁切，操作按鈕可捲動到達。已檢視最終 EXE 截圖；全部收據與 14 張畫面保存於 `desktop/verification/1.6.0/`。
 
 ## 交付檔
 
-Windows x64 GUI，版本 **1.5.1**，**54,638,808 bytes**。
+Windows x64 GUI，版本 **1.6.0**，**54,689,204 bytes**。
 
-EXE SHA-256：`7a355091d8c2862949bc7c0aa3cbd7b1549717662f56d168e0b01eab7eb12454`。
+EXE SHA-256：`65d0c5a71132156a0b423db0db528b87ba3874a1430f97d06eeb71aeb78ed993`。
 
-內含核心 SHA-256：`4d2d6025d0194815b6bbcded9ee2e27fcab882b47e415fd3f94b6713e2db771e`。
+內含核心 SHA-256：`b27c41c43ab9c67155258bccf5b869e2224c4f088d6bd0594e1caa7f11da3539`。
 
-`TDL下載助手.exe`、`TDL下載助手-1.5.1.exe`、`dist/TDL下載助手.exe` 與發行別名內容相同。
+`TDL下載助手.exe`、`TDL下載助手-1.6.0.exe`、`dist/TDL下載助手.exe` 與 `TDL-Desktop-1.6.0.exe` 發行別名內容相同。
 
 ## 已知限制
 
-- **未執行本版真實 Telegram 登入或附件傳輸測試**，也未沿用舊版連線收據。
-- 磁碟無權限、斷線、空間不足仍由下載工作回報；測試未覆蓋每種網路磁碟。
-- 日期依目前群組／頻道訊息日期；話題檔案放入所屬群組資料夾。
-- 接續以附件為單位，未完成的單一附件可能重新下載；EXE 未簽章。
-- 上游完整 Go suite 既有 Windows `app/update/TestBinaryName` 差異未在本次處理，只宣稱相關套件通過。
+- **未執行本版真實 Telegram 登入或附件傳輸測試**，也未沿用舊版連線收據；離線 fixture 不代表真實帳號的發送權限與遠端行為已驗收。
+- 來源需可讀，目的地需可發送。受保護內容、已刪除訊息、論壇權限、網路中斷與 Telegram 限流仍可能失敗。
+- 僅處理掃描符合的媒體訊息與附帶說明，不搬移成員、管理員、純文字聊天；原始訊息保留。同來源群組不得作為目的地。
+- 為避免帶出日期／類型／話題以外的相簿項目，批次強制 single；不保證保留原相簿編組。
+- 取消／失敗可能已有部分訊息送達，不能自動撤回。轉傳沒有重開自動接續或防重複的跨工作紀錄；再次掃描送出仍可能重複，需先檢查目的群組。
+- 既有下載重開接續仍以附件為單位；未完成的單一附件可能重下。EXE 未簽章。
+- 上游完整 Go suite 既有 Windows `app/update/TestBinaryName` 差異未在本次處理，只宣稱上述相關套件通過。
