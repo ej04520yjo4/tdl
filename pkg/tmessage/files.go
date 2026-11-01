@@ -2,6 +2,7 @@ package tmessage
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -23,6 +24,7 @@ import (
 const (
 	keyID       = "id"
 	keyPeerType = "peer_type"
+	keyMessages = "messages"
 	typeMessage = "message"
 )
 
@@ -78,14 +80,14 @@ func parseFile(ctx context.Context, client *tg.Client, kvd storage.Storage, file
 		return nil, err
 	}
 
-	return collect(ctx, f, peer, onlyMedia)
+	return collect(ctx, f, peer.InputPeer(), onlyMedia)
 }
 
-func collect(ctx context.Context, r io.Reader, peer peers.Peer, onlyMedia bool) (*Dialog, error) {
+func collect(ctx context.Context, r io.Reader, peer tg.InputPeerClass, onlyMedia bool) (*Dialog, error) {
 	d := jstream.NewDecoder(r, 2)
 
 	m := &Dialog{
-		Peer:     peer.InputPeer(),
+		Peer:     peer,
 		Messages: make([]int, 0),
 	}
 
@@ -116,37 +118,19 @@ func collect(ctx context.Context, r io.Reader, peer peers.Peer, onlyMedia bool) 
 		}
 	}
 
+	// A syntax error ends the stream early; report it instead of
+	// downloading only the messages read before it.
+	if err := d.Err(); err != nil {
+		return nil, err
+	}
+
 	return m, nil
 }
 
 func getChatInfo(ctx context.Context, client *tg.Client, kvd storage.Storage, r io.Reader) (peers.Peer, error) {
-	d := jstream.NewDecoder(r, 1).EmitKV()
-
-	chatID := int64(0)
-	peerType := ""
-
-	for mv := range d.Stream() {
-		_kv, ok := mv.Value.(jstream.KV)
-		if !ok {
-			continue
-		}
-
-		switch _kv.Key {
-		case keyID:
-			// The first id is the export's top-level peer id. Keep it
-			// unchanged while scanning nested message records.
-			if chatID == 0 {
-				chatID = parseChatID(_kv.Value)
-			}
-		case keyPeerType:
-			if value, ok := _kv.Value.(string); ok {
-				peerType = strings.ToLower(strings.TrimSpace(value))
-			}
-		}
-
-		if chatID != 0 && peerType != "" {
-			break
-		}
+	chatID, peerType, err := readChatHeader(r)
+	if err != nil {
+		return nil, err
 	}
 
 	if chatID == 0 {
@@ -169,8 +153,88 @@ func getChatInfo(ctx context.Context, client *tg.Client, kvd storage.Storage, r 
 	return tutil.GetInputPeer(ctx, manager, strconv.FormatInt(chatID, 10))
 }
 
+// readChatHeader returns the export's top-level id and peer_type, stopping
+// at "messages" once the id is known.  It reads synchronously on purpose: a
+// streaming decoder left running after an early return kept reading the
+// file while the caller re-read it from the start, so the second pass saw
+// only part of the messages.  Official Telegram Desktop exports have no
+// peer_type, which used to mean decoding the whole messages array here.
+func readChatHeader(r io.Reader) (int64, string, error) {
+	dec := json.NewDecoder(r)
+	dec.UseNumber()
+	if tok, err := dec.Token(); err != nil {
+		return 0, "", err
+	} else if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return 0, "", errors.New("export file is not a JSON object")
+	}
+
+	chatID := int64(0)
+	peerType := ""
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return 0, "", err
+		}
+		key, _ := tok.(string)
+
+		switch key {
+		case keyID, keyPeerType:
+			var value any
+			if err := dec.Decode(&value); err != nil {
+				return 0, "", err
+			}
+			if key == keyID && chatID == 0 {
+				chatID = parseChatID(value)
+			}
+			if text, ok := value.(string); ok && key == keyPeerType {
+				peerType = strings.ToLower(strings.TrimSpace(text))
+			}
+		case keyMessages:
+			if chatID != 0 {
+				return chatID, peerType, nil
+			}
+			fallthrough
+		default:
+			if err := skipJSONValue(dec); err != nil {
+				return 0, "", err
+			}
+		}
+	}
+
+	return chatID, peerType, nil
+}
+
+// skipJSONValue consumes one value token by token, so skipping a large
+// array does not hold it in memory.
+func skipJSONValue(dec *json.Decoder) error {
+	depth := 0
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		if delim, ok := tok.(json.Delim); ok {
+			switch delim {
+			case '{', '[':
+				depth++
+			case '}', ']':
+				depth--
+			}
+		}
+		if depth == 0 {
+			return nil
+		}
+	}
+}
+
 func parseChatID(value any) int64 {
 	switch value := value.(type) {
+	case json.Number:
+		if id, err := value.Int64(); err == nil {
+			return id
+		}
+		id, _ := value.Float64()
+		return int64(id)
 	case float64:
 		return int64(value)
 	case float32:

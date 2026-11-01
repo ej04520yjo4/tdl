@@ -15,7 +15,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QProgressBar
 
 from desktop.app import PAGE_NAMES, BackendBridge, DownloadJob, DownloadPage, MainWindow, QueueRow, _format_duration, _last_error_line
 from desktop.backend import EVENT_PREFIX, Runner
@@ -93,6 +93,36 @@ class QueueRowTests(_QtCase):
         row.update_file(job, "8")
         self.assertIn("檔案 1/300 · 進行中 0 · 失敗 1", row.percent.text())
         self.assertEqual(row._bytes_done, 100)
+        row.deleteLater()
+
+    def test_large_job_shows_a_bounded_number_of_file_lines(self) -> None:
+        job = self._job()
+        job.file_progress = {
+            str(index): {"filename": f"{index}.mp4", "state": "completed", "current": 10, "total": 10}
+            for index in range(5000)
+        }
+        row = QueueRow(job)
+        limit = QueueRow._MAX_FILE_LINES
+        self.assertEqual(len(row._file_rows), limit)
+        self.assertLessEqual(len(row.findChildren(QProgressBar)), limit + 1)
+        self.assertIn(f"另有 {5000 - limit} 個檔案", row._more_files.text())
+        self.assertIn("檔案 5000/5000", row.percent.text())
+        self.assertEqual(row._bytes_done, 50000)
+
+        # A failure keeps its line; new downloads take finished lines.
+        job.file_progress["0"].update(state="failed")
+        row.update_file(job, "0")
+        for index in range(5000, 5000 + limit + 5):
+            job.file_progress[str(index)] = {"filename": f"{index}.mp4", "state": "downloading", "percent": 5}
+            row.update_file(job, str(index))
+        self.assertEqual(len(row._file_rows), limit)
+        self.assertIn("0", row._file_rows)
+        self.assertEqual(row._file_rows["0"][2].text(), "失敗")
+        self.assertIn("5000", row._file_rows)
+        self.assertEqual(row._file_rows["5000"][2].text(), "5%")
+        # With every line busy, further downloads are counted, not listed.
+        self.assertNotIn(str(5000 + limit + 4), row._file_rows)
+        self.assertIn("進行中 25", row.percent.text())
         row.deleteLater()
 
     def test_scanned_job_shows_whole_job_progress_and_remaining_time(self) -> None:
