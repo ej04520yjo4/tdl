@@ -22,6 +22,9 @@ func NewForward() *cobra.Command {
 		Short:   "Forward messages with automatic fallback and message routing",
 		GroupID: groupTools.ID,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := opts.Validate(); err != nil {
+				return err
+			}
 			return tRun(cmd.Context(), func(ctx context.Context, c *telegram.Client, kvd storage.Storage) error {
 				return forward.Run(logctx.Named(ctx, "forward"), c, kvd, opts)
 			})
@@ -30,6 +33,7 @@ func NewForward() *cobra.Command {
 
 	cmd.Flags().StringArrayVar(&opts.From, "from", []string{}, "messages to be forwarded, can be links or exported JSON files")
 	cmd.Flags().StringVar(&opts.To, "to", "", "destination peer, can be a CHAT or router based on expression engine")
+	cmd.Flags().IntVar(&opts.TopicID, "topic", 0, "constant forum topic id; requires --to channel:<id> or chat:<id>")
 	cmd.Flags().StringVar(&opts.Edit, "edit", "", "edit message or caption with expression engine. Empty means no edit")
 	cmd.Flags().Var(&opts.Mode, "mode", fmt.Sprintf("forward mode: [%s]", strings.Join(forwarder.ModeNames(), ", ")))
 	cmd.Flags().BoolVar(&opts.Silent, "silent", false, "send messages silently")

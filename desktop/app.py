@@ -3691,6 +3691,10 @@ class MainWindow(QMainWindow):
     def _set_active_account(self, account_id: str, on_success: Optional[Callable[[Any], None]] = None) -> None:
         if not account_id:
             return
+        if self.transfer_page.is_busy() and self.transfer_page.active_account_id() != account_id:
+            show_error(self, "目前仍有操作進行中", "請先完成或取消上傳／轉傳頁的操作，再切換帳號。")
+            self._rebuild_account_menu()
+            return
         selected = next((item for item in self.accounts if item.id == account_id), None)
         if selected is not None:
             state = "已連線" if selected.authenticated else "未完成登入"
@@ -4917,6 +4921,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--verify-channel-ui", action="store_true", help="使用隔離帳號副本實際點擊更新清單並驗證視窗執行緒")
     parser.add_argument("--verify-restart", choices=("before-close", "after-reopen"), help=argparse.SUPPRESS)
     parser.add_argument("--verify-workflow", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--verify-batch-forward", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--verify-download-child", nargs=2, help=argparse.SUPPRESS)
     args = parser.parse_args(list(argv) if argv is not None else None)
 
@@ -4929,6 +4934,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.verify_workflow:
         from desktop.workflow_probe import run_probe
+        return run_probe(args.smoke_report)
+
+    if args.verify_batch_forward:
+        from desktop.batch_forward_probe import run_probe
         return run_probe(args.smoke_report)
 
     if args.verify_qr:

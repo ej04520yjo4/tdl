@@ -30,17 +30,51 @@ import (
 )
 
 type Options struct {
-	From   []string
-	To     string
-	Edit   string
-	Mode   forwarder.Mode
-	Silent bool
-	DryRun bool
-	Single bool
-	Desc   bool
+	From []string
+	To   string
+	// TopicID is the constant Telegram forum topic destination.  Zero keeps
+	// the historical expression routing behaviour; positive values override
+	// the per-message thread only after the destination has been validated as
+	// a typed channel or group peer.
+	TopicID int
+	Edit    string
+	Mode    forwarder.Mode
+	Silent  bool
+	DryRun  bool
+	Single  bool
+	Desc    bool
+}
+
+const maxTopicID = int64(1<<31 - 1)
+
+// Validate checks the local --topic contract before a Telegram connection is
+// opened.  A topic is deliberately restricted to a concrete typed peer so a
+// batch manifest cannot accidentally route to a different peer through an
+// expression result.
+func (o Options) Validate() error {
+	topic := int64(o.TopicID)
+	if topic < 0 || topic > maxTopicID {
+		return fmt.Errorf("invalid --topic %d: must be between 0 and %d", o.TopicID, maxTopicID)
+	}
+	if topic == 0 {
+		return nil
+	}
+
+	destination := strings.TrimSpace(o.To)
+	if destination == "" {
+		return fmt.Errorf("error flags: --to should be set when --topic is set")
+	}
+	kind, _, ok := tutil.ParseTypedPeer(destination)
+	if !ok || (kind != "channel" && kind != "chat") {
+		return fmt.Errorf("error flags: --topic requires a typed destination channel:<id> or chat:<id>")
+	}
+	return nil
 }
 
 func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Options) (rerr error) {
+	if err := opts.Validate(); err != nil {
+		return err
+	}
 	if opts.To == "-" || opts.Edit == "-" {
 		fg := texpr.NewFieldsGetter(nil)
 
@@ -69,7 +103,7 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 
 	manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
 
-	to, err := resolveDest(ctx, manager, opts.To)
+	to, err := resolveDest(ctx, manager, strings.TrimSpace(opts.To))
 	if err != nil {
 		return errors.Wrap(err, "resolve dest peer")
 	}
@@ -81,10 +115,13 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 
 	gui := desktopio.From(ctx) != nil
 	total := totalMessages(dialogs)
-	if gui {
-		if total == 0 {
+	if total == 0 {
+		if gui {
 			return errors.New("沒有找到可轉傳的訊息")
 		}
+		return errors.New("no messages found")
+	}
+	if gui {
 		_ = desktopio.Emit(ctx, desktopio.Event{
 			Event:   "status",
 			Kind:    "forward",
@@ -106,11 +143,14 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 			manager: manager,
 			pool:    pool,
 			to:      to,
+			topic:   opts.TopicID,
 			edit:    edit,
 			dialogs: dialogs,
 			mode:    opts.Mode,
 			silent:  opts.Silent,
 			dryRun:  opts.DryRun,
+			// Batch callers pass --single so grouped album expansion cannot
+			// pull messages outside the scanned date/media/topic manifest.
 			grouped: !opts.Single,
 			delay:   viper.GetDuration(consts.FlagDelay),
 		}),
@@ -154,6 +194,9 @@ func collectDialogs(ctx context.Context, input []string, desc bool) ([]*tmessage
 
 		if desc {
 			for _, dd := range d {
+				if dd == nil {
+					continue
+				}
 				for i, j := 0, len(dd.Messages)-1; i < j; i, j = i+1, j-1 {
 					dd.Messages[i], dd.Messages[j] = dd.Messages[j], dd.Messages[i]
 				}
@@ -217,6 +260,9 @@ func resolveEdit(input string) (*vm.Program, error) {
 func totalMessages(dialogs []*tmessage.Dialog) int {
 	var total int
 	for _, d := range dialogs {
+		if d == nil {
+			continue
+		}
 		total += len(d.Messages)
 	}
 	return total
