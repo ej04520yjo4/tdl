@@ -51,9 +51,12 @@ _JSON_VERSION = 1
 _TAIPEI_TZ = timezone(timedelta(hours=8), name="Asia/Taipei")
 EXPORT_MEDIA_TYPES = frozenset({"video", "photo", "audio", "document"})
 CHAT_CACHE_FILE_NAME = "chats.dpapi"
+# Per-file queue rows, stored beside the job's import snapshots.
+JOB_PROGRESS_FILE_NAME = "progress.json"
 # The core reports progress several times per second and file.  Rewriting the
 # queue and history JSON for each event made the core block on its stdout pipe,
-# which slowed the transfer itself; state changes are still written at once.
+# which slowed the transfer itself.  Per-file failures follow the same
+# interval; status changes such as pause or completion are written at once.
 _PROGRESS_PERSIST_INTERVAL = 2.0
 # Scan manifests that were never turned into a download are only useful for
 # the current session; resumable jobs keep their own snapshot.
@@ -336,9 +339,15 @@ def _atomic_write_bytes(path: Path, data: bytes, *, strict_permissions: bool = F
                 pass
 
 
-def _atomic_write_json(path: Path, value: Any) -> None:
+def _atomic_write_json(path: Path, value: Any, *, compact: bool = False) -> None:
+    # Files rewritten while a download runs are compact: pretty-printing
+    # roughly doubles both their size and the time spent serialising them.
     try:
-        payload = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
+        if compact:
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        else:
+            text = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+        payload = text.encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise StoreError(f"資料格式無法儲存：{path.name}") from exc
     _atomic_write_bytes(path, payload)
@@ -746,6 +755,7 @@ class Store:
         self._history_path = self.root / "downloads.json"
         self._lock = threading.RLock()
         self._ensure_files()
+        self._move_inline_progress()
         self.mark_interrupted_jobs()
         self.prune_completed_queue()
         # A forced close can leave a plaintext core runtime behind.  Seal it
@@ -1003,7 +1013,75 @@ class Store:
         return [dict(item) for item in raw["items"] if isinstance(item, Mapping)]
 
     def _save_items(self, path: Path, values: Iterable[Mapping[str, Any]]) -> None:
-        _atomic_write_json(path, {"version": _JSON_VERSION, "items": [dict(value) for value in values]})
+        # Per-file rows live in ``jobdata/<job>/progress.json``; keeping them
+        # out of the shared files keeps every queue write small, however many
+        # files earlier failed or paused jobs had.
+        items = [{key: item for key, item in value.items() if key != "file_progress"} for value in values]
+        _atomic_write_json(path, {"version": _JSON_VERSION, "items": items}, compact=True)
+
+    def _job_progress_path(self, account_id: str, job_id: str, *, create: bool = False) -> Path:
+        if not _is_uuid(str(job_id)):
+            raise StoreError("下載工作識別碼格式無效")
+        jobdata = self.account_root(account_id, create=create) / "jobdata"
+        job_dir = _safe_child(jobdata, str(job_id))
+        if job_dir.parent != jobdata.resolve():
+            raise StoreError("下載工作資料路徑不安全")
+        if create:
+            job_dir.mkdir(parents=True, exist_ok=True)
+            _restrict_permissions(job_dir)
+        return job_dir / JOB_PROGRESS_FILE_NAME
+
+    def _load_file_progress(self, account_id: str, job_id: str) -> Optional[dict[str, dict[str, Any]]]:
+        """Return a job's saved per-file rows, or ``None`` when it has none."""
+
+        try:
+            path = self._job_progress_path(account_id, job_id)
+            if path.is_symlink() or not path.is_file():
+                return None
+            with path.open("r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except (BackendError, OSError, UnicodeError, ValueError):
+            return None
+        if not isinstance(raw, Mapping):
+            return None
+        return _normalize_file_progress(raw.get("files"))
+
+    def _save_file_progress(self, account_id: str, job_id: str, rows: Mapping[str, Any]) -> None:
+        path = self._job_progress_path(account_id, job_id, create=True)
+        _atomic_write_json(path, {"version": _JSON_VERSION, "files": dict(rows)}, compact=True)
+
+    def _with_file_progress(self, job: DownloadJob) -> DownloadJob:
+        saved = self._load_file_progress(job.account_id, job.id)
+        if saved is not None:
+            job.file_progress = saved
+        return job
+
+    def _move_inline_progress(self) -> None:
+        """Move rows that 1.6.0 and earlier kept in the shared JSON files.
+
+        Rows are only for display after a restart; the core's own checkpoint
+        decides what a resumed job downloads.  A row that cannot be moved
+        (for example its account was removed) is therefore dropped rather
+        than blocking startup.
+        """
+
+        with self._lock:
+            queue_items = self._read_items(self._queue_path)
+            history_items = self._read_items(self._history_path)
+            if not any(item.get("file_progress") for item in queue_items + history_items):
+                return
+            for item in queue_items:
+                rows = _normalize_file_progress(item.get("file_progress"))
+                if not rows or str(item.get("status")) == "completed":
+                    continue
+                account_id, job_id = str(item.get("account_id", "")), str(item.get("id", ""))
+                try:
+                    if self._load_file_progress(account_id, job_id) is None:
+                        self._save_file_progress(account_id, job_id, rows)
+                except (BackendError, OSError):
+                    continue
+            self._save_items(self._queue_path, queue_items)
+            self._save_items(self._history_path, history_items)
 
     def mark_interrupted_jobs(self) -> int:
         """Mark jobs left running by a previous process as interrupted.
@@ -1033,10 +1111,12 @@ class Store:
     # Keep the original public name for callers and older desktop builds.
     recover_interrupted_jobs = mark_interrupted_jobs
 
-    def list_resumable_jobs(self, *, account_id: str | None = None) -> list[DownloadJob]:
+    def list_resumable_jobs(
+        self, *, account_id: str | None = None, file_rows: bool = True
+    ) -> list[DownloadJob]:
         """Return durable jobs that may be resumed without creating a copy."""
 
-        values = self.list_queue(statuses=("queued", "running", "interrupted", "paused"))
+        values = self.list_queue(statuses=("queued", "running", "interrupted", "paused"), file_rows=file_rows)
         if account_id is None:
             return values
         return [item for item in values if item.account_id == str(account_id)]
@@ -1225,6 +1305,8 @@ class Store:
         return job
 
     def _update_job(self, job_id: str, **updates: Any) -> DownloadJob:
+        """Apply summary fields to both records; per-file rows are not read."""
+
         with self._lock:
             queue_items = self._read_items(self._queue_path)
             history_items = self._read_items(self._history_path)
@@ -1237,41 +1319,52 @@ class Store:
                             found = item
             if found is None:
                 raise StoreError("找不到下載工作")
-            self._save_items(self._queue_path, queue_items)
-            self._save_items(self._history_path, history_items)
+            if updates:
+                self._save_items(self._queue_path, queue_items)
+                self._save_items(self._history_path, history_items)
             return DownloadJob.from_dict(found)
 
     def mark_job_running(self, job_id: str) -> DownloadJob:
-        return self._update_job(
+        job = self._update_job(
             job_id,
             status="running",
             started_at=_utc_now(),
             finished_at=None,
             error=None,
         )
+        return self._with_file_progress(job)
 
     def update_job_progress(self, job_id: str, **progress: Any) -> DownloadJob:
-        allowed = {"percent", "current", "total", "speed", "filename", "file_progress", "folders"}
+        allowed = {"percent", "current", "total", "speed", "filename", "folders"}
         updates = {key: value for key, value in progress.items() if key in allowed}
-        if "file_progress" in updates:
-            updates["file_progress"] = _normalize_file_progress(updates["file_progress"])
         if "folders" in updates:
             updates["folders"] = _clean_folders(updates["folders"])
-        return self._update_job(job_id, **updates)
+        with self._lock:
+            job = self._update_job(job_id, **updates)
+            if "file_progress" in progress:
+                job.file_progress = _normalize_file_progress(progress["file_progress"])
+                try:
+                    self._save_file_progress(job.account_id, job.id, job.file_progress)
+                except (BackendError, OSError):
+                    # Display rows only: a full disk or a removed account
+                    # folder must not stop the transfer itself.
+                    pass
+        return job
 
     def finish_job(self, job_id: str, status: str, *, error: str | None = None) -> DownloadJob:
         if status not in {"completed", "failed", "cancelled", "interrupted", "paused"}:
             raise ValidationError("下載完成狀態無效")
         if status != "completed":
-            return self._update_job(job_id, status=status, finished_at=_utc_now(), error=error)
+            job = self._update_job(job_id, status=status, finished_at=_utc_now(), error=error)
+            return self._with_file_progress(job)
         return self._complete_job(job_id, error=error)
 
     def _complete_job(self, job_id: str, *, error: str | None) -> DownloadJob:
         """Record a completed job and release everything kept for a resume.
 
         A finished job is never restarted, so its per-file rows (thousands
-        for a channel) would only make every later queue write slower.  Both
-        records keep the totals instead; the queue copy itself is dropped by
+        for a channel) are deleted with its job folder.  Both records keep
+        the totals instead; the queue copy itself is dropped by
         ``prune_completed_queue`` on the next launch.
         """
 
@@ -1279,11 +1372,15 @@ class Store:
             queue_items = self._read_items(self._queue_path)
             history_items = self._read_items(self._history_path)
             found: Optional[dict[str, Any]] = None
+            rows: Optional[dict[str, dict[str, Any]]] = None
             for items in (queue_items, history_items):
                 for item in items:
                     if str(item.get("id")) != str(job_id):
                         continue
-                    rows = _normalize_file_progress(item.get("file_progress", {}))
+                    if rows is None:
+                        rows = self._load_file_progress(str(item.get("account_id", "")), str(job_id))
+                        if rows is None:
+                            rows = _normalize_file_progress(item.get("file_progress", {}))
                     item.update(status="completed", finished_at=_utc_now(), error=error)
                     if rows:
                         item["file_count"] = len(rows)
@@ -1347,9 +1444,9 @@ class Store:
                 cleared = {job_id for _account_id, job_id in removed}
                 for item in history_items:
                     if str(item.get("id")) in cleared:
-                        item["file_progress"] = {}
                         item["file_snapshots"] = []
                 self._save_items(self._history_path, history_items)
+        # The per-file rows go with the job folder below.
         for account_id, job_id in removed:
             self._remove_job_data(account_id, job_id)
         return [job_id for _account_id, job_id in removed]
@@ -1390,7 +1487,7 @@ class Store:
         with self._lock:
             referenced = {
                 os.path.normcase(str(Path(path)))
-                for job in self.list_resumable_jobs()
+                for job in self.list_resumable_jobs(file_rows=False)
                 for path in job.files
             }
         cutoff = time.time() - max_age_seconds
@@ -1443,16 +1540,20 @@ class Store:
         with self._lock:
             for item in self._read_items(self._history_path):
                 if str(item.get("id")) == str(job_id):
-                    return DownloadJob.from_dict(item)
+                    return self._with_file_progress(DownloadJob.from_dict(item))
         raise StoreError("找不到下載工作")
 
-    def list_queue(self, *, statuses: Sequence[str] | None = None) -> list[DownloadJob]:
+    def list_queue(
+        self, *, statuses: Sequence[str] | None = None, file_rows: bool = True
+    ) -> list[DownloadJob]:
         with self._lock:
             values = [DownloadJob.from_dict(item) for item in self._read_items(self._queue_path)]
-        if statuses is None:
-            return values
-        wanted = set(statuses)
-        return [item for item in values if item.status in wanted]
+            if statuses is not None:
+                wanted = set(statuses)
+                values = [item for item in values if item.status in wanted]
+            if file_rows:
+                values = [self._with_file_progress(item) for item in values]
+        return values
 
     def list_history(self, *, account_id: str | None = None) -> list[DownloadJob]:
         with self._lock:
@@ -4027,7 +4128,9 @@ class Runner:
                             row = file_progress.setdefault(file_id, {"file_id": file_id})
                             row["state"] = sanitize_text(event.get("state") or "failed")
                             pending_progress["file_progress"] = file_progress
-                            persist_progress(force=True)
+                            # A burst of failures would otherwise rewrite the
+                            # rows once per file; the final write is forced.
+                            persist_progress()
                     elif event.get("event") == "authenticated":
                         # Do not mark an account logged in until the child has
                         # exited successfully and the session vault has sealed

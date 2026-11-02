@@ -194,6 +194,63 @@ for index in range(20):
         raw = json.loads((self.root / "downloads.json").read_text(encoding="utf-8"))["items"][0]
         self.assertEqual((raw["status"], raw["file_count"], raw["total_bytes"]), ("completed", 20, 20000))
 
+    def test_per_file_failures_follow_the_write_interval(self) -> None:
+        script = f"""
+import json
+prefix = {EVENT_PREFIX!r}
+for index in range(200):
+    print(prefix + json.dumps({{'event': 'error', 'file_id': str(index), 'state': 'failed',
+        'message': 'media download failed'}}), flush=True)
+raise SystemExit(1)
+"""
+        runner = _FixtureRunner(self.store, script)
+        writes = 0
+        original = self.store.update_job_progress
+
+        def counting(job_id, **progress):  # type: ignore[no-untyped-def]
+            nonlocal writes
+            writes += 1
+            return original(job_id, **progress)
+
+        with patch.object(self.store, "update_job_progress", side_effect=counting):
+            result = runner.start_download(self.account.id, ["https://t.me/telegram/193"]).wait(timeout=20)
+        self.assertFalse(result.success)
+        # Each failure used to force a rewrite of every saved row.
+        self.assertLess(writes, 20)
+        saved = Store(self.root).get_job(result.job_id)
+        self.assertEqual(len(saved.file_progress), 200)
+        self.assertEqual(saved.file_progress["199"]["state"], "failed")
+
+    def test_file_rows_stay_out_of_the_shared_queue_files(self) -> None:
+        job = self.store.create_download_job(self.account.id, ["https://t.me/telegram/193"])
+        rows = {str(index): {"file_id": str(index), "state": "completed", "total": 10} for index in range(50)}
+        self.store.update_job_progress(job.id, percent=50, file_progress=rows)
+        for name in ("queue.json", "downloads.json"):
+            raw = json.loads((self.root / name).read_text(encoding="utf-8"))["items"][0]
+            self.assertNotIn("file_progress", raw)
+            self.assertEqual(raw["percent"], 50)
+        progress = self.store.account_root(self.account.id) / "jobdata" / job.id / "progress.json"
+        self.assertEqual(len(json.loads(progress.read_text(encoding="utf-8"))["files"]), 50)
+        self.assertEqual(len(Store(self.root).get_job(job.id).file_progress), 50)
+        self.assertEqual(len(Store(self.root).list_queue()[0].file_progress), 50)
+
+    def test_rows_saved_inline_by_older_versions_are_moved_on_start(self) -> None:
+        job = self.store.create_download_job(self.account.id, ["https://t.me/telegram/193"])
+        self.store.finish_job(job.id, "paused")
+        rows = {"1": {"file_id": "1", "state": "completed", "total": 10, "filename": "a.mp4"}}
+        for name in ("queue.json", "downloads.json"):
+            path = self.root / name
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            raw["items"][0]["file_progress"] = rows
+            path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+
+        reopened = Store(self.root)
+        self.assertEqual(reopened.get_job(job.id).file_progress["1"]["state"], "completed")
+        self.assertEqual(reopened.list_queue()[0].file_progress["1"]["filename"], "a.mp4")
+        for name in ("queue.json", "downloads.json"):
+            raw = json.loads((self.root / name).read_text(encoding="utf-8"))["items"][0]
+            self.assertNotIn("file_progress", raw)
+
     def test_final_file_states_survive_an_interrupted_run(self) -> None:
         script = _emit_script(
             {"event": "progress", "file_id": "1", "state": "completed", "current": 10, "total": 10, "percent": 100, "filename": "a.mp4"},

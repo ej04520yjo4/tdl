@@ -1289,7 +1289,12 @@ class QueueRow(Card):
         # latest event would make the visible list jump around on every
         # callback.
         self._file_order: list[str] = []
+        # Visible file lines, keyed by the file each one shows now; see
+        # ``_claim_file_line``.  ``_line_touched`` orders them by last update.
         self._file_rows: dict[str, tuple[QProgressBar, QLabel, QLabel]] = {}
+        self._line_touched: dict[str, int] = {}
+        self._touch_count = 0
+        self._more_files: Optional[QLabel] = None
         self._has_file_progress = False
         # Per-file display state and byte counters, kept so one progress
         # event updates one row and the totals without rescanning every file.
@@ -1549,56 +1554,92 @@ class QueueRow(Card):
         except (TypeError, ValueError, OverflowError):
             return 0
 
+    # A channel job can report thousands of files; one widget line each made
+    # restoring such a job freeze the window.  Files beyond this many reuse
+    # the lines of finished ones and are otherwise only counted.
+    _MAX_FILE_LINES = 20
+
+    def _new_file_line(self) -> tuple[QProgressBar, QLabel, QLabel]:
+        filename = QLabel()
+        filename.setWordWrap(False)
+        filename.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        filename.setMinimumWidth(0)
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        bar.setTextVisible(False)
+        bar.setFixedHeight(6)
+        bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        detail = QLabel()
+        detail.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        detail.setFixedWidth(68)
+        detail.setObjectName("QueueFileProgressText")
+        line = QWidget(self.file_progress_host)
+        line.setFixedHeight(22)
+        line_layout = QHBoxLayout(line)
+        line_layout.setContentsMargins(0, 0, 0, 0)
+        line_layout.setSpacing(8)
+        line_layout.addWidget(filename, 3)
+        line_layout.addWidget(bar, 2)
+        line_layout.addWidget(detail, 0)
+        self.file_progress_layout.addWidget(line)
+        return bar, filename, detail
+
+    def _claim_file_line(self, identifier: str, state: str) -> Optional[tuple[QProgressBar, QLabel, QLabel]]:
+        """Give a file without a line one, or ``None`` to only count it.
+
+        Lines keep their file while it is downloading or failed, so the list
+        does not jump around.  Once all lines are used, a downloading or
+        failed file takes the line least recently updated among finished,
+        then waiting, files; other files stay in the totals only.
+        """
+
+        if len(self._file_rows) < self._MAX_FILE_LINES:
+            line = self._new_file_line()
+        else:
+            if state not in ("下載中", "失敗"):
+                return None
+            reusable = [
+                (0 if self._file_states.get(shown) != "等待中" else 1, self._line_touched.get(shown, 0), shown)
+                for shown in self._file_rows
+                if self._file_states.get(shown) in ("已完成", "已取消", "等待中")
+            ]
+            if not reusable:
+                return None
+            shown = min(reusable)[2]
+            line = self._file_rows.pop(shown)
+            self._line_touched.pop(shown, None)
+        self._file_rows[identifier] = line
+        return line
+
     def _apply_file(self, item: Mapping[str, Any]) -> None:
         """Create or update one file row and keep the running totals."""
 
         identifier = item["id"]
-        row = self._file_rows.get(identifier)
-        if row is None:
+        if identifier not in self._file_states:
             # First-seen order is the display order.  Concurrent downloads
             # report in any order; sorting by the latest event would make the
             # visible list jump around on every callback.
             self._file_order.append(identifier)
-            filename = QLabel(item["filename"])
-            filename.setWordWrap(False)
-            filename.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
-            filename.setMinimumWidth(0)
-            bar = QProgressBar()
-            bar.setRange(0, 100)
-            bar.setTextVisible(False)
-            bar.setFixedHeight(6)
-            bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            detail = QLabel()
-            detail.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            detail.setFixedWidth(68)
-            detail.setObjectName("QueueFileProgressText")
-            line = QWidget(self.file_progress_host)
-            line.setFixedHeight(22)
-            line_layout = QHBoxLayout(line)
-            line_layout.setContentsMargins(0, 0, 0, 0)
-            line_layout.setSpacing(8)
-            line_layout.addWidget(filename, 3)
-            line_layout.addWidget(bar, 2)
-            line_layout.addWidget(detail, 0)
-            self.file_progress_layout.addWidget(line)
-            row = (bar, filename, detail)
-            self._file_rows[identifier] = row
-        bar, filename, detail = row
         if item.get("path"):
             self._remember_folder(item["path"])
-        if filename.text() != item["filename"]:
-            filename.setText(item["filename"])
-            filename.setToolTip(item["filename"])
-            detail.setToolTip(item["filename"])
         percent = item["percent"]
         state = self._file_state(item["state"], percent)
-        if state == "已完成":
-            bar.setValue(100)
-        elif percent is not None:
-            bar.setValue(max(0, min(100, int(round(percent)))))
-        else:
-            bar.setValue(0)
-        detail.setText(self._file_detail(item, state, percent))
+        row = self._file_rows.get(identifier) or self._claim_file_line(identifier, state)
+        if row is not None:
+            self._touch_count += 1
+            self._line_touched[identifier] = self._touch_count
+            bar, filename, detail = row
+            if filename.text() != item["filename"]:
+                filename.setText(item["filename"])
+                filename.setToolTip(item["filename"])
+                detail.setToolTip(item["filename"])
+            if state == "已完成":
+                bar.setValue(100)
+            elif percent is not None:
+                bar.setValue(max(0, min(100, int(round(percent)))))
+            else:
+                bar.setValue(0)
+            detail.setText(self._file_detail(item, state, percent))
 
         previous = self._file_states.get(identifier)
         if previous != state:
@@ -1633,6 +1674,19 @@ class QueueRow(Card):
         self.file_progress_host.setVisible(True)
         self.percent.setText(summary)
         self.percent.setToolTip(summary)
+        unlisted = len(self._file_order) - len(self._file_rows)
+        if unlisted > 0:
+            if self._more_files is None:
+                # Added once every line is in use, so it stays last.
+                self._more_files = QLabel()
+                self._more_files.setObjectName("MutedText")
+                self._more_files.setFixedHeight(20)
+                self._more_files.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+                self._more_files.setMinimumWidth(0)
+                self.file_progress_layout.addWidget(self._more_files)
+            more = f"另有 {unlisted} 個檔案未逐一列出，已計入上方統計"
+            if self._more_files.text() != more:
+                self._more_files.setText(more)
 
         # A scan knows the whole job size up front; a pasted link only learns
         # each file's size as the core reaches it.
