@@ -23,3 +23,5 @@
 2026-10-25：依使用者指示，先合併 [PR #3](https://github.com/ej04520yjo4/tdl/pull/3) 的 1.5.0 介面改善，再以 [PR #5](https://github.com/ej04520yjo4/tdl/pull/5) 將 1.5.1 目的位置功能合併至 `master`，並同步本機主分支。EXE 與 Release 附件沿用已驗證的 1.5.1，詳見 [1.5.1 主分支同步紀錄](handovers/1.5.1.md)。
 
 2026-10-27：依使用者指示，以 [PR #4](https://github.com/ej04520yjo4/tdl/pull/4) 將 `claude/sha256sums-lf` 的發行校驗檔 LF 修正以合併提交併入 `master`，保留分支與原始提交，並同步本機主分支。該修正的程式與測試已隨 1.5.1 發布，與主分支內容相同；PR 中早於 1.5.1 寫下的「尚未發行的修正」段落已過時，合併時移除。EXE 與 Release 附件未變更，詳見 [1.5.1 PR #4 合併紀錄](handovers/1.5.1.md)。
+
+2026-11-02：依使用者指示，先以 [PR #6](https://github.com/ej04520yjo4/tdl/pull/6) 合併 1.6.0 群組批次轉傳，再以 [PR #7](https://github.com/ej04520yjo4/tdl/pull/7) 將 1.6.1 效能與 JSON 匯入修正合併至 `master`，並同步本機主分支。EXE 與 Release 附件沿用已驗證的 1.6.1，詳見 [1.6.1 主分支同步紀錄](handovers/1.6.1.md)。
