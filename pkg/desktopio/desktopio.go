@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Prefix marks machine-readable lines in stdout.
@@ -33,6 +34,11 @@ type Bridge struct {
 	writeMu sync.Mutex
 	closeMu sync.Once
 	done    chan struct{}
+
+	// paused is set by the "pause" command.  It stops the operation exactly
+	// like "cancel", but tells the downloader to keep partly downloaded
+	// files so the same job can continue from them later.
+	paused atomic.Bool
 }
 
 // Event is the common envelope used by the desktop protocol.  Fields which do
@@ -187,6 +193,17 @@ func Emit(ctx context.Context, event Event) error {
 	return nil
 }
 
+// Paused reports whether the operation was stopped with the "pause" command
+// rather than "cancel".  It is false in regular CLI mode.
+func (b *Bridge) Paused() bool {
+	return b != nil && b.paused.Load()
+}
+
+// Paused reports whether the desktop paused the operation in ctx.
+func Paused(ctx context.Context) bool {
+	return From(ctx).Paused()
+}
+
 // Prompt emits a prompt and waits for the next JSON input line with a value.
 // A cancel command, EOF, or context cancellation unblocks the caller.
 func (b *Bridge) Prompt(ctx context.Context, kind, message string) (string, error) {
@@ -249,7 +266,10 @@ func (b *Bridge) readLoop() {
 		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
 			continue
 		}
-		if req.Command == "cancel" {
+		if req.Command == "cancel" || req.Command == "pause" {
+			if req.Command == "pause" {
+				b.paused.Store(true)
+			}
 			b.cancel()
 			continue
 		}

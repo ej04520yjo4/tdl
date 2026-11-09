@@ -100,3 +100,25 @@ func TestCancelInputCancelsContext(t *testing.T) {
 		t.Fatal("prompt succeeded after cancellation")
 	}
 }
+
+func TestPauseCancelsContextAndIsRemembered(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		paused  bool
+	}{{"pause", true}, {"cancel", false}} {
+		line := `{"command":"` + tc.command + `"}` + "\n"
+		ctx, bridge := New(context.Background(), strings.NewReader(line), &bytes.Buffer{})
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+			t.Fatalf("%s command did not stop the operation", tc.command)
+		}
+		if Paused(ctx) != tc.paused {
+			t.Fatalf("%s: Paused() = %v, want %v", tc.command, Paused(ctx), tc.paused)
+		}
+		bridge.Close()
+	}
+	if Paused(context.Background()) {
+		t.Fatal("CLI mode must never report a pause")
+	}
+}

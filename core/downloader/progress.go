@@ -25,6 +25,8 @@ type writeAt struct {
 	elem     Elem
 	progress Progress
 	partSize int
+	// partDone, when set, is told about every part written in full.
+	partDone func(index int64)
 
 	downloaded *atomic.Int64
 }
@@ -42,6 +44,11 @@ func (w *writeAt) WriteAt(p []byte, off int64) (int, error) {
 	at, err := w.elem.To().WriteAt(p, off)
 	if err != nil {
 		return 0, err
+	}
+	// Every write is one whole part at a part boundary, so the part can be
+	// skipped if the download is paused and continued later.
+	if w.partDone != nil && at == len(p) && off%int64(w.partSize) == 0 {
+		w.partDone(off / int64(w.partSize))
 	}
 
 	// some small files may finish too fast, terminal history may not be overwritten

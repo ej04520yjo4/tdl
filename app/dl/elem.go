@@ -20,9 +20,17 @@ type iterElem struct {
 	file    *tmedia.Media
 
 	to *os.File
+	// partial tracks the parts on disk, so a pause can keep them.
+	partial *partState
 
 	opts Options
 }
+
+// DoneParts lists the parts a paused download already wrote.
+func (i *iterElem) DoneParts() []int64 { return i.partial.parts() }
+
+// PartDone records a part written to the temporary file.
+func (i *iterElem) PartDone(index int64) { i.partial.add(index) }
 
 func (i *iterElem) File() downloader.File { return i }
 

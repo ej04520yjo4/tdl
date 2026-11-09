@@ -314,6 +314,26 @@ def _restrict_permissions(path: Path, *, strict: bool = False) -> None:
         pass
 
 
+def _replace_file(source: Path, target: Path) -> None:
+    """``os.replace`` that waits out a short-lived lock on Windows.
+
+    Antivirus scanners, indexers and backup tools briefly open files that
+    were just written; Windows then refuses to replace them ("access
+    denied").  The data files are rewritten often while downloading, so wait
+    up to about 1.5 seconds before giving up.
+    """
+
+    for delay in (0.05, 0.1, 0.2, 0.4, 0.8):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if os.name != "nt":
+                raise
+            time.sleep(delay)
+    os.replace(source, target)
+
+
 def _atomic_write_bytes(path: Path, data: bytes, *, strict_permissions: bool = False) -> None:
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -327,7 +347,7 @@ def _atomic_write_bytes(path: Path, data: bytes, *, strict_permissions: bool = F
             handle.flush()
             os.fsync(handle.fileno())
         _restrict_permissions(temporary, strict=strict_permissions)
-        os.replace(temporary, path)
+        _replace_file(temporary, path)
         _restrict_permissions(path, strict=strict_permissions)
     except OSError as exc:
         raise StoreError(f"寫入資料失敗：{path.name}") from exc
@@ -948,7 +968,7 @@ class Store:
             try:
                 protected = _dpapi_protect(proxy.encode("utf-8"))
                 safe_values["proxy_protected"] = base64.b64encode(protected).decode("ascii")
-            except (OSError, TypeError, ValueError) as exc:
+            except (DataProtectionError, OSError, TypeError, ValueError) as exc:
                 raise StoreError("無法安全保存代理設定") from exc
         _atomic_write_json(self._preferences_path, {"version": _JSON_VERSION, "values": safe_values})
 
@@ -1356,6 +1376,10 @@ class Store:
             raise ValidationError("下載完成狀態無效")
         if status != "completed":
             job = self._update_job(job_id, status=status, finished_at=_utc_now(), error=error)
+            if status == "cancelled":
+                # A cancelled job starts over if retried; a paused one keeps
+                # its partly downloaded files for the next run.
+                self._remove_partial_files(job.account_id, job.id, job.output_dir)
             return self._with_file_progress(job)
         return self._complete_job(job_id, error=error)
 
@@ -1394,7 +1418,7 @@ class Store:
             self._save_items(self._queue_path, queue_items)
             self._save_items(self._history_path, history_items)
             job = DownloadJob.from_dict(found)
-        self._remove_job_data(job.account_id, job.id)
+        self._remove_job_data(job.account_id, job.id, job.output_dir)
         return job
 
     def prune_completed_queue(self) -> int:
@@ -1407,11 +1431,58 @@ class Store:
                 self._save_items(self._queue_path, kept)
             return len(queue_items) - len(kept)
 
-    def _remove_job_data(self, account_id: str, job_id: str) -> None:
-        """Delete one job's private manifest copies; never fails the caller."""
+    def _remove_partial_files(self, account_id: str, job_id: str, output_dir: str) -> int:
+        """Delete the files a pause kept, once the job will not continue.
+
+        The core keeps ``<name>.tmp`` and its ``<name>.tmp.part`` list when a
+        download is paused.  Only files named by this job's own rows, inside
+        its download folder, and with that part list next to them are
+        removed; nothing else in the folder is touched.
+        """
+
+        rows = self._load_file_progress(account_id, job_id) or {}
+        if not rows or not output_dir:
+            return 0
+        try:
+            root = Path(output_dir).expanduser().resolve()
+        except (OSError, RuntimeError):
+            return 0
+        removed = 0
+        for row in rows.values():
+            name = str(row.get("filename") or "")
+            folder = str(row.get("path") or "")
+            if row.get("state") == "completed" or not name or not folder or Path(name).name != name:
+                continue
+            try:
+                directory = Path(folder).resolve()
+                directory.relative_to(root)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            temporary = directory / f"{name}{PARTIAL_DOWNLOAD_SUFFIX}"
+            part_list = directory / f"{name}{PARTIAL_DOWNLOAD_SUFFIX}{PART_LIST_SUFFIX}"
+            if temporary.is_symlink() or part_list.is_symlink() or not part_list.is_file():
+                continue
+            try:
+                temporary.unlink(missing_ok=True)
+                part_list.unlink(missing_ok=True)
+            except OSError:
+                continue
+            removed += 1
+        return removed
+
+    def _remove_job_data(self, account_id: str, job_id: str, output_dir: str = "") -> None:
+        """Delete one job's private manifest copies; never fails the caller.
+
+        With ``output_dir`` the files a pause kept are removed as well.
+        """
 
         if not _is_uuid(str(job_id)):
             return
+        if output_dir:
+            try:
+                self._remove_partial_files(account_id, job_id, output_dir)
+            except (BackendError, OSError):
+                pass
         try:
             jobdata = self.account_root(account_id, create=False) / "jobdata"
             target = _safe_child(jobdata, str(job_id))
@@ -1430,26 +1501,28 @@ class Store:
         """
 
         removable = {"completed", "failed", "cancelled"}
-        removed: list[tuple[str, str]] = []
+        removed: list[tuple[str, str, str]] = []
         with self._lock:
             kept: list[dict[str, Any]] = []
             for item in self._read_items(self._queue_path):
                 if str(item.get("status")) in removable:
-                    removed.append((str(item.get("account_id", "")), str(item.get("id", ""))))
+                    removed.append(
+                        (str(item.get("account_id", "")), str(item.get("id", "")), str(item.get("output_dir", "")))
+                    )
                 else:
                     kept.append(item)
             if removed:
                 self._save_items(self._queue_path, kept)
                 history_items = self._read_items(self._history_path)
-                cleared = {job_id for _account_id, job_id in removed}
+                cleared = {job_id for _account_id, job_id, _output_dir in removed}
                 for item in history_items:
                     if str(item.get("id")) in cleared:
                         item["file_snapshots"] = []
                 self._save_items(self._history_path, history_items)
         # The per-file rows go with the job folder below.
-        for account_id, job_id in removed:
-            self._remove_job_data(account_id, job_id)
-        return [job_id for _account_id, job_id in removed]
+        for account_id, job_id, output_dir in removed:
+            self._remove_job_data(account_id, job_id, output_dir)
+        return [job_id for _account_id, job_id, _output_dir in removed]
 
     def remove_history_items(self, job_ids: Sequence[str]) -> list[str]:
         """Delete ended jobs from the download history (and the queue).
@@ -1460,26 +1533,26 @@ class Store:
 
         wanted = {str(job_id) for job_id in job_ids}
         removable = {"completed", "failed", "cancelled"}
-        removed: list[tuple[str, str]] = []
+        removed: list[tuple[str, str, str]] = []
         with self._lock:
             history_items = self._read_items(self._history_path)
             kept_history: list[dict[str, Any]] = []
             for item in history_items:
                 job_id = str(item.get("id", ""))
                 if job_id in wanted and str(item.get("status")) in removable:
-                    removed.append((str(item.get("account_id", "")), job_id))
+                    removed.append((str(item.get("account_id", "")), job_id, str(item.get("output_dir", ""))))
                 else:
                     kept_history.append(item)
             if removed:
-                gone = {job_id for _account_id, job_id in removed}
+                gone = {job_id for _account_id, job_id, _output_dir in removed}
                 queue_items = [
                     item for item in self._read_items(self._queue_path) if str(item.get("id")) not in gone
                 ]
                 self._save_items(self._queue_path, queue_items)
                 self._save_items(self._history_path, kept_history)
-        for account_id, job_id in removed:
-            self._remove_job_data(account_id, job_id)
-        return [job_id for _account_id, job_id in removed]
+        for account_id, job_id, output_dir in removed:
+            self._remove_job_data(account_id, job_id, output_dir)
+        return [job_id for _account_id, job_id, _output_dir in removed]
 
     def purge_stale_exports(self, *, max_age_seconds: float = _EXPORT_RETENTION_SECONDS) -> int:
         """Remove old channel scan manifests no resumable job still names."""
@@ -1577,6 +1650,11 @@ class _DataBlob(ctypes.Structure):
     _fields_ = [("cbData", ctypes.wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
 
 
+# A paused download keeps ``<name>.tmp`` and the list of its finished parts,
+# ``<name>.tmp.part`` (see app/dl/partial.go).
+PARTIAL_DOWNLOAD_SUFFIX = ".tmp"
+PART_LIST_SUFFIX = ".part"
+
 _DPAPI_ENTROPY = b"TDLDesktop-session-v1"
 _DPAPI_MAGIC = b"TDL-DPAPI-1\n"
 _PLAIN_MAGIC = b"TDL-LOCAL-1\n"
@@ -1586,8 +1664,8 @@ def _dpapi_protect(data: bytes) -> bytes:
     if os.name != "nt":
         return _PLAIN_MAGIC + data
     try:
-        crypt32 = ctypes.windll.crypt32
-        kernel32 = ctypes.windll.kernel32
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         input_buffer = ctypes.create_string_buffer(data)
         entropy_buffer = ctypes.create_string_buffer(_DPAPI_ENTROPY)
         input_blob = _DataBlob(len(data), ctypes.cast(input_buffer, ctypes.POINTER(ctypes.c_byte)))
@@ -1605,17 +1683,16 @@ def _dpapi_protect(data: bytes) -> bytes:
             ctypes.byref(output_blob),
         )
         if not ok:
-            raise OSError(ctypes.get_last_error())
+            raise OSError(ctypes.get_last_error(), "CryptProtectData failed")
         try:
             result = ctypes.string_at(output_blob.pbData, output_blob.cbData)
         finally:
             kernel32.LocalFree(output_blob.pbData)
         return _DPAPI_MAGIC + result
     except (AttributeError, OSError, TypeError) as exc:
-        # This fallback still prevents an unencrypted directory tree from
-        # remaining on disk.  On Windows, the UI can surface a warning if the
-        # platform DPAPI call itself is unavailable.
-        return _PLAIN_MAGIC + data
+        # Never write the session or chat list readable on Windows.  The
+        # caller keeps the previous envelope and reports the failure.
+        raise DataProtectionError("無法用 Windows 加密保存帳號資料，已取消保存。") from exc
 
 
 def _dpapi_unprotect(data: bytes) -> bytes:
@@ -1626,8 +1703,8 @@ def _dpapi_unprotect(data: bytes) -> bytes:
     if os.name != "nt":
         raise DataProtectionError("此工作階段需要 Windows DPAPI")
     try:
-        crypt32 = ctypes.windll.crypt32
-        kernel32 = ctypes.windll.kernel32
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         protected = data[len(_DPAPI_MAGIC) :]
         input_buffer = ctypes.create_string_buffer(protected)
         entropy_buffer = ctypes.create_string_buffer(_DPAPI_ENTROPY)
@@ -1646,7 +1723,7 @@ def _dpapi_unprotect(data: bytes) -> bytes:
             ctypes.byref(output_blob),
         )
         if not ok:
-            raise OSError(ctypes.get_last_error())
+            raise OSError(ctypes.get_last_error(), "CryptUnprotectData failed")
         try:
             return ctypes.string_at(output_blob.pbData, output_blob.cbData)
         finally:
@@ -2795,8 +2872,15 @@ class RunHandle:
             raise ValidationError("輸入內容必須是文字")
         return self._send({"value": value})
 
+    def _stop_command(self) -> str:
+        """``pause`` keeps partly downloaded files; ``cancel`` removes them."""
+
+        if self.pause_requested.is_set() and not self.cancel_requested.is_set():
+            return "pause"
+        return "cancel"
+
     def _request_cancel(self) -> bool:
-        sent = self._send({"command": "cancel"})
+        sent = self._send({"command": self._stop_command()})
         with self._process_lock:
             process = self._process
             if process is not None and process.poll() is None:
@@ -2824,18 +2908,19 @@ class RunHandle:
     def pause(self) -> bool:
         """Gracefully pause the operation so a download can resume later.
 
-        The core receives the same cancellation command used for an explicit
-        cancel, allowing it to flush its checkpoint.  The durable Store state
-        and :class:`RunResult` retain the distinction between pause and cancel.
+        The core stops as for a cancel and flushes its checkpoint, but keeps
+        the parts of files it was downloading so the job continues from them.
+        The durable Store state and :class:`RunResult` also record the pause.
         """
 
         self.pause_requested.set()
         self.stop_requested.set()
         return self._request_cancel() or not self.done.is_set()
 
-    @staticmethod
-    def _cancel_watchdog(process: subprocess.Popen[str]) -> None:
-        deadline = time.monotonic() + 3.0
+    def _cancel_watchdog(self, process: subprocess.Popen[str]) -> None:
+        # A pause first flushes the partly downloaded files to disk, which can
+        # take a few seconds for several large videos.
+        deadline = time.monotonic() + (10.0 if self._stop_command() == "pause" else 3.0)
         while process.poll() is None and time.monotonic() < deadline:
             time.sleep(0.05)
         if process.poll() is None:
@@ -3970,7 +4055,16 @@ class Runner:
             updates = dict(pending_progress)
             pending_progress.clear()
             last_progress_write = now
-            self.store.update_job_progress(job.id, **updates)
+            try:
+                self.store.update_job_progress(job.id, **updates)
+            except StoreError:
+                # These values are for the queue display and the next launch;
+                # the core keeps its own checkpoint.  A file briefly locked by
+                # another program, or a full system disk while the download
+                # goes to another drive, must not stop the download.  Keep the
+                # values and write them with a later event.
+                for key, value in updates.items():
+                    pending_progress.setdefault(key, value)
 
         try:
             if not lock_held:

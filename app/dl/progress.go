@@ -90,6 +90,15 @@ func (p *progress) OnDone(elem downloader.Elem, err error) {
 	}
 	t := tracker.(*pw.Tracker)
 
+	// The desktop pauses with its own command.  A paused file keeps the
+	// parts already on disk, so the job continues from them later; they are
+	// flushed before the part list that describes them is written.
+	paused := err != nil && desktopio.Paused(p.ctx)
+	keep := paused && e.partial.resumable()
+	if keep && e.to.Sync() != nil {
+		keep = false
+	}
+
 	if err := e.to.Close(); err != nil {
 		p.fail(t, elem, errors.Wrap(err, "close file"))
 		p.emitMachineError(e, p.machineFilename(e), errors.Wrap(err, "close file"))
@@ -97,12 +106,18 @@ func (p *progress) OnDone(elem downloader.Elem, err error) {
 	}
 
 	if err != nil {
-		if !errors.Is(err, context.Canceled) { // don't report user cancel
+		// A pause or user cancel is not a failure, whatever error the
+		// interrupted network call returned.
+		if !paused && !errors.Is(err, context.Canceled) {
 			failure := errors.Wrap(err, "progress")
 			p.fail(t, elem, failure)
 			p.emitMachineError(e, p.machineFilename(elem), errors.Wrap(failure, "下載失敗"))
 		}
+		if keep && e.partial.save(e.to.Name()) == nil {
+			return
+		}
 		_ = os.Remove(e.to.Name()) // just try to remove temp file, ignore error
+		_ = os.Remove(e.to.Name() + partExt)
 		return
 	}
 
@@ -117,6 +132,8 @@ func (p *progress) OnDone(elem downloader.Elem, err error) {
 		p.emitMachineError(e, filepath.Base(finalPath), failure)
 		return
 	}
+	// The part list of a continued download is no longer needed.
+	_ = os.Remove(e.to.Name() + partExt)
 	p.it.Finish(e.logicalPos)
 
 	// Report 100% only once post-processing has succeeded.  The progress
