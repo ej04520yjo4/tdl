@@ -186,8 +186,9 @@ import sys
 from pathlib import Path
 print({EVENT_PREFIX!r} + json.dumps({{'event':'progress','percent':31,'current':31,'total':100,'filename':'part.bin'}}), flush=True)
 for line in sys.stdin:
-    if json.loads(line).get('command') == 'cancel':
-        Path({str(marker)!r}).write_text('checkpoint', encoding='utf-8')
+    command = json.loads(line).get('command')
+    if command in ('cancel', 'pause'):
+        Path({str(marker)!r}).write_text(command, encoding='utf-8')
         raise SystemExit(0)
 """
         runner = _FixtureRunner(self.store, self_script)
@@ -208,7 +209,9 @@ for line in sys.stdin:
         self.assertFalse(paused.success)
         self.assertFalse(paused.cancelled)
         self.assertTrue(paused.paused)
-        self.assertTrue(marker.exists())
+        # The core gets its own pause command, so it keeps partly
+        # downloaded files instead of deleting them as for a cancel.
+        self.assertEqual(marker.read_text(encoding="utf-8"), "pause")
 
         saved = self.store.get_job(paused.job_id)
         self.assertEqual(saved.status, "paused")
