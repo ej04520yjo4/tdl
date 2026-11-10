@@ -101,7 +101,7 @@ func Desktop(ctx context.Context, opts Options) error {
 		// GUI logout is a local account-data action owned by the front end.  Do
 		// not mutate Telegram Desktop's files as a side effect of importing.
 		_ = desktopio.Emit(ctx, desktopio.Event{
-			Event: "authenticated",
+			Event: desktopio.EventAuthenticated,
 			ID:    acc,
 		})
 		return nil

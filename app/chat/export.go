@@ -60,6 +60,9 @@ type threadSelection struct {
 	forum bool
 }
 
+// threadKindTopic marks a forum topic selection.
+const threadKindTopic = "topic"
+
 func selectThread(opts ExportOptions) (threadSelection, error) {
 	if opts.Topic != 0 && opts.Reply != 0 {
 		return threadSelection{}, fmt.Errorf("--topic and --reply cannot be used together")
@@ -68,7 +71,7 @@ func selectThread(opts ExportOptions) (threadSelection, error) {
 		if opts.Topic < 1 || int64(opts.Topic) > math.MaxInt32 {
 			return threadSelection{}, fmt.Errorf("forum topic id must be between 1 and %d", math.MaxInt32)
 		}
-		return threadSelection{id: opts.Topic, kind: "topic", forum: true}, nil
+		return threadSelection{id: opts.Topic, kind: threadKindTopic, forum: true}, nil
 	}
 	if opts.Reply != 0 {
 		return threadSelection{id: opts.Reply, kind: "reply"}, nil
@@ -280,9 +283,9 @@ func Export(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts E
 		color.Blue("Type: %s | Input: %v", opts.Type, opts.Input)
 	} else {
 		_ = desktopio.Emit(ctx, desktopio.Event{
-			Event:   "status",
+			Event:   desktopio.EventStatus,
 			Kind:    "chat_export",
-			Stage:   "scanning",
+			Stage:   desktopio.StageScanning,
 			Message: "正在掃描訊息與媒體…",
 		})
 	}
@@ -301,7 +304,7 @@ func Export(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts E
 
 	var q messages.Query
 	switch {
-	case thread.kind == "topic" && thread.id == 1:
+	case thread.kind == threadKindTopic && thread.id == 1:
 		// The General forum topic has no top_msg_id. getReplies(peer, 1)
 		// therefore does not mean "General"; scan history and filter by the
 		// reply header below.
@@ -399,7 +402,7 @@ loop:
 		if !ok {
 			continue
 		}
-		if thread.kind == "topic" && thread.id == 1 && !messageIsGeneralTopic(m) {
+		if thread.kind == threadKindTopic && thread.id == 1 && !messageIsGeneralTopic(m) {
 			continue
 		}
 		// only get media messages
@@ -460,9 +463,9 @@ loop:
 		tracker.SetValue(count)
 		if gui {
 			_ = desktopio.Emit(ctx, desktopio.Event{
-				Event:   "status",
+				Event:   desktopio.EventStatus,
 				Kind:    "chat_export",
-				Stage:   "scanning",
+				Stage:   desktopio.StageScanning,
 				Current: count,
 				Message: fmt.Sprintf("已找到 %d 筆媒體", count),
 			})

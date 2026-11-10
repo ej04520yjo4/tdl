@@ -125,6 +125,7 @@ type testAuth struct {
 
 func (t testAuth) Phone(_ context.Context) (string, error)    { return t.phone, nil }
 func (t testAuth) Password(_ context.Context) (string, error) { return "", auth.ErrPasswordNotProvided }
+
 func (t testAuth) Code(_ context.Context, _ *tg.AuthSentCode) (string, error) {
 	return "12345", nil
 }

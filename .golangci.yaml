@@ -24,6 +24,11 @@ linters:
       - common-false-positives
       - legacy
       - std-error-handling
+    rules:
+      # Test fixtures repeat literal strings on purpose.
+      - path: (_test\.go$|^test/)
+        linters:
+          - goconst
     paths:
       - third_party$
       - builtin$
