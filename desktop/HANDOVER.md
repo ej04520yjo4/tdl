@@ -32,3 +32,5 @@
 2026-11-10：依使用者指示，以 [PR #8](https://github.com/ej04520yjo4/tdl/pull/8) 將 `claude/desktop-1.6.2-fixes` 的 1.6.2 以合併提交併入 `master`（`5d10caf`），保留分支與原始提交；本機 `master` 以不切換分支的方式同步。EXE 與 Release 附件沿用已驗證的 1.6.2。
 
 2026-11-10：PR #8 的 1.6.2 已由另一個工作階段依使用者同意合併（`5d10caf`）。之後依使用者指示，以 [PR #9](https://github.com/ej04520yjo4/tdl/pull/9) 將 1.6.3 以合併提交併入 `master`。EXE 與 Release 附件沿用已驗證的 1.6.3，詳見 [1.6.3 主分支同步紀錄](handovers/1.6.3.md)。
+
+2026-11-10：依使用者指示，以 [PR #10](https://github.com/ej04520yjo4/tdl/pull/10) 將 1.6.4 以合併提交併入 `master`，並同步本機主分支。EXE 與 Release 附件沿用已驗證的 1.6.4，詳見 [1.6.4 主分支同步紀錄](handovers/1.6.4.md)。
