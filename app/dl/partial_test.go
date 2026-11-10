@@ -3,6 +3,7 @@ package dl
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -124,4 +125,79 @@ func TestPauseKeepsPartsAndCancelRemovesThem(t *testing.T) {
 	path, _ = doneWithError(t, "cancel")
 	require.NoFileExists(t, path)
 	require.NoFileExists(t, path+partExt)
+}
+
+// doneAfterFailure finishes a download whose part 0 is on disk with err,
+// as the downloader reports a network or Telegram error.  With desktop set
+// the run has a live bridge (no pause or cancel command); otherwise it runs
+// like the command line.
+func doneAfterFailure(t *testing.T, desktop bool, failure error) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "video.mp4"+tempExt)
+	f, state, err := openTemp(path, partMedia(5))
+	require.NoError(t, err)
+	_, err = f.WriteAt(bytes.Repeat([]byte{1}, downloader.MaxPartSize), 0)
+	require.NoError(t, err)
+	state.add(0)
+
+	ctx := context.Background()
+	if desktop {
+		var bridge *desktopio.Bridge
+		ctx, bridge = desktopio.New(ctx, nil, &bytes.Buffer{})
+		t.Cleanup(bridge.Close)
+	}
+
+	elem := &iterElem{id: 1, file: partMedia(5), to: f, partial: state}
+	p := newProgress(ctx, prettyprogress.NewWriter(), &iter{mu: &sync.Mutex{}, finished: map[int]struct{}{}}, Options{})
+	tracker := &prettyprogress.Tracker{Message: "video.mp4", Total: partTestSize}
+	p.pw.AppendTracker(tracker)
+	p.trackers.Store(elem.id, tracker)
+	p.OnDone(elem, failure)
+	return path
+}
+
+func TestDesktopFailureKeepsPartsForRetry(t *testing.T) {
+	for name, failure := range map[string]error{
+		// The file itself failed, for example a dropped connection.
+		"network error": errors.New("rpc error: connection reset"),
+		// Another file failed and the downloader stopped this one.
+		"stopped by a sibling": context.Canceled,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := doneAfterFailure(t, true, failure)
+			require.FileExists(t, path)
+			require.FileExists(t, path+partExt)
+			parts, ok := readParts(path, locationKey(partMedia(5).InputFileLoc), partTestSize)
+			require.True(t, ok)
+			require.Equal(t, []int64{0}, parts)
+
+			// The retry reopens the file and only fetches the missing parts.
+			f, state, err := openTemp(path, partMedia(5))
+			require.NoError(t, err)
+			defer f.Close()
+			require.Equal(t, []int64{0}, state.parts())
+		})
+	}
+}
+
+func TestOnlyALiveDesktopRunKeepsPartsAfterFailure(t *testing.T) {
+	failure := errors.New("rpc error: connection reset")
+	newCheck := func(ctx context.Context) *progress {
+		return newProgress(ctx, prettyprogress.NewWriter(), &iter{mu: &sync.Mutex{}, finished: map[int]struct{}{}}, Options{})
+	}
+
+	// The command line keeps its original behavior: the temporary file goes.
+	require.False(t, newCheck(context.Background()).keepAfterFailure(failure))
+
+	ctx, bridge := desktopio.New(context.Background(), nil, &bytes.Buffer{})
+	t.Cleanup(bridge.Close)
+	check := newCheck(ctx)
+	require.False(t, check.keepAfterFailure(nil), "a finished file has nothing to keep")
+	require.True(t, check.keepAfterFailure(failure))
+	require.True(t, check.keepAfterFailure(context.Canceled), "stopped because another file failed")
+
+	// A user cancel stops the whole run; the desktop expects the files gone.
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	require.False(t, newCheck(cancelled).keepAfterFailure(context.Canceled))
 }

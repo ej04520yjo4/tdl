@@ -1,0 +1,58 @@
+name: desktop tests
+
+# The Windows desktop app (desktop/) and the core packages it ships.  The
+# upstream workflows only lint and test the Go code on Linux; this runs the
+# same Go test list as desktop/build.ps1 plus the desktop Python suite on
+# Windows, where the app is delivered.  It does not build or publish the EXE.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Go core and desktop tests (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CGO_ENABLED: "0"
+      # A stuck test prints every thread's stack and fails instead of
+      # holding the job until the workflow timeout.
+      TDL_TEST_TIMEOUT: "180"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: desktop/requirements-lock.txt
+
+      - name: Install desktop dependencies
+        run: python -m pip install -r desktop/requirements-lock.txt
+
+      - name: Build the core
+        run: go build -trimpath -o bin/tdl-core.exe .
+
+      - name: Go tests (same list as desktop/build.ps1)
+        run: go test ./pkg/desktopio ./pkg/key ./app/chat ./app/dl ./app/up ./app/forward ./app/migrate ./pkg/tmessage ./cmd ./core/downloader ./core/uploader ./core/forwarder ./core/util/tutil
+
+      - name: Desktop tests
+        run: python -m pytest desktop/tests -q

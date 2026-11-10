@@ -9,6 +9,7 @@ import (
 	"github.com/go-faster/errors"
 	"github.com/gotd/contrib/clock"
 	"github.com/gotd/contrib/middleware/floodwait"
+	"github.com/gotd/log/logzap"
 	tdclock "github.com/gotd/td/clock"
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/telegram"
@@ -81,7 +82,8 @@ func New(ctx context.Context, o Options) (*telegram.Client, error) {
 		DialTimeout:    10 * time.Second,
 		Middlewares:    append(NewDefaultMiddlewares(ctx, o.ReconnectTimeout), o.Middlewares...),
 		Clock:          tclock,
-		Logger:         logctx.From(ctx).Named("td"),
+		// gotd now logs through its own port (github.com/gotd/log); adapt zap to it.
+		Logger:         logzap.New(logctx.From(ctx).Named("td")),
 	}
 
 	return telegram.NewClient(o.AppID, o.AppHash, opts), nil

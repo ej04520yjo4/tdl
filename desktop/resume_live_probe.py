@@ -39,6 +39,9 @@ from desktop.backend import (  # noqa: E402
 TAIWAN = timezone(timedelta(hours=8))
 MIN_BYTES = int(os.environ.get("TDL_PROBE_MIN_MB", "20")) * 1024 * 1024
 MAX_BYTES = int(os.environ.get("TDL_PROBE_MAX_MB", "200")) * 1024 * 1024
+# Fraction of the file after which the probe asks for a pause.  A small video
+# on a fast connection can finish before the pause arrives; pause earlier then.
+PAUSE_AT = float(os.environ.get("TDL_PROBE_PAUSE_AT", "0.4"))
 
 
 def _digest(path: Path) -> str:
@@ -80,7 +83,7 @@ def _files(folder: Path) -> list[Path]:
     return sorted(path for path in folder.rglob("*") if path.is_file())
 
 
-def run(report_path: Path) -> dict:
+def run(report_path: Path, *, batch_dry_run: bool = True) -> dict:
     source = Path(os.environ["LOCALAPPDATA"]) / "TDLDesktop"
     accounts = json.loads((source / "accounts.json").read_text(encoding="utf-8"))
     preferences = json.loads((source / "preferences.json").read_text(encoding="utf-8"))
@@ -141,7 +144,7 @@ def run(report_path: Path) -> dict:
                 current, total = event.get("current"), event.get("total")
                 if event.get("event") == "progress" and isinstance(current, int) and isinstance(total, int) and total:
                     seen["total"] = total
-                    if not seen["requested"] and current >= total * 0.4:
+                    if not seen["requested"] and current >= total * PAUSE_AT:
                         seen["requested"] = True
                         seen["paused_at"] = current
                         handle.pause()
@@ -152,7 +155,12 @@ def run(report_path: Path) -> dict:
             kept = [path for path in _files(paused_dir) if path.name.endswith(PARTIAL_DOWNLOAD_SUFFIX)]
             lists = [path for path in _files(paused_dir) if path.name.endswith(PARTIAL_DOWNLOAD_SUFFIX + PART_LIST_SUFFIX)]
             if len(kept) != 1 or len(lists) != 1:
-                raise RuntimeError(f"expected one kept file and one part list, found {len(kept)} and {len(lists)}")
+                left = sorted("".join(path.suffixes[-2:]) or "(none)" for path in _files(paused_dir))
+                raise RuntimeError(
+                    f"expected one kept file and one part list, found {len(kept)} and {len(lists)}; "
+                    f"files left by suffix: {left}; job status: {store.get_job(paused.job_id).status}; "
+                    f"pause requested at {round(seen['paused_at'] * 100 / max(seen['total'], 1), 1)}%"
+                )
             kept_parts = json.loads(lists[0].read_text(encoding="utf-8"))["parts"]
             report.update(
                 paused_at_percent=round(seen["paused_at"] * 100 / seen["total"], 1),
@@ -175,7 +183,9 @@ def run(report_path: Path) -> dict:
             report["continue_seconds"] = round(time.monotonic() - started, 1)
             report["continue_first_progress_bytes"] = first["current"]
             report["continue_started_from_kept_parts"] = bool(
-                first["current"] is not None and first["current"] >= len(kept_parts) * 1024 * 1024 * 0.99
+                # The last part is usually shorter than 1 MiB, so cap at the file size.
+                first["current"] is not None
+                and first["current"] >= min(len(kept_parts) * 1024 * 1024, seen["total"]) * 0.99
             )
             finished = _files(paused_dir)
             leftovers = [path.name for path in finished if path.name.endswith((PARTIAL_DOWNLOAD_SUFFIX, PART_LIST_SUFFIX))]
@@ -206,6 +216,10 @@ def run(report_path: Path) -> dict:
             report["files_identical"] = report["resumed_sha256"] == report["reference_sha256"]
 
             # 5. Batch forward dry run of the scanned manifest: sends nothing.
+            # Skipped when the user agreed to download checks only.
+            if not batch_dry_run:
+                report["batch_dry_run"] = "SKIPPED_BY_REQUEST"
+                return _finish(report, report_path, source, originals)
             listed = _wait(runner.start_list_chats(account["id"]), "chat list")
             if not listed or not listed.success:
                 raise RuntimeError("chat list failed")
@@ -234,6 +248,10 @@ def run(report_path: Path) -> dict:
         finally:
             runner.cancel_all()
 
+    return _finish(report, report_path, source, originals)
+
+
+def _finish(report: dict, report_path: Path, source: Path, originals: dict) -> dict:
     changed = [str(path.relative_to(source)) for path, digest in originals.items() if not path.is_file() or _digest(path) != digest]
     report["original_data_unchanged"] = not changed
     report["ok"] = bool(
@@ -251,9 +269,13 @@ def run(report_path: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=Path, default=ROOT / "dist" / "resume-live-verification.json")
+    parser.add_argument(
+        "--skip-batch-dry-run", action="store_true",
+        help="only download, pause and continue; do not run the batch forward dry run",
+    )
     args = parser.parse_args()
     try:
-        report = run(args.report)
+        report = run(args.report, batch_dry_run=not args.skip_batch_dry_run)
     except Exception as exc:  # report the failure instead of a traceback with paths
         report = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
