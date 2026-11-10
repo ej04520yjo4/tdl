@@ -13,9 +13,9 @@
   "ask_download_folder_default": true,
   "folder_dialog_calls": 3,
   "folder_dialog_initial_paths": [
-    "D:\\Codex\\Tools\\tdl\\dist\\workflow-fixture-jopd97do\\downloads",
-    "D:\\Codex\\Tools\\tdl\\dist\\workflow-fixture-jopd97do\\downloads",
-    "D:\\Codex\\Tools\\tdl\\dist\\workflow-fixture-jopd97do\\downloads-a"
+    "D:\\Codex\\Tools\\tdl\\dist\\workflow-fixture-_bdx6txi\\downloads",
+    "D:\\Codex\\Tools\\tdl\\dist\\workflow-fixture-_bdx6txi\\downloads",
+    "D:\\Codex\\Tools\\tdl\\dist\\workflow-fixture-_bdx6txi\\downloads-a"
   ],
   "folder_dialog_cancelled": [
     true,
@@ -148,10 +148,10 @@
     "workflow-verification-folder-b-queued.png"
   ],
   "cleanup_clean": true,
-  "elapsed": 2.297,
+  "elapsed": 2.359,
   "result": "PASS",
   "version": "1.6.3",
-  "sha256": "edf22cc1a665074041939b26c29bf69bb2791b6d9702ff757a206fa54b540c75",
+  "sha256": "c85626bb20cfcfcef698ba290d52561eac1cb7cb4d8ff9f33d7bb0664088ca61",
   "executable": "D:\\Codex\\Tools\\tdl\\dist\\TDL下載助手.exe",
   "screenshots_present": true,
   "telegram_live_account_test": "NOT_RUN_BY_OFFLINE_WORKFLOW_CHECK"
