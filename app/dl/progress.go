@@ -80,6 +80,19 @@ func (p *progress) OnDownload(elem downloader.Elem, state downloader.ProgressSta
 	p.emitMachineState(e, state.Downloaded, state.Total, speed, p.machineFilename(e), "downloading")
 }
 
+// keepAfterFailure reports whether a file that stopped with err should keep
+// its finished parts so a retry of the desktop job continues from them.
+//
+// Only the desktop keeps them: it removes them when the job is cancelled or
+// deleted from the history.  A user cancel cancels the whole operation (the
+// run context), while a network or Telegram error leaves it running; when one
+// file fails, the downloader stops the other files through its own child
+// context, so those keep their parts as well.  The command line keeps its
+// original behavior and removes the temporary file.
+func (p *progress) keepAfterFailure(err error) bool {
+	return err != nil && desktopio.From(p.ctx) != nil && p.ctx.Err() == nil
+}
+
 func (p *progress) OnDone(elem downloader.Elem, err error) {
 	e := elem.(*iterElem)
 	p.throttle.Forget(fmt.Sprintf("%d", e.id))
@@ -94,7 +107,7 @@ func (p *progress) OnDone(elem downloader.Elem, err error) {
 	// parts already on disk, so the job continues from them later; they are
 	// flushed before the part list that describes them is written.
 	paused := err != nil && desktopio.Paused(p.ctx)
-	keep := paused && e.partial.resumable()
+	keep := (paused || p.keepAfterFailure(err)) && e.partial.resumable()
 	if keep && e.to.Sync() != nil {
 		keep = false
 	}

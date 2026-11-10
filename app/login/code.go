@@ -57,7 +57,7 @@ func Code(ctx context.Context) error {
 
 		if desktopio.From(ctx) != nil {
 			_ = desktopio.Emit(ctx, desktopio.Event{
-				Event:    "authenticated",
+				Event:    desktopio.EventAuthenticated,
 				ID:       fmt.Sprintf("%d", user.ID),
 				Username: user.Username,
 				Name:     userDisplayName(user),

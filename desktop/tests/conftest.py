@@ -11,8 +11,14 @@ from __future__ import annotations
 
 import faulthandler
 import os
+from pathlib import Path
 
 import pytest
+
+# Many tests create their temporary folders under the ignored ".build"
+# directory (next to the build tools) instead of the system temp folder.  A
+# fresh checkout, such as CI, does not have it yet.
+(Path(__file__).resolve().parents[2] / ".build").mkdir(exist_ok=True)
 
 # The slowest tests take a few seconds; this only catches a real hang.
 TEST_TIMEOUT_SECONDS = float(os.environ.get("TDL_TEST_TIMEOUT", "180"))

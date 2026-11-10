@@ -171,7 +171,9 @@ class BatchForwardPageTests(unittest.TestCase):
             if getattr(self.page.target_group_combo.itemData(i), "get", lambda *_: None)("ref") == "chat:1003"
         )
         self.page.target_group_combo.setCurrentIndex(forum_index)
-        self.assertTrue(self._wait(lambda: self.page._target_topics_loaded))
+        # Topics arrive before the loading thread ends; the scan button stays
+        # disabled until the page is no longer busy, so wait for both.
+        self.assertTrue(self._wait(lambda: self.page._target_topics_loaded and not self.page.is_busy()))
         self.assertEqual(self.page.target_topic_combo.currentIndex(), 0)
         self.assertIn("含一般", self.page.target_topic_combo.currentText())
         self.assertFalse(self.page.scan_button.isEnabled())

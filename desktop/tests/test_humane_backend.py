@@ -56,7 +56,12 @@ class AccountNameTests(_Workspace):
         self.assertEqual(names[username_only.id], "@only_username")
         self.assertEqual(names[anonymous.id], "Telegram 帳號")
         self.assertEqual(names[chosen.id], "工作帳號 2024")
-        self.assertNotIn("912", (self.root / "accounts.json").read_text(encoding="utf-8"))
+        # Account IDs are random UUIDs and may contain these digits by chance
+        # (for example "b912"), so check every stored value except the ID.
+        saved = json.loads((self.root / "accounts.json").read_text(encoding="utf-8"))
+        for account in saved["accounts"]:
+            stored = json.dumps({key: value for key, value in account.items() if key != "id"}, ensure_ascii=False)
+            self.assertNotIn("912", stored)
 
 
 class ErrorExplanationTests(unittest.TestCase):
@@ -87,6 +92,15 @@ class ErrorExplanationTests(unittest.TestCase):
         ):
             self.assertTrue(suggest_next_step(translate_error(raw)), raw)
         self.assertEqual(suggest_next_step("完全無關的內容"), "")
+
+    def test_download_retry_advice_mentions_continuing_partial_files(self) -> None:
+        # 1.6.3 keeps the finished parts of a failed file, so a retry
+        # continues it; uploads and forwards have no partial state.
+        self.assertIn("從中斷處接續", suggest_next_step("有檔案下載失敗，請查看錯誤訊息後重試"))
+        for failure in ("有檔案上傳失敗", "有訊息轉傳失敗"):
+            step = suggest_next_step(failure)
+            self.assertTrue(step)
+            self.assertNotIn("下載", step)
 
 
 class PreferenceTests(_Workspace):

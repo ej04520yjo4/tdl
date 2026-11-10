@@ -61,6 +61,9 @@ type ListOptions struct {
 	IncludeTopics bool
 }
 
+// kindChatScan tags the desktop status events of a chat list scan.
+const kindChatScan = "chat_scan"
+
 func List(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts ListOptions) error {
 	log := logctx.From(ctx)
 	gui := desktopio.From(ctx) != nil
@@ -88,9 +91,9 @@ func List(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Lis
 
 	if gui {
 		_ = desktopio.Emit(ctx, desktopio.Event{
-			Event:   "status",
-			Kind:    "chat_scan",
-			Stage:   "scanning",
+			Event:   desktopio.EventStatus,
+			Kind:    kindChatScan,
+			Stage:   desktopio.StageScanning,
 			Message: "正在掃描頻道與群組…",
 		})
 	}
@@ -100,9 +103,9 @@ func List(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Lis
 	dialogs, skipped, fetchErr := fetchDialogsWithErrorHandling(ctx, c.API(), func(current int) {
 		if gui {
 			_ = desktopio.Emit(ctx, desktopio.Event{
-				Event:   "status",
-				Kind:    "chat_scan",
-				Stage:   "scanning",
+				Event:   desktopio.EventStatus,
+				Kind:    kindChatScan,
+				Stage:   desktopio.StageScanning,
 				Current: int64(current),
 				Message: fmt.Sprintf("已掃描 %d 個對話", current),
 			})
@@ -186,8 +189,8 @@ func List(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Lis
 		result = append(result, r)
 		if gui {
 			_ = desktopio.Emit(ctx, desktopio.Event{
-				Event:   "status",
-				Kind:    "chat_scan",
+				Event:   desktopio.EventStatus,
+				Kind:    kindChatScan,
 				Stage:   "reading",
 				Current: int64(len(result)),
 				Total:   int64(len(dialogs)),
