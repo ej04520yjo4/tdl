@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QEvent
 from PySide6.QtWidgets import QApplication
 
 from desktop import backend
@@ -29,15 +30,26 @@ class RowButtonTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.app = QApplication.instance() or QApplication([])
 
+    def setUp(self) -> None:
+        self.rows: list[QueueRow] = []
+
+    def tearDown(self) -> None:
+        # A row left for interpreter shutdown is freed after QApplication and
+        # crashes the test process on exit (0xC0000005 / 0xC0000409).
+        for row in self.rows:
+            row.deleteLater()
+        QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
     def row(self, status: str) -> QueueRow:
         row = QueueRow(DownloadJob(id="j", url="https://t.me/telegram/1", title="影片", output_dir=str(BUILD), status=status))
         row.set_state(status)
+        self.rows.append(row)
         return row
 
     def test_buttons_follow_the_job_state(self) -> None:
         for status, pause, cancel, retry in (
             ("下載中", True, True, False),
-            ("等待中", True, True, False),
+            ("等待中", False, True, False),
             ("處理中", False, True, False),
             ("已暫停", False, True, True),
             ("失敗", False, False, True),
@@ -136,6 +148,24 @@ class WindowPauseTests(_WindowCase):
         self.assertFalse(job.resume_on_start)
         self.assertFalse(kept.exists())
         self.assertFalse(part_list.exists())
+
+    def test_a_waiting_job_without_a_download_can_be_cancelled(self) -> None:
+        store = self.bridge.store
+        saved = store.create_download_job(self.account.id, ["https://t.me/telegram/1"], output_dir=Path(self.directory) / "downloads")
+        job = DownloadJob(
+            id=saved.id, url=saved.links[0], title="影片", output_dir=str(Path(self.directory) / "downloads"),
+            status="等待中", account_id=self.account.id, links=list(saved.links), backend_job_id=saved.id,
+            resume_on_start=True,
+        )
+        self.window.jobs[job.id] = job
+        self.window.home_page.add_jobs([job])
+        row = self.window.home_page.rows[job.id]
+        self.assertTrue(row.pause_button.isHidden(), "nothing is running yet")
+        row.cancel_button.click()
+        self.pump(lambda: store.get_job(saved.id).status == "cancelled")
+        self.assertEqual(job.status, "已取消")
+        self.assertFalse(job.resume_on_start)
+        self.assertIn(job.id, self.window._resume_attempted)
 
 
 class RestoreTests(unittest.TestCase):

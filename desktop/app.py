@@ -1821,8 +1821,9 @@ class QueueRow(Card):
         resumable = status == "已暫停"
         # A paused job can be dropped as well; its kept parts are deleted.
         self.cancel_button.setVisible(active or resumable)
-        # "處理中" is saving the job before the core starts: nothing to pause.
-        self.pause_button.setVisible(status in ("等待中", "下載中"))
+        # Only a running download can pause: "等待中" and "處理中" have not
+        # started the core yet, so there is nothing to keep.
+        self.pause_button.setVisible(status == "下載中")
         self.retry_button.setText("繼續下載" if resumable else "重試")
         self.retry_button.setVisible(status in ("失敗", "已取消", "待重試", "已暫停"))
         self.detail_button.setVisible(status == "失敗")
@@ -4562,10 +4563,10 @@ class MainWindow(QMainWindow):
             worker.cancel()
             return
         job = self.jobs.get(job_id)
-        if job is None or job.status != "已暫停" or not job.backend_job_id:
+        if job is None or job.status not in ("已暫停", "等待中") or not job.backend_job_id:
             return
-        # A paused job has no worker: record the cancel directly.  The store
-        # deletes the parts the pause kept.
+        # A paused or restored waiting job has no worker: record the cancel
+        # directly.  The store deletes the parts a pause kept.
         job.status = "已取消"
         job.speed = ""
         job.resume_on_start = False
