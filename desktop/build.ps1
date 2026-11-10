@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$Python = "$PSScriptRoot\..\.build\venv\Scripts\python.exe",
     [string]$Go = "$PSScriptRoot\..\.build\go\bin\go.exe",
     [switch]$SkipTests
@@ -17,6 +17,8 @@ try {
     & $Go build -trimpath -ldflags "-s -w -X github.com/iyear/tdl/pkg/consts.Version=desktop-$version" -o bin/tdl-core.exe .
     if ($LASTEXITCODE -ne 0) { throw 'Go build failed' }
     if (-not $SkipTests) {
+        # Keep this package list in sync with .github/workflows/desktop.yml
+        # (checked by desktop/tests/test_ci_workflow.py).
         & $Go test ./pkg/desktopio ./pkg/key ./app/chat ./app/dl ./app/up ./app/forward ./app/migrate ./pkg/tmessage ./cmd ./core/downloader ./core/uploader ./core/forwarder ./core/util/tutil
         if ($LASTEXITCODE -ne 0) { throw 'Go tests failed' }
         & $Python -m pytest desktop/tests -q

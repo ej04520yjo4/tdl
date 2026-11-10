@@ -16,3 +16,8 @@ indent_style = tab
 [*.md]
 max_line_length = off
 trim_trailing_whitespace = false
+
+# Windows PowerShell 5.1 reads BOM-less scripts in the ANSI code page, which
+# garbles Chinese text such as the EXE name; a UTF-8 BOM keeps it intact.
+[*.ps1]
+charset = utf-8-bom

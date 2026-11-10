@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "isolated_account_copy": true,
+  "public_video_bytes": 5697716,
+  "paused_at_percent": 18.4,
+  "job_status_after_pause": "paused",
+  "kept_parts": 1,
+  "kept_megabytes": 1.0,
+  "continue_seconds": 6.4,
+  "continue_first_progress_bytes": 2097152,
+  "continue_started_from_kept_parts": true,
+  "resumed_bytes": 5697716,
+  "reference_bytes": 5697716,
+  "resumed_sha256": "59fc15a81023d16a617b715389e1a6099977b90b82b94d98561f6e013c8c55a1",
+  "reference_sha256": "59fc15a81023d16a617b715389e1a6099977b90b82b94d98561f6e013c8c55a1",
+  "files_identical": true,
+  "batch_dry_run": "SKIPPED_BY_REQUEST",
+  "original_data_unchanged": true
+}
