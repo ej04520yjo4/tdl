@@ -136,6 +136,9 @@ PAGE_NAMES = ("頻道下載", "下載中心", "上傳與轉傳", "帳號管理",
 STALL_SECONDS = 45
 # Window size, position and last page, kept beside the other app data.
 UI_STATE_FILE = "ui-state.json"
+# The saved reason of a job paused with the 暫停 button (the same text as
+# desktop.backend.MANUAL_PAUSE_MESSAGE); such a job waits for 繼續下載.
+MANUAL_PAUSE_MESSAGE = "已暫停，按「繼續下載」從中斷處接續。"
 
 BG = "#f4f7fb"
 CARD = "#ffffff"
@@ -361,6 +364,9 @@ class DownloadJob:
     backend_job_id: str = ""
     resume_on_start: bool = False
     closing_pause: bool = False
+    # Paused with the queue's 暫停 button: waits for 繼續下載 instead of
+    # resuming on the next launch.
+    manual_pause: bool = False
     file_progress: dict[str, dict[str, Any]] = field(default_factory=dict, repr=False)
     # Totals from a channel scan; zero when the job size is not known yet.
     expected_files: int = 0
@@ -590,7 +596,7 @@ class BackendBridge:
         while not handle.done.is_set():
             if cancel_event.is_set():
                 if pause_event is not None and pause_event.is_set():
-                    handle.pause()
+                    handle.pause(manual=job.manual_pause)
                 else:
                     handle.cancel()
             event = handle.get_event(timeout=0.2)
@@ -776,10 +782,11 @@ class DownloadWorker(QObject):
     def cancel(self) -> None:
         self.cancel_event.set()
 
-    def pause(self) -> None:
+    def pause(self, *, manual: bool = False) -> None:
         # An explicit cancel must never turn back into a restartable pause.
         if not self.cancel_event.is_set():
             self.job.closing_pause = True
+            self.job.manual_pause = manual
             self.pause_event.set()
             self.cancel_event.set()
 
@@ -1262,6 +1269,7 @@ class SidebarButton(QPushButton):
 
 class QueueRow(Card):
     cancel_requested = Signal(str)
+    pause_requested = Signal(str)
     retry_requested = Signal(str)
     open_requested = Signal(str)
     detail_requested = Signal(str)
@@ -1331,13 +1339,16 @@ class QueueRow(Card):
         self.percent.setMaximumWidth(210)
         self.percent.setToolTip("等待核心回報")
         self.cancel_button = QPushButton("取消")
+        self.pause_button = QPushButton("暫停")
+        self.pause_button.setToolTip("暫停並保留已下載的部分；之後按「繼續下載」從中斷處接續")
         self.retry_button = QPushButton("重試")
         self.open_button = QPushButton("開啟資料夾")
         self.open_button.setToolTip("開啟這個工作實際存放檔案的資料夾")
         self.detail_button = QPushButton("查看原因")
         self.detail_button.setToolTip("顯示失敗原因、建議的處理方式與診斷細節")
-        for button in (self.cancel_button, self.retry_button, self.open_button, self.detail_button):
+        for button in (self.cancel_button, self.pause_button, self.retry_button, self.open_button, self.detail_button):
             button.setCursor(Qt.PointingHandCursor)
+        self.pause_button.setVisible(False)
         self.retry_button.setVisible(False)
         self.open_button.setVisible(False)
         self.detail_button.setVisible(False)
@@ -1374,6 +1385,7 @@ class QueueRow(Card):
         right.addWidget(self.status, 0, Qt.AlignRight)
         actions = QHBoxLayout()
         actions.setSpacing(6)
+        actions.addWidget(self.pause_button)
         actions.addWidget(self.cancel_button)
         actions.addWidget(self.retry_button)
         actions.addWidget(self.detail_button)
@@ -1389,6 +1401,7 @@ class QueueRow(Card):
         layout.addLayout(left, 1)
         layout.addLayout(right, 0)
         self.cancel_button.clicked.connect(lambda: self.cancel_requested.emit(self.job_id))
+        self.pause_button.clicked.connect(lambda: self.pause_requested.emit(self.job_id))
         self.retry_button.clicked.connect(lambda: self.retry_requested.emit(self.job_id))
         self.open_button.clicked.connect(lambda: self.open_requested.emit(self.open_target()))
         self.detail_button.clicked.connect(lambda: self.detail_requested.emit(self.job_id))
@@ -1805,8 +1818,11 @@ class QueueRow(Card):
             self.progress.setValue(bounded)
             self.percent.setText(f"{bounded}%" + (f" · {detail}" if detail else ""))
         active = status in ("等待中", "下載中", "處理中")
-        self.cancel_button.setVisible(active)
         resumable = status == "已暫停"
+        # A paused job can be dropped as well; its kept parts are deleted.
+        self.cancel_button.setVisible(active or resumable)
+        # "處理中" is saving the job before the core starts: nothing to pause.
+        self.pause_button.setVisible(status in ("等待中", "下載中"))
         self.retry_button.setText("繼續下載" if resumable else "重試")
         self.retry_button.setVisible(status in ("失敗", "已取消", "待重試", "已暫停"))
         self.detail_button.setVisible(status == "失敗")
@@ -2292,6 +2308,7 @@ class DownloadPage(QWidget):
     export_requested = Signal()
     import_requested = Signal()
     cancel_requested = Signal(str)
+    pause_requested = Signal(str)
     retry_requested = Signal(str)
     open_requested = Signal(str)
     account_changed = Signal(str)
@@ -2615,6 +2632,7 @@ class DownloadPage(QWidget):
             self.jobs[job.id] = job
             row = QueueRow(job)
             row.cancel_requested.connect(self.cancel_requested.emit)
+            row.pause_requested.connect(self.pause_requested.emit)
             row.retry_requested.connect(self.retry_requested.emit)
             row.open_requested.connect(self.open_requested.emit)
             row.detail_requested.connect(self.detail_requested.emit)
@@ -3442,6 +3460,7 @@ class MainWindow(QMainWindow):
         self.home_page.export_requested.connect(self._export_json)
         self.home_page.import_requested.connect(self._import_json)
         self.home_page.cancel_requested.connect(self.cancel_job)
+        self.home_page.pause_requested.connect(self.pause_job)
         self.home_page.retry_requested.connect(self.retry_job)
         self.home_page.open_requested.connect(self.open_output)
         self.home_page.account_changed.connect(self._set_active_account)
@@ -3833,6 +3852,7 @@ class MainWindow(QMainWindow):
             "completed": "已完成",
         }
         status = status_map.get(raw_status, "等待中")
+        saved_error = _safe_str(_extract(value, "error", default=""))
         title = saved_title or filename or (Path(files[0]).name if files else f"已恢復下載 {index + 1}")
         if len(links) > 1:
             title = f"{title}（{len(links)} 個連結）"
@@ -3864,7 +3884,10 @@ class MainWindow(QMainWindow):
             links=links,
             files=files,
             backend_job_id=backend_id,
-            resume_on_start=raw_status in {"queued", "running", "interrupted", "paused"},
+            resume_on_start=(
+                raw_status in {"queued", "running", "interrupted", "paused"}
+                and not (raw_status == "paused" and saved_error == MANUAL_PAUSE_MESSAGE)
+            ),
             file_progress=file_progress,
             expected_files=int(_extract(value, "expected_files", default=0) or 0),
             expected_bytes=int(_extract(value, "expected_bytes", default=0) or 0),
@@ -4116,6 +4139,7 @@ class MainWindow(QMainWindow):
         job.account_id = _safe_str(options.get("account_id"), job.account_id)
         job.status = "處理中"
         job.closing_pause = False
+        job.manual_pause = False
         job.error = ""
         self._preparing_jobs.add(job.id)
         self.home_page.update_job(job)
@@ -4513,9 +4537,21 @@ class MainWindow(QMainWindow):
         # user's close-versus-cancel intent on the longer-lived queue model.
         paused = job.closing_pause
         job.status = "已暫停" if paused else "已取消"
-        job.speed = "重開程式後自動繼續" if paused else ""
+        if not paused:
+            job.speed = ""
+        elif job.manual_pause:
+            job.speed = "按「繼續下載」從中斷處接續"
+        else:
+            job.speed = "重開程式後自動繼續"
         self.home_page.update_job(job)
         self.refresh_history()
+
+    def pause_job(self, job_id: str) -> None:
+        """Pause one download; it keeps the downloaded parts."""
+
+        worker = self._workers.get(job_id)
+        if worker is not None:
+            worker.pause(manual=True)
 
     def cancel_job(self, job_id: str) -> None:
         if job_id in self._preparing_jobs:
@@ -4524,6 +4560,21 @@ class MainWindow(QMainWindow):
         worker = self._workers.get(job_id)
         if worker is not None:
             worker.cancel()
+            return
+        job = self.jobs.get(job_id)
+        if job is None or job.status != "已暫停" or not job.backend_job_id:
+            return
+        # A paused job has no worker: record the cancel directly.  The store
+        # deletes the parts the pause kept.
+        job.status = "已取消"
+        job.speed = ""
+        job.resume_on_start = False
+        self._resume_attempted.add(job.id)
+        self.home_page.update_job(job)
+        self._start_store_action(
+            lambda: self.bridge.store.finish_job(job.backend_job_id, "cancelled"),
+            lambda _saved: self.refresh_history(),
+        )
 
     def retry_job(self, job_id: str) -> None:
         job = self.jobs.get(job_id)

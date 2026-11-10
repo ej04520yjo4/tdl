@@ -2827,6 +2827,17 @@ class RunResult:
     paused: bool = False
 
 
+# The saved reason of a paused job.  The desktop resumes a job paused by
+# closing the program on the next launch, but leaves a job the user paused
+# with the 暫停 button waiting for 繼續下載.
+CLOSING_PAUSE_MESSAGE = "操作已暫停，可重新啟動後繼續下載。"
+MANUAL_PAUSE_MESSAGE = "已暫停，按「繼續下載」從中斷處接續。"
+
+
+def _pause_message(handle: "RunHandle") -> str:
+    return MANUAL_PAUSE_MESSAGE if handle.manual_pause else CLOSING_PAUSE_MESSAGE
+
+
 class RunHandle:
     """Thread-safe handle returned by :meth:`Runner.start`."""
 
@@ -2837,6 +2848,10 @@ class RunHandle:
         self.cancel_requested = threading.Event()
         self.pause_requested = threading.Event()
         self.stop_requested = threading.Event()
+        # A pause from the queue's 暫停 button, as opposed to closing the
+        # program: the job then waits for 繼續下載 instead of resuming on the
+        # next launch.
+        self.manual_pause = False
         self._callback = callback
         self._process: Optional[subprocess.Popen[str]] = None
         self._process_lock = threading.RLock()
@@ -2905,14 +2920,17 @@ class RunHandle:
         self.stop_requested.set()
         return self._request_cancel() or not self.done.is_set()
 
-    def pause(self) -> bool:
+    def pause(self, *, manual: bool = False) -> bool:
         """Gracefully pause the operation so a download can resume later.
 
         The core stops as for a cancel and flushes its checkpoint, but keeps
         the parts of files it was downloading so the job continues from them.
         The durable Store state and :class:`RunResult` also record the pause.
+        ``manual`` marks a pause the user asked for (see ``manual_pause``).
         """
 
+        if manual:
+            self.manual_pause = True
         self.pause_requested.set()
         self.stop_requested.set()
         return self._request_cancel() or not self.done.is_set()
@@ -4091,7 +4109,7 @@ class Runner:
                         cancelled = handle.cancel_requested.is_set()
                         paused = handle.pause_requested.is_set() and not cancelled
                         stop_status = "cancelled" if cancelled else "paused"
-                        stop_error = "操作已取消。" if cancelled else "操作已暫停，可重新啟動後繼續下載。"
+                        stop_error = "操作已取消。" if cancelled else _pause_message(handle)
                         if isinstance(request, DownloadRequest) and request.job_id:
                             try:
                                 job = self.store.get_job(request.job_id)
@@ -4146,11 +4164,7 @@ class Runner:
                 export_output_created = True
             args = self._build_args(request, runtime)
             if handle.stop_requested.is_set():
-                stop_error = (
-                    "操作已取消。"
-                    if handle.cancel_requested.is_set()
-                    else "操作已暫停，可重新啟動後繼續下載。"
-                )
+                stop_error = "操作已取消。" if handle.cancel_requested.is_set() else _pause_message(handle)
                 raise RunnerError(stop_error)
             env = os.environ.copy()
             env[GUI_ENV] = "1"
@@ -4331,7 +4345,7 @@ class Runner:
             if handle.cancel_requested.is_set():
                 last_error = last_error or "操作已取消。"
             elif handle.pause_requested.is_set():
-                last_error = last_error or "操作已暫停，可重新啟動後繼續下載。"
+                last_error = last_error or _pause_message(handle)
             elif returncode != 0 and not last_error:
                 stderr_error = "\n".join(stderr_lines[-10:])
                 auth_invalid_seen = auth_invalid_seen or _is_auth_invalid_error(stderr_error)
@@ -4527,6 +4541,7 @@ __all__ = [
     "Account",
     "BackendError",
     "BackupRequest",
+    "CLOSING_PAUSE_MESSAGE",
     "CoreNotFound",
     "DEFAULT_ACCOUNT_NAME",
     "DEFAULT_TEMPLATE",
@@ -4540,6 +4555,7 @@ __all__ = [
     "LoginRequest",
     "ListChatsRequest",
     "ListTopicsRequest",
+    "MANUAL_PAUSE_MESSAGE",
     "Preferences",
     "RecoverRequest",
     "RunHandle",
