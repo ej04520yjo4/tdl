@@ -1,54 +1,51 @@
 # 桌面版交付驗證
 
-日期：2026-11-10。版本：1.6.3。基底：1.6.2（`c0b0418`，已由 PR #8 合併為 `master` 的 `5d10caf`）。
+日期：2026-11-10。版本：1.6.4。基底：1.6.3（Release `desktop-v1.6.3` 的 `8dfcbc4`；之後由 PR #9 合併為 `master` 的 `713c8d6`，兩者只差文件）。
 
 ## 本次範圍
 
-桌面版下載失敗時也保留已完成的分段，重試從中斷處接續（使用者取消仍刪除；命令列不變）；新增 Windows CI workflow；gotd `v0.163.0`、x/net、x/crypto、klauspost/compress、otel、brotli 升級並以 Go 1.27.3 建置；PySide6 6.12.0、PyInstaller 6.22.3、pytest 9.2.0；`build.ps1` 加上 UTF-8 BOM；修正一個會隨機失敗的帳號名稱測試。帳號、設定與資料格式不變。
+下載中的工作每列新增「暫停」；自己按暫停的工作重開後不自動開始，要按「繼續下載」；關閉程式造成的暫停照舊自動接續。「已暫停」與尚未啟動的「等待中」工作可以取消，取消時刪除保留的暫存檔。README「中斷處理」重寫、1.6.2 交接清冊加註更正。另修正兩個驗證程式的時序問題（見下）。帳號、設定與資料格式不變；Go 核心程式與 1.6.3 相同。
 
 ## 原始碼測試
 
-- 最終建置內完整 Python suite：**222 passed、30 subtests passed**，46.65 秒（1.6.2 為 218 項；新增 CI 清單一致 2 項、失敗建議文字 1 項、建置腳本編碼 1 項）。
-- GitHub Actions（PR #9，提交 `6f4ce34`）：新增的 Windows「Go core and desktop tests」與上游 `lint`（`.`、`core`、`extension`）、`unit-test` 全部通過。這是此 fork 第一次有 CI 執行；第一次執行時 Windows 測試因缺少 `.build` 暫存資料夾、lint 因 golangci-lint 版本過舊而失敗，已修正（見交接清冊第 7 項）。
-- 本機 golangci-lint v2.15.0：三個模組 0 個問題。
-- Go：`build.ps1` 列出的套件全部通過（`pkg/desktopio`、`app/chat`、`app/dl`、`app/up`、`app/forward`、`app/migrate`、`pkg/tmessage`、`cmd`、`core/downloader`、`core/uploader`、`core/util/tutil`；`pkg/key`、`core/forwarder` 無測試）；`core` 模組全部測試、`go vet` 通過。
-- 新增 Go 測試：桌面版因網路錯誤失敗、或被另一個失敗檔案停止時保留分段且重試可讀回；只有仍在執行的桌面工作會保留，命令列與使用者取消不保留。
-- `govulncheck`：升級前程式實際呼叫到 3 個漏洞（gotd GO-2026-6138、klauspost/compress GO-2026-6865、`crypto/x509` GO-2026-6809），升級後 **0**。
-- 隨機失敗的測試：`test_phone_number_names_are_replaced_on_start` 檢查帳號檔不得含「912」，但隨機帳號 ID 可能含這三個數字（本次第一次建置遇到 `…-b912-…`）。改為排除 ID 欄位後再檢查，並以強制含「912」的 ID 驗證新寫法通過。
+- 最終建置內完整 Python suite：**230 passed、36 subtests passed**，46.31 秒（1.6.3 為 222 項；新增 `test_pause_button.py` 8 項）。
+- 新增測試涵蓋：各狀態顯示哪些按鈕、暫停按鈕只送出自己的工作、`pause_job` 以手動暫停停止下載、取消已暫停工作後紀錄為已取消且 `.tmp`／`.tmp.part` 被刪除、取消沒有下載程序的「等待中」工作、手動暫停重開不自動接續而關閉暫停與中斷會接續、前後端暫停文字一致、後端以 fixture 核心分別保存兩種暫停原因。
+- Go：`build.ps1` 列出的套件全部通過。最終建置顯示為快取結果（同一份程式碼在前一次建置已實際執行並通過）；核心程式與 1.6.3 相同。
 
-## 最終 EXE 離線驗證
+## 建置過程中發現並修正的問題（如實記錄）
+
+共建置 4 次，前 3 次失敗：
+
+1. **測試程式結束時當掉**：230 項全部通過，但 pytest 程序結束時偶爾以 `0xC0000409`／`0xC0000005` 結束。原因是新增的按鈕測試建立佇列列後沒有刪除，Python 結束時在 QApplication 之後才釋放。單獨執行該檔 20 次有 14 次當掉；改為測試結束時刪除後，單獨 15 次、完整 suite 3 次都正常結束。這是測試程式問題，不影響 EXE。
+2. **批次轉傳 EXE 驗證偶發失敗**：`partial_failure_visible` 為 false（該步驟 6 次中 1 次）。驗證程式在背景執行緒結束後立刻讀狀態文字，但失敗訊息可能還沒送到頁面；畫面本身之後會正確顯示。`desktop/batch_forward_probe.py` 改為最多等 3 秒再判斷。修正後從原始碼執行 24 次，23 次通過；第 1 次失敗的報告被下一次覆蓋，失敗步驟未留下紀錄，之後 23 次都沒有重現。
+3. **原生視窗檢查逾時**：`verify_release.py` 的原生 Windows 視窗檢查一次超過 45 秒。單獨重跑 3 次各約 10 秒通過，原因未確認（推測是新 EXE 第一次啟動被防毒掃描或桌面忙碌）。
+4. 第 4 次建置全部通過，交付檔即此次產物。
+
+## 最終 EXE 離線驗證（fixture，不連 Telegram）
 
 - `verification.json`：複製到獨立目錄、移除 Python／Go PATH，核心、繁簡搜尋、畫面繪製與原生 Windows 視窗啟閉通過。
-- `restart-verification.json`：兩個 EXE 程序驗證關閉保存、同一筆下載恢復、已完成附件不重寫、群組資料夾恢復。
-- `workflow-verification.json`、`batch-forward-verification.json`：頻道／話題下載、位置記憶與批次轉傳離線流程通過。
+- `restart-verification.json`：兩個 EXE 程序驗證關閉保存為「已暫停」、重開後同一筆下載自動恢復（關閉暫停仍會接續）、已完成附件不重寫、群組資料夾恢復。
+- `workflow-verification.json`：頻道／話題下載、位置記憶流程通過。佇列截圖 `workflow-verification-queue.png` 顯示下載中的工作有「暫停」與「取消」兩個按鈕、版本 1.6.4。
+- `batch-forward-verification.json`：批次轉傳離線流程通過。
+- **未在 EXE 上驗證**：實際按下「暫停」、重開後維持暫停、取消已暫停工作。這些只有上述原始碼自動化測試。
 
-## 真實 Telegram 驗證（使用者當次同意，只下載；已記憶帳號的隔離副本）
+## 真實 Telegram 驗證
 
-- `channel-live-verification.json`（最終 EXE，新版 gotd）：取得 655 個對話、包含起迄日的日期篩選與影片篩選正確、實際下載公開 @telegram 影片 1 個（1,842,304 bytes）；原始帳號檔案未改動。
-- `resume-live-verification.json`（原始碼後端＋與 EXE 相同的內含核心，SHA-256 `4a7be8db…304a`）：公開 @telegram 影片 5,697,716 bytes，在 18.4% 暫停，工作狀態「已暫停」並保留 1 個分段與分段清單；續傳的第一個進度為 2,097,152 bytes（保留的 1 MB 加上新下載的 1 MB），完成檔與直接下載的 SHA-256 相同（`59fc15a8…55a1`）；原始資料前後雜湊相同。依同意範圍以 `--skip-batch-dry-run` 略過批次轉傳試跑，沒有任何轉傳呼叫。
-- 續傳驗證的實際過程（如實記錄）：
-  1. 預設大小 20–200 MB 找不到公開影片，改用 `TDL_PROBE_MIN_MB=5`。
-  2. 預設 40% 暫停的一次回報「暫停後找不到暫存檔」。當時沒有診斷輸出，原因未確認；推測是 5.4 MB 影片在暫停送達前已下載完成。之後以同設定再跑 3 次，都保留分段且完成檔相同，沒有重現。
-  3. 一次在暫停時 6 個分段都已寫完，驗證程式把每段都算成 1 MiB（最後一段其實較短）而誤判失敗；已修正計算。
-  4. 為確保續傳時還有分段要補，以 `TDL_PROBE_PAUSE_AT=0.15` 執行並通過；重新建置後以最終建置的內含核心再執行一次並通過，即本收據。
-- **未驗證：**下載途中真的斷線後按「重試」接續（只有自動化測試）；上傳、轉傳實際送出與 QR 登入沒有在新版 gotd 上用真實帳號操作。
+**本版未執行。**本次沒有取得使用者當次同意以真實帳號測試。暫停按鈕送出的 `pause` 指令與 1.6.2／1.6.3 真實驗證過的關閉暫停相同，但這不能代替本版的真實驗證。
 
 ## 交付檔
 
-Windows x64 GUI，版本 **1.6.3**，**57,195,394 bytes**（1.6.2 為 54,719,965 bytes；主要差異為 PySide6 6.12 與新版 gotd，另外授權檔多收了本機建置工具 golangci-lint、govulncheck 的授權）。
+Windows x64 GUI，版本 **1.6.4**，**57,175,922 bytes**（1.6.3 為 56,865,598 bytes）。
 
-EXE SHA-256：`c85626bb20cfcfcef698ba290d52561eac1cb7cb4d8ff9f33d7bb0664088ca61`。
+EXE SHA-256：`9e3e0b4c74b927ecbd4a6c2a8c0b4d86f6451d3bfc2ae2457f9a9fde3987a89b`。
 
-內含核心 SHA-256：`4a7be8db841f6cb91d1d19878e724cf255c7252cfa9e4fc74fbbe1f5665b304a`。
+內含核心 SHA-256：`e2cfb28d0f5344d99fca6916935837f22887ddd29f3fbe38d04c2c593316d61d`（程式碼與 1.6.3 相同，版本字串改為 `desktop-1.6.4`）。
 
-`TDL下載助手.exe`、`TDL下載助手-1.6.3.exe`、`dist/TDL下載助手.exe` 與 `TDL-Desktop-1.6.3.exe` 發行別名內容相同。收據與畫面保存於 `desktop/verification/1.6.3/`。
-
-最終 EXE 從含 CI 與 lint 修正的原始碼重新建置；先前建置的 EXE（`edf22cc1…`）不交付。重新建置的第一次嘗試中，批次轉傳頁面測試 `test_forum_destination_loads_topics_without_auto_topic` 在完整測試中失敗一次（單獨重跑 15 次都通過）：測試只等話題清單載入，沒等背景執行緒結束，掃描按鈕在執行緒結束前本來就不會啟用。已改為等兩者，產品行為不變。
+EXE 由 `ff9727a` 建置；之後的提交只有文件、驗證收據與合併 `master`（只含文件），都不會打包進 EXE。`TDL下載助手.exe`、`TDL下載助手-1.6.4.exe`、`dist/TDL下載助手.exe` 與 `TDL-Desktop-1.6.4.exe` 發行別名內容相同。收據與畫面保存於 `desktop/verification/1.6.4/`。
 
 ## 已知限制
 
-- 續傳只在桌面版的暫停、正常關閉與失敗重試時接續；強制結束、斷電或命令列 Ctrl+C 時該檔案從頭下載。暫停或失敗當下正在傳輸的分段會重抓。
-- 失敗後保留的暫存檔在取消工作、清除已結束工作或刪除紀錄時刪除；工作一直留著不處理時，暫存檔也會留在下載資料夾。
-- CI 只跑測試，不建置 EXE、不做真實 Telegram 驗證。
-- 第一次完整測試卡住的原因（1.6.2 記錄）仍未找到；之後再發生會印出卡住位置。
-- EXE 未簽章；上游完整 Go suite 既有 Windows `app/update/TestBinaryName` 差異未處理，只宣稱上述相關套件通過。
+- 手動暫停與關閉暫停以工作紀錄中的暫停原因文字區分；`desktop/app.py` 與 `desktop/backend.py` 的 `MANUAL_PAUSE_MESSAGE` 必須相同（已有測試）。
+- 暫停以 1 MB 分段保留，暫停當下正在傳輸的分段會重抓；暫停送達前已下載完的小檔案會直接完成。強制結束、斷電或命令列 Ctrl+C 仍從頭下載。
+- 批次轉傳驗證的一次未記錄失敗、原生視窗檢查一次逾時，原因都未確認。
+- 繼承 1.6.3：CI 只跑測試、不建置 EXE；EXE 未簽章；上游完整 Go suite 的 Windows `app/update/TestBinaryName` 差異未處理。

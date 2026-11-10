@@ -183,8 +183,12 @@ def run_probe(report_path: str | os.PathLike[str] | None = None) -> int:
                 runner.fail_next = True
                 page.download_button.click()
                 require(lambda: len(runner.batch_calls) == 4 and not page.is_busy(), "partial_failure_timeout")
+                # The worker thread can stop before its queued failure signal
+                # reaches the page; give the message a moment to arrive.
+                failure_shown = lambda: "失敗" in page.status_label.text() or "未完成" in page.status_label.text()  # noqa: E731
+                _pump_until(app, failure_shown, 3.0)
                 metrics["partial_failure_blocks_resubmit"] = not page.download_button.isEnabled()
-                metrics["partial_failure_visible"] = "失敗" in page.status_label.text() or "未完成" in page.status_label.text()
+                metrics["partial_failure_visible"] = failure_shown()
                 save("partial-failure")
             finally:
                 window.close()
