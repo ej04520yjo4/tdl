@@ -21,6 +21,13 @@ const Prefix = "@@TDL_GUI@@"
 
 const prefix = Prefix
 
+// Event and stage names shared by commands and the desktop client.
+const (
+	EventStatus        = "status"
+	EventAuthenticated = "authenticated"
+	StageScanning      = "scanning"
+)
+
 // Bridge is a small JSON-lines transport.  Every event written by Bridge is
 // prefixed so a desktop client can safely ignore legacy human-readable output
 // emitted by commands which have not yet been converted to machine events.

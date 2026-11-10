@@ -656,16 +656,6 @@ func fingerprint(dialogs []*tmessage.Dialog) string {
 	return fmt.Sprintf("%x", sha256.Sum256(buf.Bytes()))
 }
 
-// fingerprintForOptions keeps the legacy resume key stable while preventing a
-// new grouped-by-chat job from reusing checkpoints created for flat paths.
-func fingerprintForOptions(dialogs []*tmessage.Dialog, opts Options) string {
-	root := ""
-	if opts.GroupByChat {
-		root, _ = normalizeChatOutputRoot(opts.Dir)
-	}
-	return fingerprintForOptionsAndRoot(dialogs, opts, root)
-}
-
 func fingerprintForOptionsAndRoot(dialogs []*tmessage.Dialog, opts Options, root string) string {
 	base := fingerprint(dialogs)
 	if !opts.GroupByChat {

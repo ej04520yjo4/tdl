@@ -1,6 +1,6 @@
 {
   "channel_list_ok": true,
-  "chat_count": 650,
+  "chat_count": 655,
   "channel_list_partial": false,
   "channel_list_skipped": 0,
   "event_types": [
@@ -14,11 +14,11 @@
   "actual_download_ok": true,
   "downloaded_files": 1,
   "downloaded_bytes": 1842304,
-  "core_sha256": "39dcea966369761921ad801554ee7f62d5d8663aba91db402aa257ce17896d61",
+  "core_sha256": "4a7be8db841f6cb91d1d19878e724cf255c7252cfa9e4fc74fbbe1f5665b304a",
   "original_account_files_unchanged": true,
   "ok": true,
-  "elapsed": 18.047,
+  "elapsed": 18.969,
   "version": "1.6.3",
-  "sha256": "edf22cc1a665074041939b26c29bf69bb2791b6d9702ff757a206fa54b540c75",
+  "sha256": "c85626bb20cfcfcef698ba290d52561eac1cb7cb4d8ff9f33d7bb0664088ca61",
   "actual_bundled_backend_listed_scanned_and_downloaded": true
 }

@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gotd/td/tg"
 	prettyprogress "github.com/jedib0t/go-pretty/v6/progress"
 	"github.com/stretchr/testify/require"
 
-	"github.com/gotd/td/tg"
 	"github.com/iyear/tdl/core/downloader"
 	"github.com/iyear/tdl/core/tmedia"
 	"github.com/iyear/tdl/pkg/desktopio"

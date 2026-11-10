@@ -34,7 +34,7 @@ jobs:
       - name: lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.6.0
+          version: v2.15.0
           working-directory: ${{ matrix.directory }}
   unit-test:
     runs-on: ubuntu-22.04

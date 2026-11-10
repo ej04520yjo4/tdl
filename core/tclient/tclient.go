@@ -83,7 +83,7 @@ func New(ctx context.Context, o Options) (*telegram.Client, error) {
 		Middlewares:    append(NewDefaultMiddlewares(ctx, o.ReconnectTimeout), o.Middlewares...),
 		Clock:          tclock,
 		// gotd now logs through its own port (github.com/gotd/log); adapt zap to it.
-		Logger:         logzap.New(logctx.From(ctx).Named("td")),
+		Logger: logzap.New(logctx.From(ctx).Named("td")),
 	}
 
 	return telegram.NewClient(o.AppID, o.AppHash, opts), nil

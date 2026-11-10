@@ -8,8 +8,9 @@
 
 ## 原始碼測試
 
-- 最終建置內完整 Python suite：**221 passed、30 subtests passed**，40.78 秒（1.6.2 為 218 項；新增 CI 清單一致 2 項、失敗建議文字 1 項）。
-- 建置後加入建置腳本編碼測試，完整 suite 再執行：**222 passed、30 subtests passed**，41.46 秒。
+- 最終建置內完整 Python suite：**222 passed、30 subtests passed**，46.65 秒（1.6.2 為 218 項；新增 CI 清單一致 2 項、失敗建議文字 1 項、建置腳本編碼 1 項）。
+- GitHub Actions（PR #9，提交 `6f4ce34`）：新增的 Windows「Go core and desktop tests」與上游 `lint`（`.`、`core`、`extension`）、`unit-test` 全部通過。這是此 fork 第一次有 CI 執行；第一次執行時 Windows 測試因缺少 `.build` 暫存資料夾、lint 因 golangci-lint 版本過舊而失敗，已修正（見交接清冊第 7 項）。
+- 本機 golangci-lint v2.15.0：三個模組 0 個問題。
 - Go：`build.ps1` 列出的套件全部通過（`pkg/desktopio`、`app/chat`、`app/dl`、`app/up`、`app/forward`、`app/migrate`、`pkg/tmessage`、`cmd`、`core/downloader`、`core/uploader`、`core/util/tutil`；`pkg/key`、`core/forwarder` 無測試）；`core` 模組全部測試、`go vet` 通過。
 - 新增 Go 測試：桌面版因網路錯誤失敗、或被另一個失敗檔案停止時保留分段且重試可讀回；只有仍在執行的桌面工作會保留，命令列與使用者取消不保留。
 - `govulncheck`：升級前程式實際呼叫到 3 個漏洞（gotd GO-2026-6138、klauspost/compress GO-2026-6865、`crypto/x509` GO-2026-6809），升級後 **0**。
@@ -23,26 +24,26 @@
 
 ## 真實 Telegram 驗證（使用者當次同意，只下載；已記憶帳號的隔離副本）
 
-- `channel-live-verification.json`（最終 EXE，新版 gotd）：取得 650 個對話、包含起迄日的日期篩選與影片篩選正確、實際下載公開 @telegram 影片 1 個（1,842,304 bytes）；原始帳號檔案未改動。
-- `resume-live-verification.json`（原始碼後端＋與 EXE 相同的內含核心，SHA-256 `39dcea96…6d61`）：公開 @telegram 影片 5,697,716 bytes，在 18.4% 暫停，工作狀態「已暫停」並保留 1 個分段與分段清單；續傳的第一個進度為 2,097,152 bytes（保留的 1 MB 加上新下載的 1 MB），完成檔與直接下載的 SHA-256 相同（`59fc15a8…55a1`）；原始資料前後雜湊相同。依同意範圍以 `--skip-batch-dry-run` 略過批次轉傳試跑，沒有任何轉傳呼叫。
+- `channel-live-verification.json`（最終 EXE，新版 gotd）：取得 655 個對話、包含起迄日的日期篩選與影片篩選正確、實際下載公開 @telegram 影片 1 個（1,842,304 bytes）；原始帳號檔案未改動。
+- `resume-live-verification.json`（原始碼後端＋與 EXE 相同的內含核心，SHA-256 `4a7be8db…304a`）：公開 @telegram 影片 5,697,716 bytes，在 18.4% 暫停，工作狀態「已暫停」並保留 1 個分段與分段清單；續傳的第一個進度為 2,097,152 bytes（保留的 1 MB 加上新下載的 1 MB），完成檔與直接下載的 SHA-256 相同（`59fc15a8…55a1`）；原始資料前後雜湊相同。依同意範圍以 `--skip-batch-dry-run` 略過批次轉傳試跑，沒有任何轉傳呼叫。
 - 續傳驗證的實際過程（如實記錄）：
   1. 預設大小 20–200 MB 找不到公開影片，改用 `TDL_PROBE_MIN_MB=5`。
   2. 預設 40% 暫停的一次回報「暫停後找不到暫存檔」。當時沒有診斷輸出，原因未確認；推測是 5.4 MB 影片在暫停送達前已下載完成。之後以同設定再跑 3 次，都保留分段且完成檔相同，沒有重現。
   3. 一次在暫停時 6 個分段都已寫完，驗證程式把每段都算成 1 MiB（最後一段其實較短）而誤判失敗；已修正計算。
-  4. 為確保續傳時還有分段要補，最終收據以 `TDL_PROBE_PAUSE_AT=0.15` 執行並通過。
+  4. 為確保續傳時還有分段要補，以 `TDL_PROBE_PAUSE_AT=0.15` 執行並通過；重新建置後以最終建置的內含核心再執行一次並通過，即本收據。
 - **未驗證：**下載途中真的斷線後按「重試」接續（只有自動化測試）；上傳、轉傳實際送出與 QR 登入沒有在新版 gotd 上用真實帳號操作。
 
 ## 交付檔
 
-Windows x64 GUI，版本 **1.6.3**，**56,865,598 bytes**（1.6.2 為 54,719,965 bytes；主要差異為 PySide6 6.12 與新版 gotd）。
+Windows x64 GUI，版本 **1.6.3**，**57,195,394 bytes**（1.6.2 為 54,719,965 bytes；主要差異為 PySide6 6.12 與新版 gotd，另外授權檔多收了本機建置工具 golangci-lint、govulncheck 的授權）。
 
-EXE SHA-256：`edf22cc1a665074041939b26c29bf69bb2791b6d9702ff757a206fa54b540c75`。
+EXE SHA-256：`c85626bb20cfcfcef698ba290d52561eac1cb7cb4d8ff9f33d7bb0664088ca61`。
 
-內含核心 SHA-256：`39dcea966369761921ad801554ee7f62d5d8663aba91db402aa257ce17896d61`。
+內含核心 SHA-256：`4a7be8db841f6cb91d1d19878e724cf255c7252cfa9e4fc74fbbe1f5665b304a`。
 
 `TDL下載助手.exe`、`TDL下載助手-1.6.3.exe`、`dist/TDL下載助手.exe` 與 `TDL-Desktop-1.6.3.exe` 發行別名內容相同。收據與畫面保存於 `desktop/verification/1.6.3/`。
 
-建置後才修改的檔案（`desktop/build.ps1` 加 BOM、`.editorconfig`、`desktop/tests/test_ci_workflow.py`、`desktop/resume_live_probe.py`、文件）都不會打包進 EXE；修改後完整 Python suite 另行執行通過。
+最終 EXE 從含 CI 與 lint 修正的原始碼重新建置；先前建置的 EXE（`edf22cc1…`）不交付。重新建置的第一次嘗試中，批次轉傳頁面測試 `test_forum_destination_loads_topics_without_auto_topic` 在完整測試中失敗一次（單獨重跑 15 次都通過）：測試只等話題清單載入，沒等背景執行緒結束，掃描按鈕在執行緒結束前本來就不會啟用。已改為等兩者，產品行為不變。
 
 ## 已知限制
 
