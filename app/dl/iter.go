@@ -291,7 +291,7 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 		return false, false
 	}
 
-	to, err := os.Create(path)
+	to, partial, err := openTemp(path, item)
 	if err != nil {
 		i.err = errors.Wrap(err, "create file")
 		return false, false
@@ -305,7 +305,8 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 		fromMsg: message,
 		file:    item,
 
-		to: to,
+		to:      to,
+		partial: partial,
 
 		opts: i.opts,
 	}

@@ -197,9 +197,7 @@ func (i *iter) Next(ctx context.Context) bool {
 		i.err = errors.Wrapf(err, "resolve dest: %v", result)
 		return false
 	}
-	if i.opts.topic > 0 {
-		thread = i.opts.topic
-	}
+	thread = destinationThread(i.opts.topic, thread)
 
 	i.elem = &iterElem{
 		from:         from,
@@ -227,4 +225,22 @@ func (i *iter) Value() forwarder.Elem {
 
 func (i *iter) Err() error {
 	return i.err
+}
+
+// generalTopicID is a forum's General topic.
+const generalTopicID = 1
+
+// destinationThread returns the thread a forwarded message goes to.  An
+// explicit --topic replaces the routed thread.  General messages carry no top
+// message id (see app/chat's export), so sending to General means sending
+// without one; Telegram files such a message under General itself.
+func destinationThread(topic, routed int) int {
+	switch {
+	case topic == generalTopicID:
+		return 0
+	case topic > 0:
+		return topic
+	default:
+		return routed
+	}
 }

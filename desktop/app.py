@@ -570,37 +570,23 @@ class BackendBridge:
         # A files-only job uses ``url`` for a friendly queue label, but that
         # path must never be sent through Telegram's URL validator.
         links = list(job.links or ([] if files else ([job.url] if job.url else [])))
-        if job.backend_job_id:
-            request = self.module.DownloadRequest(
-                account_id=account_id,
-                links=links,
-                files=files,
-                output_dir=job.output_dir,
-                continue_download=options.get("continue_download", True),
-                skip_same=options.get("skip_existing", options.get("skip_same", True)),
-                group=options.get("group_album", options.get("group", True)),
-                group_by_chat=options.get("group_by_chat", True),
-                concurrency=int(options.get("concurrency", 2) or 2),
-                proxy=options.get("proxy") or None,
-                job_id=job.backend_job_id,
-                title=job.title,
-            )
-            handle = self.runner.start(request, on_event=None)
-        else:
-            handle = self.runner.start_download(
-                account_id,
-                links,
-                files=files or None,
-                output_dir=job.output_dir,
-                continue_download=options.get("continue_download", True),
-                skip_same=options.get("skip_existing", options.get("skip_same", True)),
-                group=options.get("group_album", options.get("group", True)),
-                group_by_chat=options.get("group_by_chat", True),
-                concurrency=int(options.get("concurrency", 2) or 2),
-                proxy=options.get("proxy") or None,
-                title=job.title,
-                on_event=None,
-            )
+        # The job was saved above, so the core always resumes the durable
+        # record rather than creating a second one.
+        request = self.module.DownloadRequest(
+            account_id=account_id,
+            links=links,
+            files=files,
+            output_dir=job.output_dir,
+            continue_download=options.get("continue_download", True),
+            skip_same=options.get("skip_existing", options.get("skip_same", True)),
+            group=options.get("group_album", options.get("group", True)),
+            group_by_chat=options.get("group_by_chat", True),
+            concurrency=int(options.get("concurrency", 2) or 2),
+            proxy=options.get("proxy") or None,
+            job_id=job.backend_job_id,
+            title=job.title,
+        )
+        handle = self.runner.start(request, on_event=None)
         while not handle.done.is_set():
             if cancel_event.is_set():
                 if pause_event is not None and pause_event.is_set():

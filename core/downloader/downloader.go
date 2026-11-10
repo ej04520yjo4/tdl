@@ -110,10 +110,22 @@ func (d *Downloader) download(ctx context.Context, elem Elem) error {
 		client = d.opts.Pool.Takeout(ctx, elem.File().DC())
 	}
 
+	w := newWriteAt(elem, d.opts.Progress, MaxPartSize)
+	threads := tutil.BestThreads(elem.File().Size(), d.opts.Threads)
+	if r, ok := elem.(Resumable); ok {
+		w.partDone = r.PartDone
+		if done := r.DoneParts(); len(done) > 0 {
+			if err := resumeParts(ctx, client, elem.File(), syncWriterAt(w), done, threads, w.downloaded); err != nil {
+				return errors.Wrap(err, "resume download")
+			}
+			return nil
+		}
+	}
+
 	_, err := downloader.NewDownloader().WithPartSize(MaxPartSize).
 		Download(client, elem.File().Location()).
-		WithThreads(tutil.BestThreads(elem.File().Size(), d.opts.Threads)).
-		Parallel(ctx, newWriteAt(elem, d.opts.Progress, MaxPartSize))
+		WithThreads(threads).
+		Parallel(ctx, w)
 	if err != nil {
 		return errors.Wrap(err, "download")
 	}

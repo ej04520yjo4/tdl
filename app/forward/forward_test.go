@@ -106,3 +106,20 @@ func TestSingleOptionDisablesAlbumExpansion(t *testing.T) {
 		t.Fatal("grouped forward unexpectedly disables grouped expansion")
 	}
 }
+
+func TestDestinationThreadSendsGeneralWithoutTopMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		topic, routed int
+		want          int
+	}{
+		{name: "general topic", topic: 1, routed: 0, want: 0},
+		{name: "general overrides routed thread", topic: 1, routed: 55, want: 0},
+		{name: "other topic", topic: 45, routed: 0, want: 45},
+		{name: "no topic keeps the routed thread", topic: 0, routed: 55, want: 55},
+	} {
+		if got := destinationThread(tc.topic, tc.routed); got != tc.want {
+			t.Errorf("%s: destinationThread(%d, %d) = %d, want %d", tc.name, tc.topic, tc.routed, got, tc.want)
+		}
+	}
+}
