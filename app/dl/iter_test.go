@@ -443,15 +443,14 @@ func TestIterContextCancellation(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
 		defer cancel()
 
-		// Wait for context to be cancelled
-		time.Sleep(5 * time.Millisecond)
-
-		// Verify that the context is cancelled
+		// Wait for the deadline instead of sleeping a fixed time: Windows
+		// timers are coarse (about 15.6 ms), so a 5 ms sleep can end before
+		// a 1 ms deadline fires.
 		select {
 		case <-ctx.Done():
 			assert.NotNil(t, ctx.Err(),
 				"Context should be cancelled")
-		default:
+		case <-time.After(time.Second):
 			t.Fatal("Context should be cancelled")
 		}
 	})
