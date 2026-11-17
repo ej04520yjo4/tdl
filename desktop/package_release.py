@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import stat
@@ -16,6 +17,66 @@ try:
     from desktop.version import VERSION
 except ImportError:  # pragma: no cover - direct ``python desktop/package_release.py``
     from version import VERSION
+
+
+LICENSE_NAMES = {"license", "license.txt", "license.md", "copying", "notice"}
+
+
+def core_modules(build_info: str) -> list[tuple[str, str]]:
+    """Return the (path, version) of every module linked into the core.
+
+    ``build_info`` is the output of ``go version -m``.  A replaced module is
+    listed by its replacement (the ``=>`` line), which is what was compiled.
+    Workspace modules (``(devel)``) are this project and have no cache entry.
+    """
+    modules: list[tuple[str, str]] = []
+    listed = False  # whether the preceding "dep" line was added
+    for line in build_info.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or fields[0] not in {"dep", "=>"}:
+            continue
+        if fields[0] == "=>" and listed:
+            modules.pop()
+        listed = fields[2].startswith("v")
+        if listed:
+            modules.append((fields[1], fields[2]))
+    return modules
+
+
+def module_cache_name(path: str, version: str) -> str:
+    """Go stores "github.com/Foo/bar" as "github.com/!foo/bar@version"."""
+    return "".join("!" + char.lower() if char.isupper() else char for char in f"{path}@{version}")
+
+
+def collect_go_licenses(root: Path, licenses: Path) -> int:
+    """Copy the licenses of the modules in the bundled core, and only those.
+
+    The module cache also holds build tools (linters, scanners) and old
+    versions; their licenses do not belong in the release.  The folder is
+    rebuilt each time so earlier, wider collections cannot linger.
+    """
+    target_root = licenses / "go-modules"
+    if target_root.exists():
+        shutil.rmtree(target_root, onerror=lambda func, path, _: (os.chmod(path, stat.S_IWRITE), func(path)))
+    core = root / "bin" / "tdl-core.exe"
+    module_cache = root / ".build" / "gopath" / "pkg" / "mod"
+    if not core.is_file() or not module_cache.exists():
+        return 0
+    go = root / ".build" / "go" / "bin" / "go.exe"
+    command = str(go) if go.is_file() else (shutil.which("go") or "")
+    if not command:
+        raise SystemExit("Go is needed to list the modules in bin/tdl-core.exe")
+    build_info = subprocess.check_output([command, "version", "-m", str(core)], text=True, encoding="utf-8")
+    copied = 0
+    for path, version in core_modules(build_info):
+        module = module_cache / Path(*module_cache_name(path, version).split("/"))
+        if not module.is_dir():
+            raise SystemExit(f"Module {path}@{version} is in the core but not in the module cache")
+        for item in module.rglob("*"):
+            if item.is_file() and item.name.lower() in LICENSE_NAMES:
+                copy_release_file(item, target_root / item.relative_to(module_cache))
+                copied += 1
+    return copied
 
 
 def copy_release_file(source: Path, target: Path) -> None:
@@ -89,16 +150,7 @@ def main() -> None:
     go_license = root / ".build" / "go" / "LICENSE"
     if go_license.is_file():
         copy_release_file(go_license, licenses / "Go-BSD.txt")
-    module_cache = root / ".build" / "gopath" / "pkg" / "mod"
-    if module_cache.exists():
-        for item in module_cache.rglob("*"):
-            if item.is_file() and item.name.lower() in {"license", "license.txt", "license.md", "copying", "notice"}:
-                relative = item.relative_to(module_cache)
-                if relative.parts[0] == "cache":
-                    continue
-                target = licenses / "go-modules" / relative
-                target.parent.mkdir(parents=True, exist_ok=True)
-                copy_release_file(item, target)
+    collect_go_licenses(root, licenses)
     tracked = subprocess.check_output(
         ["git", "ls-files", "-c", "-o", "--exclude-standard", "-z"], cwd=root
     ).decode("utf-8").split("\x00")

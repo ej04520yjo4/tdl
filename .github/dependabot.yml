@@ -1,24 +1,31 @@
-# To get started with Dependabot version updates, you'll need to specify which
-# package ecosystems to update and where the package manifests are located.
-# Please see the documentation for all configuration options:
-# https://docs.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
+# Dependency update pull requests for this fork.  Weekly and limited, so
+# they stay reviewable; nothing is merged automatically.  Version updates
+# must also be enabled for the fork in GitHub: Insights > Dependency graph >
+# Dependabot.
 
 version: 2
 updates:
-  - package-ecosystem: "gomod" # See documentation for possible values
+  - package-ecosystem: "gomod"
     directories:
       - "/"
       - "/core"
       - "/extension"
     schedule:
-      interval: "daily"
+      interval: "weekly"
     assignees:
-      - "iyear"
-    open-pull-requests-limit: 99
+      - "ej04520yjo4"
+    open-pull-requests-limit: 5
+  - package-ecosystem: "pip"
+    directory: "/desktop"
+    schedule:
+      interval: "weekly"
+    assignees:
+      - "ej04520yjo4"
+    open-pull-requests-limit: 5
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "daily"
+      interval: "weekly"
     assignees:
-      - "iyear"
-    open-pull-requests-limit: 99
+      - "ej04520yjo4"
+    open-pull-requests-limit: 5
