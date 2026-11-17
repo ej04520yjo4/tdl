@@ -406,7 +406,8 @@ class TransferPageTests(_QtCase):
             self.assertEqual(page.forward_sources(), ["https://t.me/telegram/193"])
             page.forward_mode.setCurrentIndex(1)
             page.dry_run_button.click()
-            self.pump(lambda: not page.is_busy())
+            # The buttons come back in a queued slot after the thread stops.
+            self.pump(lambda: not page.is_busy() and page.forward_button.isEnabled())
             args = bridge.runner.built[-1]
             self.assertIn("--dry-run", args)
             self.assertEqual(args[args.index("--mode") + 1], "clone")
@@ -419,7 +420,7 @@ class TransferPageTests(_QtCase):
                 exit_code=1,
             )
             page.forward_button.click()
-            self.pump(lambda: not page.is_busy())
+            self.pump(lambda: not page.is_busy() and page.forward_button.isEnabled())
             self.assertNotIn("--dry-run", bridge.runner.built[-1])
             self.assertIn("轉傳未全部完成", page.forward_status.text())
             self.assertIn("失敗 1", page.forward_status.text())
